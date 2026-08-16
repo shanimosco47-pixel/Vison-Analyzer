@@ -286,9 +286,15 @@ pass stores one float per *sample* (a 12-hour scan at one sample per 5 s is
 * **Seek performance depends on the codec.** Stage B seeks directly into the
   file. On long-GOP H.264/H.265 exports each seek costs more than on the
   fixtures used here; verify Stage B timing on your own footage.
-* **Variable-frame-rate recordings** are handled by estimating the frame rate
-  from timestamps, and the UI says when this happened, but timings on such
-  files are inherently less exact.
+* **Variable-frame-rate recordings are refused, not analysed.** Every timing
+  here is derived from a single frame rate, so on a VFR file the error grows
+  through the recording. Rather than report confidently wrong timestamps, the
+  upload is rejected with an explanation and a suggestion to re-save the file
+  at a constant rate. Detection compares the spacing of presentation
+  timestamps across the first 120 frames; it tolerates NTSC quantisation and
+  the occasional dropped frame. **Full VFR support is future work** and needs
+  real VFR footage to validate against — the decision logic here is tested
+  against scripted timestamp patterns, not against a genuine VFR container.
 * **Job state lives in memory.** Restarting the server clears uploads and
   results. That is intentional for a local prototype; a database would be the
   first thing to add if results must survive a restart.

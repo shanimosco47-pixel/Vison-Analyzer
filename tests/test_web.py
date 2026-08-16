@@ -21,25 +21,6 @@ from app.web.routes import create_app
 
 
 @pytest.fixture
-def app(tmp_path: Path):
-    config = replace(
-        AppConfig(),
-        data_dir=tmp_path / "data",
-        max_upload_mb=64,
-        log_level="WARNING",
-    )
-    application = create_app(config)
-    application.config.update(TESTING=True)
-    yield application
-    application.extensions["analysis_service"].shutdown()
-
-
-@pytest.fixture
-def client(app):
-    return app.test_client()
-
-
-@pytest.fixture
 def fast_sweeper(tmp_path: Path):
     """A service whose retention sweep runs on a test-sized interval.
 

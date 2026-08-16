@@ -9,12 +9,15 @@ and a regression in the timing logic shows up immediately.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
+
+from app.config import AppConfig
+from app.web.routes import create_app
 
 RANDOM_SEED = 20260316
 
@@ -171,3 +174,23 @@ def broken_video(tmp_path: Path) -> Path:
     path = tmp_path / "not_really.mp4"
     path.write_bytes(b"this is not a video file, it is a trap" * 32)
     return path
+
+
+@pytest.fixture
+def app(tmp_path: Path):
+    """The real Flask application, with a temporary data directory."""
+    config = replace(
+        AppConfig(),
+        data_dir=tmp_path / "data",
+        max_upload_mb=64,
+        log_level="WARNING",
+    )
+    application = create_app(config)
+    application.config.update(TESTING=True)
+    yield application
+    application.extensions["analysis_service"].shutdown()
+
+
+@pytest.fixture
+def client(app):
+    return app.test_client()

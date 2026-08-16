@@ -10,12 +10,18 @@ obtained so the UI can warn the user when a value was estimated.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
 
-from ..errors import EmptyVideoError, VideoMetadataError, VideoOpenError
+from ..errors import (
+    EmptyVideoError,
+    VariableFrameRateError,
+    VideoMetadataError,
+    VideoOpenError,
+)
 from ..logging_setup import get_logger
 from .sampling import MAX_PLAUSIBLE_FPS, MIN_PLAUSIBLE_FPS
 
@@ -24,6 +30,29 @@ logger = get_logger(__name__)
 # Number of frames decoded when the container's FPS has to be re-derived from
 # presentation timestamps.
 FPS_ESTIMATION_FRAMES = 60
+
+# --- variable-frame-rate detection ----------------------------------------- #
+# A VFR file usually declares a plausible *average* frame rate, so it passes
+# every other check and is then timed as if it were constant. These settings
+# decide when the spacing between presentation timestamps is irregular enough
+# that the constant-rate assumption must be refused.
+
+# How many frame intervals are examined at the start of the recording.
+VFR_SAMPLE_FRAMES = 120
+
+# Fewer than this many usable intervals is not enough evidence to judge, so the
+# file is accepted (the alternative would be rejecting short clips at random).
+VFR_MIN_INTERVALS = 20
+
+# An interval counts as irregular when it differs from the median interval by
+# more than this fraction of it. 0.5 is far wider than the +/-1 ms quantisation
+# of a 29.97 FPS file, and far narrower than a genuine rate change.
+VFR_INTERVAL_TOLERANCE = 0.5
+
+# The file is rejected when more than this fraction of intervals are irregular.
+# A tenth tolerates the occasional dropped frame in an otherwise constant-rate
+# recording, while a real rate change affects far more than that.
+VFR_MAX_IRREGULAR_RATIO = 0.10
 
 
 @dataclass(frozen=True)
@@ -104,6 +133,56 @@ def _estimate_fps_from_timestamps(capture: cv2.VideoCapture) -> float | None:
     return fps
 
 
+def measure_frame_intervals(
+    capture: cv2.VideoCapture, limit: int = VFR_SAMPLE_FRAMES
+) -> list[float]:
+    """Gaps in milliseconds between the presentation timestamps of the first frames.
+
+    Returns an empty list when the backend does not expose usable timestamps,
+    which is treated as "cannot judge" rather than as evidence either way.
+    """
+    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    stamps: list[float] = []
+    for _ in range(limit):
+        if not capture.grab():
+            break
+        position_ms = capture.get(cv2.CAP_PROP_POS_MSEC)
+        if not math.isfinite(position_ms):
+            break
+        stamps.append(position_ms)
+
+    intervals = [later - earlier for earlier, later in zip(stamps, stamps[1:], strict=False)]
+    # A backend that reports 0 for every frame yields all-zero intervals; that
+    # is missing data, not a constant frame rate of infinity.
+    return intervals if any(interval > 0 for interval in intervals) else []
+
+
+def is_variable_frame_rate(
+    intervals_ms: Sequence[float],
+    *,
+    tolerance: float = VFR_INTERVAL_TOLERANCE,
+    max_irregular_ratio: float = VFR_MAX_IRREGULAR_RATIO,
+    min_intervals: int = VFR_MIN_INTERVALS,
+) -> bool:
+    """Decide whether frame spacing is too irregular to be timed as constant.
+
+    Pure and free of OpenCV so the decision can be tested directly against
+    scripted timestamp patterns: clean constant rate, NTSC millisecond
+    quantisation, an occasional dropped frame, and a genuine rate change.
+    """
+    if len(intervals_ms) < min_intervals:
+        return False  # not enough evidence to accuse the file of anything
+
+    ordered = sorted(intervals_ms)
+    middle = len(ordered) // 2
+    median = ordered[middle] if len(ordered) % 2 else 0.5 * (ordered[middle - 1] + ordered[middle])
+    if median <= 0:
+        return False
+
+    irregular = sum(1 for value in intervals_ms if abs(value - median) > tolerance * median)
+    return irregular / len(intervals_ms) > max_irregular_ratio
+
+
 def probe_video(path: Path) -> VideoInfo:
     """Open ``path`` and return validated metadata.
 
@@ -111,6 +190,8 @@ def probe_video(path: Path) -> VideoInfo:
         VideoOpenError: the file cannot be opened/decoded at all.
         EmptyVideoError: the file opens but yields no frames.
         VideoMetadataError: the frame rate cannot be established.
+        VariableFrameRateError: the frame rate is not constant, so the file
+            cannot be timed accurately and is refused.
     """
     path = Path(path)
     if not path.is_file():
@@ -152,6 +233,31 @@ def probe_video(path: Path) -> VideoInfo:
             warnings.append(
                 "The frame rate was estimated from timestamps because the file does not "
                 "declare a usable one. Timings may be less accurate."
+            )
+
+        # Refuse variable-frame-rate recordings outright. Every timing here is
+        # derived from one frame rate, so a file whose cadence changes would be
+        # reported with confidently wrong timestamps - the one outcome this
+        # application must never produce. Full VFR support is future work.
+        intervals = measure_frame_intervals(capture)
+        if is_variable_frame_rate(intervals):
+            median_ms = sorted(intervals)[len(intervals) // 2]
+            logger.warning(
+                "Rejecting %s: variable frame rate (%d intervals sampled, median %.1f ms, "
+                "min %.1f ms, max %.1f ms, container claims %.3f fps)",
+                path.name,
+                len(intervals),
+                median_ms,
+                min(intervals),
+                max(intervals),
+                fps,
+            )
+            raise VariableFrameRateError(
+                detail=(
+                    f"{len(intervals)} intervals sampled, median {median_ms:.1f} ms, "
+                    f"range {min(intervals):.1f}-{max(intervals):.1f} ms, "
+                    f"declared fps {fps:.3f}"
+                )
             )
 
         raw_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)

@@ -45,6 +45,23 @@ class EmptyVideoError(AnalyzerError):
     default_message = "The video contains no readable frames."
 
 
+class VariableFrameRateError(AnalyzerError):
+    """The recording's frame spacing varies, so it cannot be timed accurately.
+
+    Every timing in this application is derived from a single frame rate. On a
+    variable-frame-rate file that assumption is wrong, and the error grows
+    through the recording, so such files are refused rather than measured
+    incorrectly.
+    """
+
+    default_message = (
+        "This recording has a variable frame rate, so its timings cannot be "
+        "measured accurately and it has been rejected rather than reported with "
+        "wrong timestamps. Re-save it with a constant frame rate (most editors "
+        "can do this, as can 'ffmpeg -vsync cfr') and upload it again."
+    )
+
+
 class UnsupportedFormatError(AnalyzerError):
     """Upload rejected before it was ever opened."""
 
