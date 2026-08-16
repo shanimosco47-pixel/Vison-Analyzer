@@ -393,8 +393,15 @@ class FlowStateMachine:
         if sample.disturbed:
             measurement.frames_disturbed += 1
             # A disturbed frame proves nothing: it may neither start the clock
-            # nor contribute to the "liquid has stopped" evidence.
+            # nor contribute to the "liquid has stopped" evidence. Both
+            # persistence runs therefore restart, because each one must be a
+            # contiguous run of frames we actually trust. Resetting (rather
+            # than pausing) also errs toward continuing to measure: the failure
+            # mode becomes "end not confirmed", which is reported for review,
+            # instead of an end confirmed on evidence we never had.
             self.start_timer.reset()
+            self.absence_timer.reset()
+            self._gap_started_s = None
             return
 
         activity_score = sample.value

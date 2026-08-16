@@ -122,6 +122,47 @@ class TestFlowEnd:
         # Confirmation happened 0.5 s later, and must not be reported as the end.
         assert machine.measurement.end_s < 100 * FRAME
 
+    def test_disturbance_does_not_count_toward_the_end_persistence(self):
+        """Frames we could not trust must not be credited as observed absence.
+
+        Regression: the disturbed branch reset only the start timer, so the
+        absence run kept its pre-disturbance start time. One clean frame
+        arriving after a long disturbance then satisfied the 0.5 s rule on
+        0.16 s of real evidence.
+        """
+        machine = FlowStateMachine(config(flow_start_persistence_s=0.2, flow_end_persistence_s=0.5))
+        sequence = [liquid()] * 100  # stream; last liquid at 3.96 s
+        sequence += [empty()] * 3  # 0.12 s of genuine absence
+        sequence += [disturbed()] * 25  # 1.0 s proving nothing either way
+        sequence += [empty()] * 1  # one clean frame: must NOT confirm the end
+        feed(machine, sequence)
+        assert not machine.finished
+
+        # Only a fresh, full 0.5 s run of trusted absence may end the measurement.
+        feed(machine, [empty()] * 14, start_s=len(sequence) * FRAME)
+        assert machine.finished
+        assert machine.measurement.end_confirmed
+        # The reported end is still the last frame that showed liquid.
+        assert machine.measurement.end_s == pytest.approx(99 * FRAME, abs=FRAME)
+
+    def test_disturbance_between_final_drops_does_not_end_the_measurement(self):
+        """The realistic case: a hand crosses the cup while the last drops fall."""
+        machine = FlowStateMachine(config(flow_start_persistence_s=0.2, flow_end_persistence_s=0.5))
+        sequence = [liquid()] * 100  # continuous stream
+        for _ in range(3):  # three drops, 0.2 s apart
+            sequence += [liquid()] + [empty()] * 5
+        sequence += [empty()] * 2 + [disturbed()] * 25 + [empty()] * 1
+        for _ in range(2):  # two more drops after the disturbance
+            sequence += [liquid()] + [empty()] * 5
+        last_drop_index = max(i for i, sample in enumerate(sequence) if sample.value > 0)
+        sequence += [empty()] * 20  # sustained absence: now it may end
+
+        feed(machine, sequence)
+        assert machine.finished
+        assert machine.measurement.end_confirmed
+        # Timing must run to the last drop, not to the drop before the disturbance.
+        assert machine.measurement.end_s == pytest.approx(last_drop_index * FRAME, abs=FRAME)
+
     def test_persistence_is_time_based_not_frame_based(self):
         """0.5 s must mean 0.5 s at any frame rate - never '15 frames'."""
         results = {}
