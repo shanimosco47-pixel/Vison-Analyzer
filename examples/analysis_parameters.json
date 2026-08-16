@@ -1,0 +1,75 @@
+{
+  "_comment": [
+    "Example parameter sets for the HTTP API (POST /api/analyses).",
+    "The browser UI builds exactly these payloads; the API is documented here so",
+    "the analysis can also be scripted for batch work. Every key not listed is",
+    "left at the documented default in app/config.py.",
+    "All time values are in SECONDS. All pixel coordinates refer to the original",
+    "video resolution, not to whatever the browser happened to display."
+  ],
+
+  "zahn_cup_by_click": {
+    "_comment": "Simplest Zahn run: click the outlet, take every other default.",
+    "video_id": "<id returned by POST /api/videos>",
+    "mode": "zahn_cup",
+    "params": {
+      "outlet": { "x": 640, "y": 320 }
+    }
+  },
+
+  "zahn_cup_tuned": {
+    "_comment": [
+      "A tuned Zahn run for a dark, low-contrast liquid on a busy background.",
+      "flow_end_persistence_s is the value to adjust first when the timing stops",
+      "too early (raise it) or drags on after the last drop (lower it)."
+    ],
+    "video_id": "<id>",
+    "mode": "zahn_cup",
+    "params": {
+      "roi": { "x": 610, "y": 315, "width": 70, "height": 400 },
+      "flow_start_persistence_s": 0.3,
+      "flow_end_persistence_s": 0.6,
+      "activity_threshold": 0.1,
+      "min_abs_diff": 10,
+      "min_drop_area_px": 6,
+      "analysis_start_s": 0,
+      "analysis_end_s": 180
+    }
+  },
+
+  "robot_activity_12_hour_shift": {
+    "_comment": [
+      "A whole shift. shortest_event_s drives the scan speed: the scan samples",
+      "shortest_event_s / safety_factor apart, so 20 s here means one sample",
+      "every ~6.7 s and roughly 6 500 samples for 12 hours."
+    ],
+    "video_id": "<id>",
+    "mode": "robot_activity",
+    "params": {
+      "roi": { "x": 300, "y": 120, "width": 900, "height": 700 },
+      "shortest_event_s": 20,
+      "min_event_duration_s": 5,
+      "sensitivity": 0.5,
+      "pre_roll_s": 10,
+      "post_roll_s": 10,
+      "idle_pause_s": 600,
+      "long_run_s": 0
+    },
+    "recording_start": "2026-03-04T06:00:00"
+  },
+
+  "generic_motion_first_look": {
+    "_comment": [
+      "Use this when you do not yet know what you are looking for. Raise the",
+      "sensitivity towards 1.0 if nothing is found, and set an ROI if the whole",
+      "frame produces too many candidates."
+    ],
+    "video_id": "<id>",
+    "mode": "motion_scan",
+    "params": {
+      "shortest_event_s": 15,
+      "min_event_duration_s": 2,
+      "sensitivity": 0.6
+    }
+  }
+}

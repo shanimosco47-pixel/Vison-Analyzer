@@ -1,0 +1,11 @@
+# Runtime dependencies. Bounded versions so an upstream major release cannot
+# change behaviour of an installation made months from now.
+#
+#   pip install -r requirements.txt
+#
+# All four are mature, widely adopted and permissively licensed
+# (Apache-2.0 / BSD-3-Clause); see README, "Dependencies and licensing".
+opencv-python-headless>=4.9,<5   # Apache-2.0  - video decoding and all vision work
+numpy>=1.26,<3                   # BSD-3-Clause - array maths
+flask>=3.0,<4                    # BSD-3-Clause - local web server
+pandas>=2.1,<3                   # BSD-3-Clause - optional DataFrame export of the event log

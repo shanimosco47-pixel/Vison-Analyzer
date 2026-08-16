@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Video Analyzer</title>
+  <!-- Inline icon: keeps the page free of any external request, and stops the
+       browser asking for a favicon that does not exist. -->
+  <link rel="icon" href="data:image/svg+xml,
+    %3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E
+    %3Crect width='16' height='16' rx='3' fill='%231f5fa8'/%3E
+    %3Cpath d='M5 4l7 4-7 4z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+<header class="page-header">
+  <h1>Video Analyzer</h1>
+  <p class="subtitle">Local analysis of recorded video &mdash; nothing is uploaded to the internet.</p>
+</header>
+
+<main>
+  <!-- Step 1 ---------------------------------------------------------- -->
+  <section class="step" id="step-upload">
+    <h2><span class="step-number">1</span> Upload a video</h2>
+
+    <div id="dropzone" class="dropzone" tabindex="0" role="button"
+         aria-label="Choose a video file or drop one here">
+      <p class="dropzone-title">Drop a video here</p>
+      <p class="dropzone-hint">or click to choose a file</p>
+      <p class="dropzone-formats">Supported: {{ allowed_extensions }} &middot; up to {{ max_upload_mb }} MB</p>
+      <input type="file" id="file-input" class="visually-hidden" accept="video/*">
+    </div>
+
+    <div id="upload-progress" class="progress hidden">
+      <div class="progress-bar" id="upload-bar"></div>
+    </div>
+
+    <div id="video-details" class="panel hidden">
+      <dl class="details-grid">
+        <div><dt>File</dt><dd id="meta-name">&mdash;</dd></div>
+        <div><dt>Duration</dt><dd id="meta-duration">&mdash;</dd></div>
+        <div><dt>Resolution</dt><dd id="meta-resolution">&mdash;</dd></div>
+        <div><dt>Frame rate</dt><dd id="meta-fps">&mdash;</dd></div>
+        <div><dt>File size</dt><dd id="meta-size">&mdash;</dd></div>
+        <div><dt>Codec</dt><dd id="meta-codec">&mdash;</dd></div>
+      </dl>
+      <p id="meta-warnings" class="warning hidden"></p>
+      <video id="preview" class="preview" controls preload="metadata"></video>
+    </div>
+  </section>
+
+  <!-- Step 2 ---------------------------------------------------------- -->
+  <section class="step disabled" id="step-mode">
+    <h2><span class="step-number">2</span> Choose what to analyse</h2>
+    <div class="mode-list">
+      {% for mode in modes %}
+      <label class="mode-card">
+        <input type="radio" name="mode" value="{{ mode.name }}">
+        <span class="mode-body">
+          <span class="mode-title">{{ mode.display_name }}</span>
+          <span class="mode-description">{{ mode.description }}</span>
+        </span>
+      </label>
+      {% endfor %}
+    </div>
+  </section>
+
+  <!-- Step 3 ---------------------------------------------------------- -->
+  <section class="step disabled" id="step-configure">
+    <h2><span class="step-number">3</span> Configure</h2>
+
+    <div id="frame-picker" class="hidden">
+      <p class="instruction" id="picker-instruction"></p>
+      <div class="frame-toolbar">
+        <button type="button" class="secondary" id="grab-frame">
+          Use the frame currently shown in the preview
+        </button>
+        <span class="hint" id="frame-time-label"></span>
+        <button type="button" class="secondary hidden" id="clear-region">Clear region</button>
+      </div>
+      <div class="frame-holder">
+        <img id="frame-image" alt="Video frame for marking the analysis region">
+        <canvas id="frame-canvas"></canvas>
+      </div>
+      <p class="hint" id="region-summary"></p>
+    </div>
+
+    <div class="settings-grid" id="settings-zahn">
+      <label>
+        Flow-end persistence (seconds)
+        <input type="number" id="zahn-end-persistence" step="0.05" min="0.05" value="0.5">
+        <span class="hint">How long the stream and drops must be absent before timing stops.</span>
+      </label>
+      <label>
+        Sensitivity
+        <input type="range" id="zahn-sensitivity" min="0.04" max="0.30" step="0.01" value="0.12">
+        <span class="hint">Lower detects fainter streams; higher ignores more noise.
+          <output id="zahn-sensitivity-value">0.12</output></span>
+      </label>
+    </div>
+
+    <div class="settings-grid" id="settings-activity">
+      <label>
+        Shortest event that must not be missed (seconds)
+        <input type="number" id="shortest-event" step="1" min="1" value="15">
+        <span class="hint">The scan samples several times within this period, so a shorter
+          value means a slower but more thorough scan.</span>
+      </label>
+      <label>
+        Minimum interesting event (seconds)
+        <input type="number" id="min-event" step="0.5" min="0" value="1">
+        <span class="hint">Shorter bursts of activity are ignored.</span>
+      </label>
+      <label>
+        Speed versus sensitivity
+        <input type="range" id="scan-sensitivity" min="0" max="1" step="0.05" value="0.5">
+        <span class="hint">Left: fewer, stronger detections. Right: catches weaker activity.
+          <output id="scan-sensitivity-value">0.5</output></span>
+      </label>
+      <label id="idle-pause-field">
+        Report pauses longer than (seconds)
+        <input type="number" id="idle-pause" step="30" min="0" value="300">
+        <span class="hint">Quiet spells between two working periods. 0 turns this off.</span>
+      </label>
+    </div>
+
+    <details class="advanced">
+      <summary>Advanced settings</summary>
+      <div class="settings-grid">
+        <label>
+          Recording start (real clock time)
+          <input type="datetime-local" id="recording-start" step="1">
+          <span class="hint">Optional. Without it, results are reported as video-relative
+            times only &mdash; never as guessed clock times.</span>
+        </label>
+        <label id="advanced-preroll-field">
+          Pre-roll / post-roll (seconds)
+          <input type="number" id="roll-seconds" step="1" min="0" value="5">
+          <span class="hint">How far around each candidate the detailed pass looks.</span>
+        </label>
+        <label id="advanced-start-persistence-field">
+          Flow-start persistence (seconds)
+          <input type="number" id="zahn-start-persistence" step="0.05" min="0.05" value="0.3">
+          <span class="hint">How long liquid must be visible at the outlet before timing starts.</span>
+        </label>
+      </div>
+    </details>
+  </section>
+
+  <!-- Step 4 ---------------------------------------------------------- -->
+  <section class="step disabled" id="step-analyse">
+    <h2><span class="step-number">4</span> Analyse</h2>
+    <div class="action-row">
+      <button type="button" id="run-analysis" class="primary" disabled>Start analysis</button>
+      <button type="button" id="cancel-analysis" class="secondary hidden">Cancel</button>
+    </div>
+    <div id="job-progress" class="hidden">
+      <div class="progress"><div class="progress-bar" id="job-bar"></div></div>
+      <p class="progress-message" id="job-message"></p>
+      <p class="hint" id="job-plan"></p>
+    </div>
+  </section>
+
+  <!-- Step 5 ---------------------------------------------------------- -->
+  <section class="step disabled" id="step-results">
+    <h2><span class="step-number">5</span> Results</h2>
+
+    <div id="headline" class="headline hidden"></div>
+    <ul id="result-notes" class="notes hidden"></ul>
+
+    <div id="trace-holder" class="hidden">
+      <p class="hint">Activity over time (the horizontal axis is video time; taller means more change)</p>
+      <canvas id="trace-canvas" height="90"></canvas>
+    </div>
+
+    <div id="events-holder" class="hidden">
+      <div class="action-row">
+        <a id="download-csv" class="secondary button-like" download>Export event log (CSV)</a>
+        <span class="hint" id="clock-note"></span>
+      </div>
+      <div class="table-scroll">
+        <table id="events-table">
+          <thead>
+            <tr>
+              <th>Event</th><th>Start (video)</th><th>End (video)</th><th>Duration</th>
+              <th>Start (clock)</th><th>Confidence</th><th>Status</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint">Click a row to jump the preview player to that moment.</p>
+    </div>
+
+    <details id="diagnostics-holder" class="advanced hidden">
+      <summary>Technical details of this analysis</summary>
+      <pre id="diagnostics-json"></pre>
+    </details>
+  </section>
+</main>
+
+<div id="error-banner" class="error-banner hidden" role="alert">
+  <span id="error-text"></span>
+  <button type="button" id="error-dismiss" aria-label="Dismiss">&times;</button>
+</div>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
