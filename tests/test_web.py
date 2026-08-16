@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 
 from app.config import AppConfig
+from app.services.analysis_service import AnalysisService
+from app.services.storage import VideoStore
 from app.web.routes import create_app
 
 
@@ -35,6 +37,23 @@ def app(tmp_path: Path):
 @pytest.fixture
 def client(app):
     return app.test_client()
+
+
+@pytest.fixture
+def fast_sweeper(tmp_path: Path):
+    """A service whose retention sweep runs on a test-sized interval.
+
+    Built directly rather than through create_app: the interval has to be set
+    before the thread starts its first wait, which is exactly what the
+    constructor argument is for.
+    """
+    config = replace(AppConfig(), data_dir=tmp_path / "sweep", log_level="WARNING")
+    store = VideoStore(config)
+    service = AnalysisService(config, store, sweep_interval_s=0.05)
+    try:
+        yield config, store, service
+    finally:
+        service.shutdown()
 
 
 def upload(client, path: Path, filename: str | None = None):
@@ -378,3 +397,70 @@ class TestCleanup:
             record.last_used_at = 0.0  # pretend it has been idle for ever
         assert store.purge_expired() == 1
         assert list(app.extensions["app_config"].upload_dir.glob("*")) == []
+
+
+class TestRetentionSweeper:
+    """The retention policy must be enforced while the server runs.
+
+    Regression: `purge_expired` existed on both the store and the service but
+    was called only from tests, so the configured 24 h retention never removed
+    anything during a session - the one cleanup that ran was the orphan sweep
+    at start-up, which fires when the disk is still empty.
+    """
+
+    def test_the_sweeper_thread_is_running(self, app):
+        service = app.extensions["analysis_service"]
+        assert service._sweeper.is_alive()
+        assert service._sweeper.daemon
+
+    def test_a_sweep_removes_expired_uploads_and_job_records(self, client, motion_video, app):
+        upload(client, motion_video.path)
+        service = app.extensions["analysis_service"]
+        upload_dir = app.extensions["app_config"].upload_dir
+        assert len(list(upload_dir.glob("*"))) == 1
+
+        for record in app.extensions["video_store"].list_records():
+            record.last_used_at = 0.0  # aged past the retention window
+
+        uploads_removed, _ = service.run_retention_sweep()
+        assert uploads_removed == 1
+        assert list(upload_dir.glob("*")) == []
+
+    def test_the_sweeper_runs_without_any_request_traffic(self, fast_sweeper, motion_video):
+        """The disk-filling case is an upload followed by an idle server."""
+        config, store, _service = fast_sweeper
+        with motion_video.path.open("rb") as handle:
+            store.save_upload(handle, "idle.mp4")
+        assert len(list(config.upload_dir.glob("*"))) == 1
+
+        for record in store.list_records():
+            record.last_used_at = 0.0  # aged past the retention window
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and list(config.upload_dir.glob("*")):
+            time.sleep(0.05)
+        assert list(config.upload_dir.glob("*")) == [], "the idle sweeper never ran"
+
+    def test_a_failing_sweep_does_not_kill_the_sweeper(self, fast_sweeper, monkeypatch):
+        """One transient error must not silently disable retention for good."""
+        _config, store, service = fast_sweeper
+        calls: list[int] = []
+
+        def exploding_purge() -> int:
+            calls.append(1)
+            raise OSError("disk hiccup")
+
+        monkeypatch.setattr(store, "purge_expired", exploding_purge)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and len(calls) < 2:
+            time.sleep(0.05)
+        assert len(calls) >= 2, "the sweeper stopped after the first failure"
+        assert service._sweeper.is_alive()
+
+    def test_the_sweeper_stops_on_shutdown(self, fast_sweeper):
+        _config, _store, service = fast_sweeper
+        assert service._sweeper.is_alive()
+
+        service.shutdown()
+        service._sweeper.join(timeout=5.0)
+        assert not service._sweeper.is_alive(), "the sweeper outlived shutdown()"

@@ -42,6 +42,12 @@ MAX_CONCURRENT_JOBS = 2
 # after a refresh.
 JOB_RETENTION_S = 6 * 3600
 
+# How often the retention sweep runs. Retention has to be enforced while the
+# server is running, and by a mechanism that does not depend on someone using
+# the application: the case that fills a disk is a user who uploads a
+# multi-gigabyte recording and then closes the browser.
+RETENTION_SWEEP_INTERVAL_S = 300.0
+
 
 class JobCancelled(Exception):
     """Raised inside a worker when the user cancels the job."""
@@ -107,7 +113,13 @@ class AnalysisJob:
 class AnalysisService:
     """Runs detectors in the background and keeps their results."""
 
-    def __init__(self, config: AppConfig, store: VideoStore) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        store: VideoStore,
+        *,
+        sweep_interval_s: float = RETENTION_SWEEP_INTERVAL_S,
+    ) -> None:
         self.config = config
         self.store = store
         self._jobs: dict[str, AnalysisJob] = {}
@@ -115,6 +127,12 @@ class AnalysisService:
         self._executor = ThreadPoolExecutor(
             max_workers=MAX_CONCURRENT_JOBS, thread_name_prefix="analysis"
         )
+        self._sweep_interval_s = sweep_interval_s
+        self._stop_sweeper = threading.Event()
+        self._sweeper = threading.Thread(
+            target=self._sweep_loop, name="retention-sweeper", daemon=True
+        )
+        self._sweeper.start()
 
     # -- submission --------------------------------------------------------- #
 
@@ -186,7 +204,39 @@ class AnalysisService:
                 self._jobs.pop(job_id, None)
         return len(expired)
 
+    # -- retention ----------------------------------------------------------- #
+
+    def run_retention_sweep(self) -> tuple[int, int]:
+        """Apply the retention policy once. Returns (uploads, jobs) removed.
+
+        Separate from the loop so it can be called directly by tests and, if
+        ever needed, by an operator.
+        """
+        return self.store.purge_expired(), self.purge_expired()
+
+    def _sweep_loop(self) -> None:
+        """Enforce retention on a timer, whether or not anyone is using the app.
+
+        A request-triggered purge would miss the case that actually fills a
+        disk: an upload followed by the user closing the browser.
+        """
+        while not self._stop_sweeper.wait(self._sweep_interval_s):
+            try:
+                uploads, jobs = self.run_retention_sweep()
+            except Exception:  # noqa: BLE001 - the sweeper must outlive one bad sweep
+                # A sweeper that dies on a transient OSError would silently
+                # reintroduce the unbounded-growth bug, so log and carry on.
+                logger.exception("Retention sweep failed; will retry next interval")
+            else:
+                if uploads or jobs:
+                    logger.info(
+                        "Retention sweep removed %d upload(s) and %d job record(s)",
+                        uploads,
+                        jobs,
+                    )
+
     def shutdown(self) -> None:
+        self._stop_sweeper.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     # -- worker ------------------------------------------------------------- #

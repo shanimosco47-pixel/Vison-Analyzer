@@ -350,8 +350,12 @@ small interface.
 * No `eval`, no shell execution, no filename or file content is ever executed.
 * Errors shown in the browser are short sentences; tracebacks go to the server
   log only.
-* Uploads are deleted after 24 hours of inactivity, and files left behind by a
-  previous run are cleared at start-up.
+* Uploads are deleted after 24 hours of inactivity
+  (`VISION_ANALYZER_RETENTION_HOURS`), enforced by a background sweep every
+  5 minutes for as long as the server is up — including while nobody is using
+  it, which is the case that would otherwise fill a disk. Files left behind by
+  a previous run are cleared at start-up, and finished analysis records are
+  dropped after 6 hours.
 
 ## 12. Project layout
 
