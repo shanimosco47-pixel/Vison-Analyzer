@@ -230,19 +230,28 @@ def collect_interval_windows(
 ) -> FrameTimingEvidence:
     """Sample frame intervals from several points across the recording.
 
-    Each window is reached with a frame-index seek, and the seek is verified
-    before its samples are trusted: a backend that ignored the request would
-    otherwise hand back the opening frames repeatedly and make a recording that
-    changes cadence look perfectly steady.
+    Each window is reached with a frame-index seek, and a window counts only
+    when that seek is *positively* verified: the request must succeed and the
+    backend must report landing near where it was sent. A backend that ignored
+    the seek - or that cannot say where it is, reporting a non-finite position -
+    would otherwise hand back the opening frames repeatedly and make a recording
+    that changes cadence later look perfectly steady. Unverifiable is therefore
+    treated as unusable, and the resulting shortage of windows is refused by the
+    representativeness rule in :func:`assess_frame_timing`.
     """
     starts = _window_start_indices(frame_count, window_count, window_frames) if frame_count else [0]
     windows: list[list[float]] = []
 
     for start in starts:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, float(start))
+        seek_ok = bool(capture.set(cv2.CAP_PROP_POS_FRAMES, float(start)))
         landed = capture.get(cv2.CAP_PROP_POS_FRAMES)
-        if math.isfinite(landed) and abs(landed - start) > window_frames:
-            logger.debug("Seek to frame %d landed at %.0f; skipping that window", start, landed)
+        if not seek_ok or not math.isfinite(landed) or abs(landed - start) > window_frames:
+            logger.debug(
+                "Seek to frame %d not verified (accepted=%s, landed=%r); skipping that window",
+                start,
+                seek_ok,
+                landed,
+            )
             continue
 
         stamps: list[float] = []

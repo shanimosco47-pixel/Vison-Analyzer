@@ -10,6 +10,12 @@ later pass and then be mis-timed everywhere — the original defect surviving th
 fix. Windows are now spread across the duration and compared both internally
 and against each other.
 
+Spreading the windows only helps if the seeks actually happened, so each seek
+must be positively verified before its samples count. A backend that ignores
+seeks, or that cannot report where it landed, would otherwise resample the
+opening frames and manufacture the very steadiness the check exists to
+disprove.
+
 Where a real file cannot express the pattern under test, a `FakeCapture`
 supplies scripted presentation timestamps to the *real* sampling code, so the
 seeking and windowing logic is exercised rather than stubbed out. A genuine VFR
@@ -50,21 +56,42 @@ class FakeCapture:
 
     Only the three calls the sampler makes are implemented: seek by frame
     index, read the current position, and grab the next frame.
+
+    The three flags model the ways a real backend can fail to seek, each of
+    which must stop the resulting samples from being trusted:
+
+    ``honour_seeks``
+        ``False`` means the seek is silently ignored and decoding continues
+        from wherever it already was.
+    ``report_position``
+        ``False`` means ``CAP_PROP_POS_FRAMES`` comes back as ``NaN`` - the
+        backend cannot say where it is, so nothing about the seek is provable.
+    ``seek_succeeds``
+        ``False`` means ``set()`` itself reports failure.
     """
 
-    def __init__(self, stamps_ms: list[float], *, honour_seeks: bool = True):
+    def __init__(
+        self,
+        stamps_ms: list[float],
+        *,
+        honour_seeks: bool = True,
+        report_position: bool = True,
+        seek_succeeds: bool = True,
+    ):
         self.stamps = stamps_ms
         self.honour_seeks = honour_seeks
+        self.report_position = report_position
+        self.seek_succeeds = seek_succeeds
         self.position = 0
 
     def set(self, prop: int, value: float) -> bool:
         if prop == cv2.CAP_PROP_POS_FRAMES and self.honour_seeks:
             self.position = int(value)
-        return True
+        return self.seek_succeeds
 
     def get(self, prop: int) -> float:
         if prop == cv2.CAP_PROP_POS_FRAMES:
-            return float(self.position)
+            return float(self.position) if self.report_position else float("nan")
         if prop == cv2.CAP_PROP_POS_MSEC:
             index = min(max(self.position - 1, 0), len(self.stamps) - 1)
             return self.stamps[index]
@@ -180,6 +207,47 @@ class TestCollectIntervalWindows:
         assert len(result.usable_windows) <= 1
         assert not assess_frame_timing(result).reliable
 
+    def test_a_backend_that_cannot_report_its_position_is_refused(self):
+        """NaN position: the seek is unprovable, so no window may be trusted.
+
+        This is the false negative the previous guard had. It skipped a window
+        only when the landed position was finite *and* far away, so a backend
+        reporting ``NaN`` fell straight through and its samples were kept. With
+        seeks also ignored, those samples are the opening frames over and over -
+        five apparently steady windows from a recording that changes cadence at
+        the halfway point, passed as constant and then mis-timed throughout.
+        """
+        stamps = stamps_from_intervals((33.3, 500), (200.0, 500))
+        capture = FakeCapture(stamps, honour_seeks=False, report_position=False)
+        result = collect_interval_windows(capture, frame_count=len(stamps))
+
+        assert result.windows == []
+        verdict = assess_frame_timing(result)
+        assert not verdict.reliable
+        assert verdict.reason in {"no_usable_timestamps", "unrepresentative_sample"}
+
+    def test_position_is_unprovable_even_when_the_seek_was_honoured(self):
+        """Correct seeks with unreadable positions are still not evidence.
+
+        Conservative by design: the samples here happen to be genuine, but
+        nothing observable distinguishes them from the case above, and guessing
+        is what produces confidently wrong timestamps.
+        """
+        capture = FakeCapture(stamps_from_intervals((40.0, 999)), report_position=False)
+        result = collect_interval_windows(capture, frame_count=1000)
+
+        assert result.windows == []
+        assert not assess_frame_timing(result).reliable
+
+    def test_a_seek_the_backend_reports_as_failed_is_not_trusted(self):
+        """``set()`` returning False is a refusal even if the position looks right."""
+        stamps = stamps_from_intervals((33.3, 500), (200.0, 500))
+        capture = FakeCapture(stamps, honour_seeks=False, seek_succeeds=False)
+        result = collect_interval_windows(capture, frame_count=len(stamps))
+
+        assert result.windows == []
+        assert not assess_frame_timing(result).reliable
+
     def test_a_real_constant_rate_file_is_sampled_and_accepted(self, motion_video):
         capture = cv2.VideoCapture(str(motion_video.path))
         try:
@@ -267,4 +335,27 @@ class TestUploadRejectsUnreliableTiming:
 
         assert response.status_code == 400
         assert "variable frame rate" in response.get_json()["error"]
+        assert list(app.extensions["app_config"].upload_dir.glob("*")) == []
+
+    def test_upload_is_refused_when_seeks_cannot_be_verified(
+        self, client, app, motion_video, monkeypatch
+    ):
+        """A backend reporting NaN positions must not get a measurement."""
+        stamps = stamps_from_intervals((33.3, 500), (200.0, 500))
+        monkeypatch.setattr(
+            metadata,
+            "collect_interval_windows",
+            lambda capture, **kwargs: collect_interval_windows(
+                FakeCapture(stamps, honour_seeks=False, report_position=False),
+                frame_count=len(stamps),
+            ),
+        )
+        response = client.post(
+            "/api/videos",
+            data={"file": (io.BytesIO(motion_video.path.read_bytes()), "phone_clip.mp4")},
+            content_type="multipart/form-data",
+        )
+
+        assert response.status_code == 400
+        assert "could not be verified" in response.get_json()["error"]
         assert list(app.extensions["app_config"].upload_dir.glob("*")) == []
