@@ -286,15 +286,21 @@ pass stores one float per *sample* (a 12-hour scan at one sample per 5 s is
 * **Seek performance depends on the codec.** Stage B seeks directly into the
   file. On long-GOP H.264/H.265 exports each seek costs more than on the
   fixtures used here; verify Stage B timing on your own footage.
-* **Variable-frame-rate recordings are refused, not analysed.** Every timing
-  here is derived from a single frame rate, so on a VFR file the error grows
-  through the recording. Rather than report confidently wrong timestamps, the
-  upload is rejected with an explanation and a suggestion to re-save the file
-  at a constant rate. Detection compares the spacing of presentation
-  timestamps across the first 120 frames; it tolerates NTSC quantisation and
-  the occasional dropped frame. **Full VFR support is future work** and needs
-  real VFR footage to validate against — the decision logic here is tested
-  against scripted timestamp patterns, not against a genuine VFR container.
+* **Recordings that cannot be timed with one frame rate are refused, not
+  analysed.** Every timing here is derived from a single frame rate, so on a
+  variable-rate file the error grows through the recording. Rather than report
+  confidently wrong timestamps, the upload is rejected with an explanation and
+  a suggestion to re-save at a constant rate. Detection samples five short
+  windows spread across the *whole* file (~200 frames however long it is) and
+  compares them both internally and against each other, so a recording that
+  starts steady and changes later is caught. It tolerates NTSC quantisation and
+  the occasional dropped frame. A file whose cadence cannot be checked at all —
+  no usable timestamps, or too little of it sampled to be representative — is
+  also refused, with a different message: an unverified constant-rate
+  assumption is exactly what corrupts timestamps silently. **Full VFR support
+  is future work** and needs real VFR footage to validate against; the logic
+  here is tested with scripted timestamp patterns fed through the real sampler,
+  never against a genuine VFR container.
 * **Job state lives in memory.** Restarting the server clears uploads and
   results. That is intentional for a local prototype; a database would be the
   first thing to add if results must survive a restart.

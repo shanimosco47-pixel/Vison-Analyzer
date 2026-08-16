@@ -36,23 +36,54 @@ FPS_ESTIMATION_FRAMES = 60
 # every other check and is then timed as if it were constant. These settings
 # decide when the spacing between presentation timestamps is irregular enough
 # that the constant-rate assumption must be refused.
+#
+# The evidence must be representative of the *whole* recording. Sampling only
+# the opening seconds misses the common case of a file that starts at a steady
+# cadence and changes later - a phone or surveillance clip whose rate drops
+# once the scene goes quiet or the encoder falls behind. Several short windows
+# spread across the duration are compared both internally and against each
+# other, which catches an irregular later section and a later section that is
+# internally steady but at a different rate.
 
-# How many frame intervals are examined at the start of the recording.
-VFR_SAMPLE_FRAMES = 120
+# Windows sampled across the recording, and frames grabbed in each. Five
+# windows of 40 frames is ~200 frames however long the file is: bounded, and
+# a handful of keyframe seeks.
+VFR_WINDOW_COUNT = 5
+VFR_WINDOW_FRAMES = 40
 
-# Fewer than this many usable intervals is not enough evidence to judge, so the
-# file is accepted (the alternative would be rejecting short clips at random).
+# A window needs this many intervals before its cadence means anything.
 VFR_MIN_INTERVALS = 20
 
-# An interval counts as irregular when it differs from the median interval by
-# more than this fraction of it. 0.5 is far wider than the +/-1 ms quantisation
-# of a 29.97 FPS file, and far narrower than a genuine rate change.
+# Within a window, an interval is irregular when it differs from that window's
+# median by more than this fraction. 0.5 is far wider than the +/-1 ms
+# quantisation of a 29.97 FPS file and far narrower than a real rate change.
 VFR_INTERVAL_TOLERANCE = 0.5
 
-# The file is rejected when more than this fraction of intervals are irregular.
-# A tenth tolerates the occasional dropped frame in an otherwise constant-rate
-# recording, while a real rate change affects far more than that.
+# A window is irregular when more than this fraction of its intervals are.
+# A tenth tolerates the occasional dropped frame.
 VFR_MAX_IRREGULAR_RATIO = 0.10
+
+# Between windows, the median interval may drift by at most this fraction.
+# Millisecond quantisation moves a median by ~3%; a real rate change (30 -> 25
+# FPS is 20%, 30 -> 15 is 100%) moves it far more.
+VFR_MEDIAN_DRIFT_TOLERANCE = 0.15
+
+# A recording this short cannot accumulate meaningful drift even if its cadence
+# does vary, so it is accepted without cadence evidence rather than refused for
+# being too short to judge.
+VFR_NEGLIGIBLE_FRAMES = VFR_MIN_INTERVALS + 1
+
+# Shown when the cadence could not be checked at all, as opposed to when it was
+# checked and found to vary. Both are refusals - an unverified constant-rate
+# assumption is what silently corrupts timestamps - but the user deserves to
+# know which happened.
+UNVERIFIABLE_TIMING_MESSAGE = (
+    "The frame timing of this recording could not be verified, so it has been "
+    "rejected rather than measured on an assumption that may be wrong. This "
+    "usually means the file does not carry usable frame timestamps, or is too "
+    "long for its length to be established. Re-saving it with a constant frame "
+    "rate (most editors can do this, as can 'ffmpeg -vsync cfr') will fix it."
+)
 
 
 @dataclass(frozen=True)
@@ -133,54 +164,176 @@ def _estimate_fps_from_timestamps(capture: cv2.VideoCapture) -> float | None:
     return fps
 
 
-def measure_frame_intervals(
-    capture: cv2.VideoCapture, limit: int = VFR_SAMPLE_FRAMES
-) -> list[float]:
-    """Gaps in milliseconds between the presentation timestamps of the first frames.
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
 
-    Returns an empty list when the backend does not expose usable timestamps,
-    which is treated as "cannot judge" rather than as evidence either way.
+
+@dataclass(frozen=True)
+class FrameTimingEvidence:
+    """Cadence samples taken from across a recording."""
+
+    windows: list[list[float]]  # frame intervals in ms, one list per window
+    frame_count: int | None
+    windows_requested: int
+
+    @property
+    def usable_windows(self) -> list[list[float]]:
+        return [window for window in self.windows if len(window) >= VFR_MIN_INTERVALS]
+
+    @property
+    def is_representative(self) -> bool:
+        """Whether the samples say anything about the recording as a whole.
+
+        Two windows from different parts of the file qualify. So does a single
+        window on a file short enough for that window to cover most of it. A
+        single opening window on a long file does not - that is precisely the
+        blind spot that lets a file which changes cadence later slip through.
+        """
+        usable = self.usable_windows
+        if not usable:
+            return False
+        if len(usable) >= 2:
+            return True
+        if not self.frame_count:
+            return False
+        return (len(usable[0]) + 1) >= 0.5 * self.frame_count
+
+
+@dataclass(frozen=True)
+class FrameTimingVerdict:
+    """Whether the recording can be timed with a single frame rate."""
+
+    reliable: bool
+    reason: str
+    detail: str
+
+
+def _window_start_indices(frame_count: int, windows: int, window_frames: int) -> list[int]:
+    """Evenly spaced window starts that all fit inside the recording."""
+    last_start = max(0, frame_count - window_frames)
+    if windows <= 1 or last_start == 0:
+        return [0]
+    step = last_start / (windows - 1)
+    return sorted({int(round(index * step)) for index in range(windows)})
+
+
+def collect_interval_windows(
+    capture: cv2.VideoCapture,
+    *,
+    frame_count: int | None,
+    window_count: int = VFR_WINDOW_COUNT,
+    window_frames: int = VFR_WINDOW_FRAMES,
+) -> FrameTimingEvidence:
+    """Sample frame intervals from several points across the recording.
+
+    Each window is reached with a frame-index seek, and the seek is verified
+    before its samples are trusted: a backend that ignored the request would
+    otherwise hand back the opening frames repeatedly and make a recording that
+    changes cadence look perfectly steady.
     """
-    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    stamps: list[float] = []
-    for _ in range(limit):
-        if not capture.grab():
-            break
-        position_ms = capture.get(cv2.CAP_PROP_POS_MSEC)
-        if not math.isfinite(position_ms):
-            break
-        stamps.append(position_ms)
+    starts = _window_start_indices(frame_count, window_count, window_frames) if frame_count else [0]
+    windows: list[list[float]] = []
 
-    intervals = [later - earlier for earlier, later in zip(stamps, stamps[1:], strict=False)]
-    # A backend that reports 0 for every frame yields all-zero intervals; that
-    # is missing data, not a constant frame rate of infinity.
-    return intervals if any(interval > 0 for interval in intervals) else []
+    for start in starts:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, float(start))
+        landed = capture.get(cv2.CAP_PROP_POS_FRAMES)
+        if math.isfinite(landed) and abs(landed - start) > window_frames:
+            logger.debug("Seek to frame %d landed at %.0f; skipping that window", start, landed)
+            continue
+
+        stamps: list[float] = []
+        for _ in range(window_frames):
+            if not capture.grab():
+                break
+            position_ms = capture.get(cv2.CAP_PROP_POS_MSEC)
+            if not math.isfinite(position_ms):
+                break
+            stamps.append(position_ms)
+
+        # Non-positive gaps mean the backend is not reporting real timestamps;
+        # dropping them lets "no usable evidence" be recognised as such.
+        intervals = [
+            later - earlier
+            for earlier, later in zip(stamps, stamps[1:], strict=False)
+            if later - earlier > 0
+        ]
+        if intervals:
+            windows.append(intervals)
+
+    return FrameTimingEvidence(
+        windows=windows, frame_count=frame_count, windows_requested=len(starts)
+    )
 
 
-def is_variable_frame_rate(
-    intervals_ms: Sequence[float],
+def assess_frame_timing(
+    evidence: FrameTimingEvidence,
     *,
     tolerance: float = VFR_INTERVAL_TOLERANCE,
     max_irregular_ratio: float = VFR_MAX_IRREGULAR_RATIO,
-    min_intervals: int = VFR_MIN_INTERVALS,
-) -> bool:
-    """Decide whether frame spacing is too irregular to be timed as constant.
+    drift_tolerance: float = VFR_MEDIAN_DRIFT_TOLERANCE,
+) -> FrameTimingVerdict:
+    """Decide whether a single frame rate can describe the whole recording.
 
-    Pure and free of OpenCV so the decision can be tested directly against
-    scripted timestamp patterns: clean constant rate, NTSC millisecond
-    quantisation, an occasional dropped frame, and a genuine rate change.
+    Pure and free of OpenCV, so every branch can be tested against scripted
+    cadence patterns. Refuses whenever reliability cannot be *established* -
+    not only when variability is proven - because an unverified constant-rate
+    assumption is exactly what produces silently wrong timestamps.
     """
-    if len(intervals_ms) < min_intervals:
-        return False  # not enough evidence to accuse the file of anything
+    if evidence.frame_count and evidence.frame_count <= VFR_NEGLIGIBLE_FRAMES:
+        return FrameTimingVerdict(
+            True,
+            "too_short_to_matter",
+            f"{evidence.frame_count} frames; drift cannot accumulate",
+        )
 
-    ordered = sorted(intervals_ms)
-    middle = len(ordered) // 2
-    median = ordered[middle] if len(ordered) % 2 else 0.5 * (ordered[middle - 1] + ordered[middle])
-    if median <= 0:
-        return False
+    usable = evidence.usable_windows
+    if not usable:
+        return FrameTimingVerdict(
+            False,
+            "no_usable_timestamps",
+            f"{evidence.windows_requested} window(s) sampled, none yielded "
+            f"{VFR_MIN_INTERVALS} usable presentation timestamps",
+        )
 
-    irregular = sum(1 for value in intervals_ms if abs(value - median) > tolerance * median)
-    return irregular / len(intervals_ms) > max_irregular_ratio
+    if not evidence.is_representative:
+        return FrameTimingVerdict(
+            False,
+            "unrepresentative_sample",
+            f"only one window covering {len(usable[0]) + 1} of {evidence.frame_count} "
+            "frames could be sampled, so a later change in cadence would be missed",
+        )
+
+    medians = [_median(window) for window in usable]
+    for position, (window, median) in enumerate(zip(usable, medians, strict=True)):
+        irregular = sum(1 for value in window if abs(value - median) > tolerance * median)
+        if irregular / len(window) > max_irregular_ratio:
+            return FrameTimingVerdict(
+                False,
+                "irregular_within_window",
+                f"window {position + 1} of {len(usable)}: {irregular}/{len(window)} intervals "
+                f"deviate from its {median:.1f} ms median",
+            )
+
+    overall = _median(medians)
+    drift = max(abs(median - overall) for median in medians)
+    if overall > 0 and drift > drift_tolerance * overall:
+        return FrameTimingVerdict(
+            False,
+            "rate_changes_between_windows",
+            "window medians "
+            + ", ".join(f"{median:.1f}" for median in medians)
+            + f" ms differ by up to {drift / overall:.0%}",
+        )
+
+    return FrameTimingVerdict(
+        True,
+        "constant",
+        f"{len(usable)} window(s) across the recording, median {overall:.1f} ms",
+    )
 
 
 def probe_video(path: Path) -> VideoInfo:
@@ -235,34 +388,34 @@ def probe_video(path: Path) -> VideoInfo:
                 "declare a usable one. Timings may be less accurate."
             )
 
-        # Refuse variable-frame-rate recordings outright. Every timing here is
-        # derived from one frame rate, so a file whose cadence changes would be
-        # reported with confidently wrong timestamps - the one outcome this
-        # application must never produce. Full VFR support is future work.
-        intervals = measure_frame_intervals(capture)
-        if is_variable_frame_rate(intervals):
-            median_ms = sorted(intervals)[len(intervals) // 2]
-            logger.warning(
-                "Rejecting %s: variable frame rate (%d intervals sampled, median %.1f ms, "
-                "min %.1f ms, max %.1f ms, container claims %.3f fps)",
-                path.name,
-                len(intervals),
-                median_ms,
-                min(intervals),
-                max(intervals),
-                fps,
-            )
-            raise VariableFrameRateError(
-                detail=(
-                    f"{len(intervals)} intervals sampled, median {median_ms:.1f} ms, "
-                    f"range {min(intervals):.1f}-{max(intervals):.1f} ms, "
-                    f"declared fps {fps:.3f}"
-                )
-            )
-
         raw_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
         has_frame_count = math.isfinite(raw_count) and raw_count > 0
         frame_count: int | None = int(raw_count) if has_frame_count else None
+
+        # Refuse any recording that cannot be timed with a single frame rate.
+        # Every timing here is derived from one FPS value, so a file whose
+        # cadence changes would be reported with confidently wrong timestamps -
+        # the one outcome this application must never produce. The evidence is
+        # gathered from windows spread across the whole file, because a file
+        # that starts steady and changes later is the common case.
+        # Full VFR support is future work.
+        evidence = collect_interval_windows(capture, frame_count=frame_count)
+        verdict = assess_frame_timing(evidence)
+        if not verdict.reliable:
+            logger.warning(
+                "Rejecting %s: frame timing not reliable (%s; %s; container claims %.3f fps)",
+                path.name,
+                verdict.reason,
+                verdict.detail,
+                fps,
+            )
+            raise VariableFrameRateError(
+                UNVERIFIABLE_TIMING_MESSAGE
+                if verdict.reason in {"no_usable_timestamps", "unrepresentative_sample"}
+                else None,
+                detail=f"{verdict.reason}: {verdict.detail}; declared fps {fps:.3f}",
+            )
+        logger.debug("Frame timing accepted for %s (%s)", path.name, verdict.detail)
 
         duration_s: float | None
         if frame_count:
