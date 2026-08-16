@@ -55,11 +55,39 @@ class TestFormatting:
     def test_video_timestamp(self, seconds, expected):
         assert format_video_timestamp(seconds) == expected
 
-    def test_rounding_carry(self):
-        assert format_video_timestamp(1.9999) == "0:00:02.000"
+    @pytest.mark.parametrize(
+        ("seconds", "expected"),
+        [
+            (1.9999, "0:00:02.000"),  # carry inside the minute
+            (59.9999, "0:01:00.000"),  # carry across the minute
+            (119.9999, "0:02:00.000"),  # carry across a later minute
+            (3599.9999, "1:00:00.000"),  # carry across the hour
+            (59.9994, "0:00:59.999"),  # just below: must not carry
+            (0.0, "0:00:00.000"),
+        ],
+    )
+    def test_rounding_carries_across_every_boundary(self, seconds, expected):
+        """Rounding milliseconds up must propagate into minutes and hours.
+
+        Regression: the carry used to increment the seconds field alone, so
+        59.9999 s was rendered as the impossible "0:00:60.000".
+        """
+        assert format_video_timestamp(seconds) == expected
+
+    def test_no_timestamp_field_ever_overflows(self):
+        """No input may produce a minutes or seconds field of 60 or more."""
+        for milli in range(0, 7_200_000, 999):  # two hours in ~1 s steps
+            text = format_video_timestamp(milli / 1000)
+            _, minutes, rest = text.split(":")
+            assert int(minutes) < 60, text
+            assert float(rest) < 60.0, text
 
     def test_without_milliseconds(self):
         assert format_video_timestamp(65.4, milliseconds=False) == "0:01:05"
+
+    def test_without_milliseconds_truncates_rather_than_carrying(self):
+        """Dropping the fraction must not round a time up into the next minute."""
+        assert format_video_timestamp(59.6, milliseconds=False) == "0:00:59"
 
     @pytest.mark.parametrize(
         ("seconds", "expected"),

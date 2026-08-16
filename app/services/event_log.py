@@ -44,16 +44,20 @@ def format_video_timestamp(seconds: float, *, milliseconds: bool = True) -> str:
 
     Negative inputs are clamped to zero: a video-relative time before the start
     of the video is meaningless and must not appear in a report.
+
+    The value is rounded to whole milliseconds *before* being split into hours,
+    minutes, seconds and milliseconds, so a carry propagates through every
+    field. Rounding after the split would let 59.9999 s render as the
+    impossible "0:00:60.000".
     """
-    seconds = max(0.0, float(seconds))
-    hours, remainder = divmod(int(seconds), 3600)
-    minutes, whole_seconds = divmod(remainder, 60)
+    total_ms = int(round(max(0.0, float(seconds)) * 1000))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, fraction = divmod(remainder, 1000)
     if not milliseconds:
+        # Truncate the fraction rather than rounding the seconds up: a time
+        # shown without a fraction should name the second the event is in.
         return f"{hours}:{minutes:02d}:{whole_seconds:02d}"
-    fraction = int(round((seconds - int(seconds)) * 1000))
-    if fraction == 1000:  # rounding carried over
-        whole_seconds += 1
-        fraction = 0
     return f"{hours}:{minutes:02d}:{whole_seconds:02d}.{fraction:03d}"
 
 
