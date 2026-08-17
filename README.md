@@ -286,21 +286,38 @@ pass stores one float per *sample* (a 12-hour scan at one sample per 5 s is
 * **Seek performance depends on the codec.** Stage B seeks directly into the
   file. On long-GOP H.264/H.265 exports each seek costs more than on the
   fixtures used here; verify Stage B timing on your own footage.
-* **Recordings that cannot be timed with one frame rate are refused, not
-  analysed.** Every timing here is derived from a single frame rate, so on a
-  variable-rate file the error grows through the recording. Rather than report
-  confidently wrong timestamps, the upload is rejected with an explanation and
-  a suggestion to re-save at a constant rate. Detection samples five short
-  windows spread across the *whole* file (~200 frames however long it is) and
-  compares them both internally and against each other, so a recording that
-  starts steady and changes later is caught. It tolerates NTSC quantisation and
-  the occasional dropped frame. A file whose cadence cannot be checked at all —
-  no usable timestamps, or too little of it sampled to be representative — is
-  also refused, with a different message: an unverified constant-rate
-  assumption is exactly what corrupts timestamps silently. **Full VFR support
-  is future work** and needs real VFR footage to validate against; the logic
-  here is tested with scripted timestamp patterns fed through the real sampler,
-  never against a genuine VFR container.
+* **Frame timing is checked, and the accuracy is bounded rather than assumed.**
+  Every timing here is derived from a single frame rate, so on a file whose
+  presentation timestamps do not follow that rate the error grows through the
+  recording. Five short windows spread across the *whole* file (~200 frames
+  however long it is) are checked three ways: each window's internal
+  regularity, the windows' cadences against each other, and — the rule that
+  actually bounds the damage — how far each window's first frame sits from
+  where `index / fps` puts it. The *spread* of those offsets is the error a
+  measured duration inherits, and a recording is refused when it exceeds
+  `VFR_MAX_TIMING_ERROR_S` (default **0.05 s**, in `app/video/metadata.py`
+  alongside the other frame-timing thresholds). A constant offset is not drift:
+  a recording that merely starts at a non-zero timestamp shifts every reported
+  time equally and is accepted.
+
+  This is a **bounded-accuracy** policy, not a constant-rate-only one. A file
+  that drops the occasional frame — common in surveillance exports — is
+  accepted, and its timing error is known to be inside the budget rather than
+  merely presumed small. Refusals carry three distinct messages, because the
+  operator needs to know which happened: the rate varies, the timing drifted,
+  or the timing could not be checked at all. That last case is a refusal too —
+  an unverified constant-rate assumption is exactly what corrupts timestamps
+  silently.
+
+  **What this does and does not prove.** The rules run against genuine
+  variable-rate containers in `tests/fixtures/` (see the README there),
+  including one whose irregular burst falls entirely between the sampled
+  windows and which no threshold on cadence shape can catch. But the evidence
+  is *sampled*: the offsets observed at five window starts are a lower bound on
+  the peak drift between them, so the budget bounds what was measured, not a
+  guaranteed worst case. No real plant or phone recording has been through this
+  code. **Full VFR support — timing from presentation timestamps instead of a
+  single rate — remains future work.**
 * **Job state lives in memory.** Restarting the server clears uploads and
   results. That is intentional for a local prototype; a database would be the
   first thing to add if results must survive a restart.

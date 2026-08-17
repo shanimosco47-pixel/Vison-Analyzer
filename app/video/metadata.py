@@ -73,6 +73,29 @@ VFR_MEDIAN_DRIFT_TOLERANCE = 0.15
 # being too short to judge.
 VFR_NEGLIGIBLE_FRAMES = VFR_MIN_INTERVALS + 1
 
+# How far the reported timing may drift from the recording's own presentation
+# timestamps, in seconds. Tune this the way the other thresholds above are
+# tuned; it is the one that decides accuracy rather than shape.
+#
+# The three rules above ask "does the cadence *look* irregular?". This one
+# measures the harm directly: at each sampled window start the frame's real
+# presentation timestamp is compared against `index / fps`, which is the only
+# timing this application ever reports (see reader.py). The *spread* of those
+# offsets is what corrupts a measured duration - a constant offset shifts every
+# timestamp equally and cancels out of every interval, so a recording that
+# simply starts at a non-zero PTS is not penalised.
+#
+# Measuring drift also covers what the shape rules cannot: the windows examine
+# roughly a third of a long recording, and an irregular burst falling entirely
+# between two of them leaves every window internally perfect and every median
+# identical. The offset at the *next* window start still carries it, because it
+# accounts for everything decoded before that frame.
+#
+# 0.05 s is an order of magnitude below the shortest persistence rule the
+# analysis layer applies (0.30 s to start Zahn flow), so a recording inside the
+# budget cannot move an event across a decision boundary.
+VFR_MAX_TIMING_ERROR_S = 0.05
+
 # Shown when the cadence could not be checked at all, as opposed to when it was
 # checked and found to vary. Both are refusals - an unverified constant-rate
 # assumption is what silently corrupts timestamps - but the user deserves to
@@ -83,6 +106,19 @@ UNVERIFIABLE_TIMING_MESSAGE = (
     "usually means the file does not carry usable frame timestamps, or is too "
     "long for its length to be established. Re-saving it with a constant frame "
     "rate (most editors can do this, as can 'ffmpeg -vsync cfr') will fix it."
+)
+
+# Shown when the cadence looks steady everywhere it was sampled but the frame
+# timing has still drifted away from a single frame rate by more than the
+# accuracy budget. This is the case an operator is least likely to expect - the
+# file looks completely normal - so the message says what was measured.
+TIMING_DRIFT_MESSAGE = (
+    "The frame timing of this recording drifts too far from a single frame "
+    "rate, so its timestamps would be wrong by more than the accuracy this "
+    "tool guarantees, and it has been rejected rather than measured. This "
+    "usually means frames were dropped unevenly while recording. Re-save it "
+    "with a constant frame rate (most editors can do this, as can "
+    "'ffmpeg -vsync cfr') and upload it again."
 )
 
 
@@ -180,6 +216,11 @@ class FrameTimingEvidence:
     frame_count: int | None
     windows_requested: int
 
+    # For each sampled window, how far that window's first frame sits from
+    # where `index / fps` says it should be, in milliseconds. Empty when no
+    # frame rate was supplied to compare against.
+    offsets_ms: list[float] = field(default_factory=list)
+
     @property
     def usable_windows(self) -> list[list[float]]:
         return [window for window in self.windows if len(window) >= VFR_MIN_INTERVALS]
@@ -227,8 +268,15 @@ def collect_interval_windows(
     frame_count: int | None,
     window_count: int = VFR_WINDOW_COUNT,
     window_frames: int = VFR_WINDOW_FRAMES,
+    fps: float | None = None,
 ) -> FrameTimingEvidence:
     """Sample frame intervals from several points across the recording.
+
+    When ``fps`` is supplied, each window also records how far its first frame's
+    presentation timestamp sits from ``index / fps`` — the timing this
+    application actually reports. Those offsets are what
+    :func:`assess_frame_timing` uses to bound the error directly instead of
+    inferring it from the shape of the cadence.
 
     Each window is reached with a frame-index seek, and a window counts only
     when that seek is *positively* verified: the request must succeed and the
@@ -241,6 +289,8 @@ def collect_interval_windows(
     """
     starts = _window_start_indices(frame_count, window_count, window_frames) if frame_count else [0]
     windows: list[list[float]] = []
+    offsets_ms: list[float] = []
+    can_measure_offset = fps is not None and math.isfinite(fps) and fps > 0
 
     for start in starts:
         seek_ok = bool(capture.set(cv2.CAP_PROP_POS_FRAMES, float(start)))
@@ -263,6 +313,12 @@ def collect_interval_windows(
                 break
             stamps.append(position_ms)
 
+        # stamps[0] belongs to frame `start` itself, so it is directly
+        # comparable with what the reader would report for that index.
+        if stamps and can_measure_offset:
+            assert fps is not None  # for type checkers; can_measure_offset proves it
+            offsets_ms.append(stamps[0] - start * 1000.0 / fps)
+
         # Non-positive gaps mean the backend is not reporting real timestamps;
         # dropping them lets "no usable evidence" be recognised as such.
         intervals = [
@@ -274,7 +330,10 @@ def collect_interval_windows(
             windows.append(intervals)
 
     return FrameTimingEvidence(
-        windows=windows, frame_count=frame_count, windows_requested=len(starts)
+        windows=windows,
+        frame_count=frame_count,
+        windows_requested=len(starts),
+        offsets_ms=offsets_ms,
     )
 
 
@@ -284,6 +343,7 @@ def assess_frame_timing(
     tolerance: float = VFR_INTERVAL_TOLERANCE,
     max_irregular_ratio: float = VFR_MAX_IRREGULAR_RATIO,
     drift_tolerance: float = VFR_MEDIAN_DRIFT_TOLERANCE,
+    max_timing_error_s: float = VFR_MAX_TIMING_ERROR_S,
 ) -> FrameTimingVerdict:
     """Decide whether a single frame rate can describe the whole recording.
 
@@ -338,11 +398,46 @@ def assess_frame_timing(
             + f" ms differ by up to {drift / overall:.0%}",
         )
 
+    # Finally, bound the error itself. A constant offset shifts every reported
+    # timestamp by the same amount and cancels out of every duration, so only
+    # the *spread* of the offsets is charged against the budget.
+    offsets = evidence.offsets_ms
+    if len(offsets) >= 2:
+        spread_ms = max(offsets) - min(offsets)
+        if spread_ms > max_timing_error_s * 1000.0:
+            return FrameTimingVerdict(
+                False,
+                "timing_drift",
+                "presentation timestamps drift "
+                + ", ".join(f"{value:+.1f}" for value in offsets)
+                + f" ms from index/fps across the sampled windows: a spread of "
+                f"{spread_ms:.0f} ms against a {max_timing_error_s * 1000:.0f} ms budget",
+            )
+
     return FrameTimingVerdict(
         True,
         "constant",
-        f"{len(usable)} window(s) across the recording, median {overall:.1f} ms",
+        f"{len(usable)} window(s) across the recording, median {overall:.1f} ms"
+        + (
+            f", timing drift within {max(offsets) - min(offsets):.1f} ms"
+            if len(offsets) >= 2
+            else ""
+        ),
     )
+
+
+def _refusal_message(reason: str) -> str | None:
+    """The user-facing wording for a refusal, or ``None`` for the default.
+
+    The three cases are genuinely different from the operator's point of view -
+    "we could not check", "the timing drifted", and "the rate varies" - and a
+    single message would send someone looking for the wrong problem.
+    """
+    if reason in {"no_usable_timestamps", "unrepresentative_sample"}:
+        return UNVERIFIABLE_TIMING_MESSAGE
+    if reason == "timing_drift":
+        return TIMING_DRIFT_MESSAGE
+    return None
 
 
 def probe_video(path: Path) -> VideoInfo:
@@ -408,7 +503,7 @@ def probe_video(path: Path) -> VideoInfo:
         # gathered from windows spread across the whole file, because a file
         # that starts steady and changes later is the common case.
         # Full VFR support is future work.
-        evidence = collect_interval_windows(capture, frame_count=frame_count)
+        evidence = collect_interval_windows(capture, frame_count=frame_count, fps=fps)
         verdict = assess_frame_timing(evidence)
         if not verdict.reliable:
             logger.warning(
@@ -419,9 +514,7 @@ def probe_video(path: Path) -> VideoInfo:
                 fps,
             )
             raise VariableFrameRateError(
-                UNVERIFIABLE_TIMING_MESSAGE
-                if verdict.reason in {"no_usable_timestamps", "unrepresentative_sample"}
-                else None,
+                _refusal_message(verdict.reason),
                 detail=f"{verdict.reason}: {verdict.detail}; declared fps {fps:.3f}",
             )
         logger.debug("Frame timing accepted for %s (%s)", path.name, verdict.detail)
