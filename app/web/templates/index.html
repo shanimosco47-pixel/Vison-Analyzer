@@ -168,6 +168,61 @@
     <div id="headline" class="headline hidden"></div>
     <ul id="result-notes" class="notes hidden"></ul>
 
+    <div id="zahn-review" class="zahn-review hidden">
+      <h3>Frame-by-frame review</h3>
+      <p class="hint">
+        An enlarged grayscale close-up of the marked outlet/stream region, synchronized
+        with the video above &mdash; useful for checking whether the automatically
+        detected flow start and end actually line up with what the liquid is doing.
+      </p>
+      <div class="review-grid">
+        <div class="review-panel">
+          <canvas id="review-canvas" aria-label="Grayscale close-up of the analysis region"></canvas>
+          <p id="review-unavailable" class="warning hidden"></p>
+        </div>
+        <div class="review-controls">
+          <p class="review-time">
+            Video time: <strong id="review-time-value">00:00.0</strong>
+            <span class="hint">elapsed in the recording, not a wall-clock time</span>
+          </p>
+          <div class="action-row">
+            <button type="button" id="review-back" class="secondary">&minus;0.1 s</button>
+            <button type="button" id="review-forward" class="secondary">+0.1 s</button>
+          </div>
+          <p class="hint">Seeks by a tenth of a second; the browser/codec may not land on
+            an exact frame boundary.</p>
+
+          <div class="review-timeline" id="review-timeline">
+            <div class="review-timeline-track" id="review-timeline-track"
+                 aria-label="Video position (click to seek)">
+              <div class="review-timeline-marker start hidden" id="review-marker-start"
+                   title="Detected flow start"></div>
+              <div class="review-timeline-marker end hidden" id="review-marker-end"
+                   title="Detected flow end"></div>
+              <div class="review-timeline-playhead" id="review-playhead"></div>
+            </div>
+          </div>
+
+          <div class="review-boundaries">
+            <div class="review-boundary">
+              <span class="review-boundary-label">Flow start</span>
+              <span class="review-boundary-value" id="review-start-value">&mdash;</span>
+              <button type="button" id="review-jump-start" class="secondary" disabled>
+                Jump near start
+              </button>
+            </div>
+            <div class="review-boundary">
+              <span class="review-boundary-label">Flow end</span>
+              <span class="review-boundary-value" id="review-end-value">&mdash;</span>
+              <button type="button" id="review-jump-end" class="secondary" disabled>
+                Jump near end
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div id="trace-holder" class="hidden">
       <p class="hint">Activity over time (the horizontal axis is video time; taller means more change)</p>
       <canvas id="trace-canvas" height="90"></canvas>
