@@ -86,11 +86,16 @@ function formatBytes(bytes) {
 /** Format elapsed video time with tenths precision, e.g. "00:16.3". */
 function formatTimeTenths(seconds) {
   if (typeof seconds !== "number" || !Number.isFinite(seconds)) return "--:--.-";
-  const total = Math.max(0, seconds);
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const secs = total % 60;
-  const secsText = secs.toFixed(1).padStart(4, "0"); // "6.3" -> "06.3"
+  // Round to whole tenths *before* decomposing into hours/minutes/seconds, so a
+  // value like 59.96 carries into the next minute ("01:00.0") instead of
+  // rounding its seconds component alone up to an impossible "60.0".
+  const totalTenths = Math.round(Math.max(0, seconds) * 10);
+  const wholeSeconds = Math.floor(totalTenths / 10);
+  const tenth = totalTenths % 10;
+  const hours = Math.floor(wholeSeconds / 3600);
+  const minutes = Math.floor((wholeSeconds % 3600) / 60);
+  const secs = wholeSeconds % 60;
+  const secsText = `${String(secs).padStart(2, "0")}.${tenth}`;
   const minutesText = String(minutes).padStart(2, "0");
   return hours > 0 ? `${hours}:${minutesText}:${secsText}` : `${minutesText}:${secsText}`;
 }
@@ -819,7 +824,11 @@ function initZahnReview() {
   const preview = el("preview");
   preview.addEventListener("loadedmetadata", onReviewSourceReady);
   preview.addEventListener("play", startReviewSyncLoop);
-  preview.addEventListener("pause", () => { drawReviewFrame(); updateReviewReadouts(); });
+  preview.addEventListener("pause", () => {
+    stopReviewSyncLoop();
+    drawReviewFrame();
+    updateReviewReadouts();
+  });
   preview.addEventListener("seeked", () => { drawReviewFrame(); updateReviewReadouts(); });
   preview.addEventListener("timeupdate", updateReviewReadouts);
 }
@@ -868,6 +877,13 @@ function setupZahnReview(summary) {
 
   if (preview.readyState >= 1) onReviewSourceReady();
   updateReviewBoundaryMarkers();
+
+  // The preview may already be playing when a result activates the panel
+  // (analysis can take a while, and nothing pauses the preview during it).
+  // In that case no future `play` event will arrive to start the sync loop,
+  // so start it explicitly rather than leaving the panel showing one frozen
+  // frame until the user happens to pause and play again.
+  if (!preview.paused) startReviewSyncLoop();
 }
 
 function teardownZahnReview() {
@@ -913,6 +929,12 @@ function onReviewSourceReady() {
 /** Prefers frame-accurate sync via requestVideoFrameCallback; falls back to rAF + events. */
 function startReviewSyncLoop() {
   if (!state.review.active) return;
+  // Single-owner: whatever chain might already be running (from an earlier
+  // `play`, possibly still in flight when this one fires - a `pause` and a
+  // fast `play` can otherwise race, since a callback already queued by a
+  // prior chain does not un-queue itself) is stopped before starting a new
+  // one, so at most one redraw loop is ever active.
+  stopReviewSyncLoop();
   const preview = el("preview");
 
   if (typeof preview.requestVideoFrameCallback === "function") {

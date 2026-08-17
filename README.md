@@ -244,7 +244,7 @@ and has its own suite, run separately with Node's built-in test runner —
 no npm install, no build step:
 
 ```bash
-node --test tests_js/
+node --test tests_js/*.test.js
 ```
 
 Everything DOM-facing in that panel (drawing to the canvas, synchronizing

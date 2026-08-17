@@ -3,7 +3,7 @@
  * (app/web/static/app.js). No browser, no DOM, no build step - these run
  * with Node's built-in test runner:
  *
- *   node --test tests_js/
+ *   node --test tests_js/*.test.js
  *
  * Only the functions exported through the `module.exports` guard at the
  * bottom of app.js are under test here; everything DOM-facing is covered
@@ -45,6 +45,20 @@ test("formatTimeTenths", async (t) => {
 
   await t.test("clamps a negative input to zero rather than showing a sign", () => {
     assert.equal(formatTimeTenths(-2.5), "00:00.0");
+  });
+
+  await t.test("carries a tenths rounding across a minute boundary", () => {
+    // 59.96 rounds to 60.0 seconds at one decimal place; that must carry into
+    // the minutes component rather than displaying the impossible "60.0".
+    assert.equal(formatTimeTenths(59.96), "01:00.0");
+  });
+
+  await t.test("carries a tenths rounding across an hour boundary", () => {
+    assert.equal(formatTimeTenths(3599.96), "1:00:00.0");
+  });
+
+  await t.test("carries a tenths rounding across a plain second boundary", () => {
+    assert.equal(formatTimeTenths(15.96), "00:16.0");
   });
 
   await t.test("returns a placeholder for non-finite or missing input", () => {
