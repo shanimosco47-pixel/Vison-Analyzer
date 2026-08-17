@@ -247,10 +247,19 @@ no npm install, no build step:
 node --test tests_js/*.test.js
 ```
 
-Everything DOM-facing in that panel (drawing to the canvas, synchronizing
-with the video element, button wiring) is exercised by the Chromium browser
-check described below instead, the same way the rest of the page's
-interactivity is.
+Everything DOM-facing in that panel — drawing to the canvas, synchronizing
+with the video element via `requestVideoFrameCallback`/its fallback, the
+`±0.1 s` and boundary-jump buttons, and correct callback teardown across
+pause/resume and rapid play/pause cycling — was verified manually with an
+ad hoc Playwright script against a real Chromium build, the same way the
+rest of the page's browser behavior has always been checked in this
+project (see the "Full browser flow in Chromium" row in §7). That script
+is **not committed to this repository and is not part of the automated
+gates above** — this project deliberately carries no Playwright/browser-test
+dependency, so there is nothing here a contributor can currently re-run for
+this panel's DOM-facing behavior beyond the Node suite's pure-logic
+coverage and the Python web tests' HTTP-level coverage. Treat it as
+manually verified once, not as regression-tested going forward.
 
 The Python suite has four layers:
 
