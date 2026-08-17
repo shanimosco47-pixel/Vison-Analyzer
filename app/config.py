@@ -15,6 +15,7 @@ individual fields from the UI without the analysis code knowing about HTTP.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
@@ -412,8 +413,14 @@ class AppConfig:
             raise ConfigurationError("The port number is invalid.")
         if self.retention_hours <= 0:
             raise ConfigurationError("The retention period must be greater than zero.")
-        if self.max_timing_error_s <= 0:
-            raise ConfigurationError("The frame-timing error budget must be greater than zero.")
+        if not math.isfinite(self.max_timing_error_s) or self.max_timing_error_s <= 0:
+            # NaN and +/-inf both satisfy `<= 0` being False, so they would
+            # otherwise pass as a valid budget and then silently disable the
+            # drift check downstream: `spread_ms > NaN` and `spread_ms > inf`
+            # are never true for any finite spread.
+            raise ConfigurationError(
+                "The frame-timing error budget must be a finite number greater than zero."
+            )
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> AppConfig:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -180,3 +181,26 @@ class TestAppConfig:
             AppConfig.from_env({"VISION_ANALYZER_MAX_TIMING_ERROR_S": "0"})
         with pytest.raises(ConfigurationError):
             AppConfig.from_env({"VISION_ANALYZER_MAX_TIMING_ERROR_S": "-0.05"})
+
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-0.05"])
+    def test_a_non_finite_or_non_positive_timing_budget_is_rejected(self, value):
+        """NaN and infinity both satisfy Python's `x <= 0` being False.
+
+        ``float("nan")`` and ``float("inf")`` parse successfully from the
+        environment, so a bare positivity check lets them through. Once
+        accepted, they silently disable the drift rule downstream:
+        ``spread_ms > NaN`` and ``spread_ms > inf`` are never true for any
+        finite spread, so every recording would pass timing-drift review
+        without a single video actually being checked.
+        """
+        with pytest.raises(ConfigurationError):
+            AppConfig.from_env({"VISION_ANALYZER_MAX_TIMING_ERROR_S": value})
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), 0.0, -0.05])
+    def test_validate_rejects_a_non_finite_or_non_positive_budget_directly(self, value):
+        """The same guard applies whether the value came from the environment
+        or was set directly, e.g. by future code that builds AppConfig in
+        memory rather than through from_env().
+        """
+        with pytest.raises(ConfigurationError):
+            replace(AppConfig(), max_timing_error_s=value).validate()
