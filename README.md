@@ -91,6 +91,19 @@ events), then the evidence: confidence, an activity-over-time plot, and the
 event table. Clicking a row seeks the preview player to that moment. **Export
 event log (CSV)** downloads the table.
 
+*For Zahn cup results specifically*, a **frame-by-frame review panel** sits
+just below the headline: an enlarged, grayscale close-up of the marked
+outlet/stream region, redrawn from the video above on every frame it plays or
+seeks to (via `requestVideoFrameCallback` where the browser supports it,
+falling back to a redraw loop otherwise) — nothing is re-encoded, uploaded, or
+sent anywhere. It shows the elapsed video time to a tenth of a second
+(distinct from any wall-clock time elsewhere on the page), `−0.1 s` / `+0.1 s`
+buttons for fine scrubbing, a small timeline with markers for the detected
+flow start and end, and a "jump near start/end" button for each boundary that
+seeks to just before it so you can watch the transition happen. This is a
+review aid only — it does not change the detected times or how they were
+computed.
+
 ## 4. The detection architecture
 
 ```
@@ -219,13 +232,36 @@ reaches 1.0.
 ## 6. Testing
 
 ```bash
-pytest                    # 237 tests, about 55 s
-ruff check app tests      # lint
-ruff format --check app tests
+pytest                    # 305 tests, about 33 s
+ruff check app tests scripts
+ruff format --check app tests scripts
 mypy app                  # static types
 ```
 
-The suite has four layers:
+The frame-by-frame review panel's pure logic (time formatting, seek
+clamping, ROI validity, canvas sizing) is plain, dependency-free JavaScript
+and has its own suite, run separately with Node's built-in test runner —
+no npm install, no build step:
+
+```bash
+node --test tests_js/*.test.js
+```
+
+Everything DOM-facing in that panel — drawing to the canvas, synchronizing
+with the video element via `requestVideoFrameCallback`/its fallback, the
+`±0.1 s` and boundary-jump buttons, and correct callback teardown across
+pause/resume and rapid play/pause cycling — was verified manually with an
+ad hoc Playwright script against a real Chromium build, the same way the
+rest of the page's browser behavior has always been checked in this
+project (see the "Full browser flow in Chromium" row in §7). That script
+is **not committed to this repository and is not part of the automated
+gates above** — this project deliberately carries no Playwright/browser-test
+dependency, so there is nothing here a contributor can currently re-run for
+this panel's DOM-facing behavior beyond the Node suite's pure-logic
+coverage and the Python web tests' HTTP-level coverage. Treat it as
+manually verified once, not as regression-tested going forward.
+
+The Python suite has four layers:
 
 * **Unit tests** for time↔frame conversion, sampling plans, persistence timers,
   hysteresis, ROI validation, configuration validation, timestamp formatting
@@ -322,6 +358,13 @@ pass stores one float per *sample* (a 12-hour scan at one sample per 5 s is
   guaranteed worst case. No real plant or phone recording has been through this
   code. **Full VFR support — timing from presentation timestamps instead of a
   single rate — remains future work.**
+* **The review panel's `±0.1 s` controls are 0.1-second seeks, not frame steps.**
+  Whether that lands on a distinct decoded frame depends on the browser, the
+  codec, and the actual frame rate — it is labelled as time-based seeking
+  rather than implying a frame-exact guarantee the browser cannot make.
+  Likewise, the grayscale close-up is kept in sync with the video element's
+  own `currentTime`/frame callbacks, so it is exact to the same precision as
+  the video element itself, not to an independently measured frame index.
 * **Job state lives in memory.** Restarting the server clears uploads and
   results. That is intentional for a local prototype; a database would be the
   first thing to add if results must survive a restart.
@@ -420,6 +463,7 @@ app/
   web/                        Flask routes, one HTML page, plain CSS/JS
 scripts/benchmark_scan.py     throughput and memory measurement
 tests/                        unit, synthetic, integration and web tests
+tests_js/                     Node-run unit tests for app.js's pure logic
 ```
 
 ### Adding a detector

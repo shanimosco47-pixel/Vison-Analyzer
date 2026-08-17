@@ -12,6 +12,9 @@
 "use strict";
 
 const POLL_INTERVAL_MS = 700;
+const REVIEW_SEEK_STEP_S = 0.1;
+const REVIEW_BOUNDARY_CONTEXT_S = 1.0;
+const REVIEW_CANVAS_TARGET_PX = 480;
 
 const state = {
   video: null,        // metadata of the uploaded video
@@ -22,6 +25,14 @@ const state = {
   jobId: null,
   pollTimer: null,
   dragStart: null,
+  review: {
+    active: false,      // a Zahn result with a usable ROI is on screen
+    roi: null,           // {x, y, width, height} in source pixels, from the analysis result
+    flowStartS: null,
+    flowEndS: null,
+    frameCallbackId: null,
+    rafId: null,
+  },
 };
 
 const el = (id) => document.getElementById(id);
@@ -61,6 +72,101 @@ function formatBytes(bytes) {
   return megabytes >= 1024
     ? `${(megabytes / 1024).toFixed(2)} GB`
     : `${megabytes.toFixed(1)} MB`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pure logic for the Zahn review panel                                */
+/*                                                                      */
+/* Kept free of the DOM so it can be unit-tested directly from Node     */
+/* (see tests_js/) without a browser. The module.exports guard at the   */
+/* bottom of this file is a no-op in the browser, where `module` does   */
+/* not exist.                                                           */
+/* ------------------------------------------------------------------ */
+
+/** Format elapsed video time with tenths precision, e.g. "00:16.3". */
+function formatTimeTenths(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return "--:--.-";
+  // Round to whole tenths *before* decomposing into hours/minutes/seconds, so a
+  // value like 59.96 carries into the next minute ("01:00.0") instead of
+  // rounding its seconds component alone up to an impossible "60.0".
+  const totalTenths = Math.round(Math.max(0, seconds) * 10);
+  const wholeSeconds = Math.floor(totalTenths / 10);
+  const tenth = totalTenths % 10;
+  const hours = Math.floor(wholeSeconds / 3600);
+  const minutes = Math.floor((wholeSeconds % 3600) / 60);
+  const secs = wholeSeconds % 60;
+  const secsText = `${String(secs).padStart(2, "0")}.${tenth}`;
+  const minutesText = String(minutes).padStart(2, "0");
+  return hours > 0 ? `${hours}:${minutesText}:${secsText}` : `${minutesText}:${secsText}`;
+}
+
+/** Clamp a seek target to [0, duration]. An unknown/invalid duration only clamps below. */
+function clampSeekTime(time, duration) {
+  const numericTime = typeof time === "number" && Number.isFinite(time) ? time : 0;
+  const upperBound = typeof duration === "number" && Number.isFinite(duration) && duration > 0
+    ? duration
+    : Infinity;
+  return Math.min(Math.max(numericTime, 0), upperBound);
+}
+
+/** The clamped result of stepping the current time by a (possibly negative) delta. */
+function stepSeekTime(currentTime, deltaSeconds, duration) {
+  return clampSeekTime((currentTime || 0) + deltaSeconds, duration);
+}
+
+/** The clamped seek target that gives some lead-in before a detected boundary. */
+function boundaryJumpTime(boundarySeconds, duration, contextSeconds = REVIEW_BOUNDARY_CONTEXT_S) {
+  if (typeof boundarySeconds !== "number" || !Number.isFinite(boundarySeconds)) return null;
+  return clampSeekTime(boundarySeconds - contextSeconds, duration);
+}
+
+/**
+ * Whether an ROI is a usable rectangle to crop and enlarge.
+ *
+ * Bounds against the video's native dimensions are only checked when they
+ * are supplied, so this can also validate an ROI before the video element
+ * has finished loading metadata.
+ */
+function isValidRoi(roi, videoWidth, videoHeight) {
+  if (!roi || typeof roi !== "object") return false;
+  const { x, y, width, height } = roi;
+  if (![x, y, width, height].every((value) => typeof value === "number" && Number.isFinite(value))) {
+    return false;
+  }
+  if (width <= 0 || height <= 0) return false;
+  if (typeof videoWidth === "number" && typeof videoHeight === "number"
+    && videoWidth > 0 && videoHeight > 0) {
+    if (x < 0 || y < 0 || x + width > videoWidth || y + height > videoHeight) return false;
+  }
+  return true;
+}
+
+/**
+ * The internal pixel resolution for the enlarged grayscale canvas: the ROI's
+ * aspect ratio, scaled so its longer side is `targetLongSidePx`.
+ *
+ * Returns null for a degenerate ROI so callers can show a clear message
+ * instead of drawing to a zero-sized or distorted canvas.
+ */
+function computeReviewCanvasSize(roiWidth, roiHeight, targetLongSidePx) {
+  if (!(roiWidth > 0) || !(roiHeight > 0) || !(targetLongSidePx > 0)) return null;
+  const scale = targetLongSidePx / Math.max(roiWidth, roiHeight);
+  return {
+    width: Math.max(1, Math.round(roiWidth * scale)),
+    height: Math.max(1, Math.round(roiHeight * scale)),
+  };
+}
+
+/** The percentage position (0-100) of a video-relative time along its timeline. */
+function timelinePercent(seconds, duration) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return null;
+  if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0) return null;
+  return Math.min(100, Math.max(0, (seconds / duration) * 100));
+}
+
+/** Whether the Zahn review panel should be shown at all for this result summary. */
+function shouldShowZahnReview(summary) {
+  return Boolean(summary && summary.mode === "zahn_cup");
 }
 
 async function readError(response) {
@@ -516,6 +622,7 @@ function resetResults() {
     el(id).classList.add("hidden")
   );
   el("events-table").querySelector("tbody").innerHTML = "";
+  teardownZahnReview();
 }
 
 /* ------------------------------------------------------------------ */
@@ -531,6 +638,7 @@ function renderResults(job) {
   renderNotes(result.warnings || [], summary.reasons || []);
   renderTrace(result.trace);
   renderEvents(job);
+  setupZahnReview(summary);
 
   el("diagnostics-json").textContent = JSON.stringify(
     { plan: job.plan, summary, diagnostics: result.diagnostics },
@@ -697,12 +805,247 @@ function renderEvents(job) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Zahn review panel - synchronized grayscale ROI and boundary controls */
+/*                                                                      */
+/* The panel reads frames directly from the existing <video>, draws the */
+/* analysis ROI (in source-pixel coordinates, as returned by the        */
+/* analysis result) onto a canvas at an enlarged size, and desaturates   */
+/* it with a CSS filter. No second video is created, uploaded, or       */
+/* stored; nothing here issues a network request.                       */
+/* ------------------------------------------------------------------ */
+
+function initZahnReview() {
+  el("review-back").addEventListener("click", () => reviewStep(-REVIEW_SEEK_STEP_S));
+  el("review-forward").addEventListener("click", () => reviewStep(REVIEW_SEEK_STEP_S));
+  el("review-jump-start").addEventListener("click", () => reviewJumpToBoundary(state.review.flowStartS));
+  el("review-jump-end").addEventListener("click", () => reviewJumpToBoundary(state.review.flowEndS));
+  el("review-timeline-track").addEventListener("click", (event) => reviewSeekFromTimelineClick(event));
+
+  const preview = el("preview");
+  preview.addEventListener("loadedmetadata", onReviewSourceReady);
+  preview.addEventListener("play", startReviewSyncLoop);
+  preview.addEventListener("pause", () => {
+    stopReviewSyncLoop();
+    drawReviewFrame();
+    updateReviewReadouts();
+  });
+  preview.addEventListener("seeked", () => { drawReviewFrame(); updateReviewReadouts(); });
+  preview.addEventListener("timeupdate", updateReviewReadouts);
+}
+
+function reviewStep(deltaSeconds) {
+  const preview = el("preview");
+  preview.currentTime = stepSeekTime(preview.currentTime, deltaSeconds, preview.duration);
+}
+
+function reviewJumpToBoundary(boundarySeconds) {
+  const preview = el("preview");
+  const target = boundaryJumpTime(boundarySeconds, preview.duration);
+  if (target === null) return;
+  preview.pause();
+  preview.currentTime = target;
+}
+
+function reviewSeekFromTimelineClick(event) {
+  const preview = el("preview");
+  if (!Number.isFinite(preview.duration) || preview.duration <= 0) return;
+  const rect = el("review-timeline-track").getBoundingClientRect();
+  const fraction = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0;
+  preview.currentTime = clampSeekTime(fraction * preview.duration, preview.duration);
+}
+
+/** Called after a new analysis result arrives; decides whether to show the panel. */
+function setupZahnReview(summary) {
+  if (!shouldShowZahnReview(summary)) {
+    teardownZahnReview();
+    return;
+  }
+
+  const preview = el("preview");
+  state.review.active = true;
+  state.review.roi = summary.roi || null;
+  state.review.flowStartS = typeof summary.flow_start_s === "number" ? summary.flow_start_s : null;
+  state.review.flowEndS = typeof summary.flow_end_s === "number" ? summary.flow_end_s : null;
+
+  el("zahn-review").classList.remove("hidden");
+  el("review-jump-start").disabled = state.review.flowStartS === null;
+  el("review-jump-end").disabled = state.review.flowEndS === null;
+  el("review-start-value").textContent =
+    state.review.flowStartS === null ? "not detected" : formatTimeTenths(state.review.flowStartS);
+  el("review-end-value").textContent =
+    state.review.flowEndS === null ? "not detected" : formatTimeTenths(state.review.flowEndS);
+
+  if (preview.readyState >= 1) onReviewSourceReady();
+  updateReviewBoundaryMarkers();
+
+  // The preview may already be playing when a result activates the panel
+  // (analysis can take a while, and nothing pauses the preview during it).
+  // In that case no future `play` event will arrive to start the sync loop,
+  // so start it explicitly rather than leaving the panel showing one frozen
+  // frame until the user happens to pause and play again.
+  if (!preview.paused) startReviewSyncLoop();
+}
+
+function teardownZahnReview() {
+  state.review.active = false;
+  state.review.roi = null;
+  state.review.flowStartS = null;
+  state.review.flowEndS = null;
+  stopReviewSyncLoop();
+  el("zahn-review").classList.add("hidden");
+  el("review-unavailable").classList.add("hidden");
+  el("review-canvas").classList.remove("hidden");
+}
+
+/** Sizes the canvas once the video's native dimensions and the ROI are both known. */
+function onReviewSourceReady() {
+  if (!state.review.active) return;
+  const preview = el("preview");
+  const roi = state.review.roi;
+  const valid = isValidRoi(roi, preview.videoWidth, preview.videoHeight);
+  const canvas = el("review-canvas");
+  const unavailable = el("review-unavailable");
+
+  if (!valid) {
+    canvas.classList.add("hidden");
+    unavailable.textContent =
+      "The marked region for this result can't be shown here - it no longer matches "
+      + "this video's dimensions.";
+    unavailable.classList.remove("hidden");
+    return;
+  }
+
+  const size = computeReviewCanvasSize(roi.width, roi.height, REVIEW_CANVAS_TARGET_PX);
+  canvas.width = size.width;
+  canvas.height = size.height;
+  canvas.classList.remove("hidden");
+  unavailable.classList.add("hidden");
+
+  drawReviewFrame();
+  updateReviewReadouts();
+  updateReviewBoundaryMarkers();
+}
+
+/** Prefers frame-accurate sync via requestVideoFrameCallback; falls back to rAF + events. */
+function startReviewSyncLoop() {
+  if (!state.review.active) return;
+  // Single-owner: whatever chain might already be running (from an earlier
+  // `play`, possibly still in flight when this one fires - a `pause` and a
+  // fast `play` can otherwise race, since a callback already queued by a
+  // prior chain does not un-queue itself) is stopped before starting a new
+  // one, so at most one redraw loop is ever active.
+  stopReviewSyncLoop();
+  const preview = el("preview");
+
+  if (typeof preview.requestVideoFrameCallback === "function") {
+    const onFrame = () => {
+      drawReviewFrame();
+      updateReviewReadouts();
+      if (!preview.paused && !preview.ended) {
+        state.review.frameCallbackId = preview.requestVideoFrameCallback(onFrame);
+      }
+    };
+    state.review.frameCallbackId = preview.requestVideoFrameCallback(onFrame);
+    return;
+  }
+
+  // Fallback for browsers without requestVideoFrameCallback: redraw every animation
+  // frame while playing. `timeupdate`/`seeked` (wired in initZahnReview) keep the
+  // readouts and drawing correct while paused or scrubbing.
+  const loop = () => {
+    drawReviewFrame();
+    updateReviewReadouts();
+    if (!preview.paused && !preview.ended) {
+      state.review.rafId = requestAnimationFrame(loop);
+    }
+  };
+  state.review.rafId = requestAnimationFrame(loop);
+}
+
+function stopReviewSyncLoop() {
+  const preview = el("preview");
+  if (state.review.frameCallbackId !== null && typeof preview.cancelVideoFrameCallback === "function") {
+    preview.cancelVideoFrameCallback(state.review.frameCallbackId);
+  }
+  state.review.frameCallbackId = null;
+  if (state.review.rafId !== null) {
+    cancelAnimationFrame(state.review.rafId);
+    state.review.rafId = null;
+  }
+}
+
+function drawReviewFrame() {
+  if (!state.review.active) return;
+  const canvas = el("review-canvas");
+  if (canvas.classList.contains("hidden")) return; // ROI invalid; nothing to draw
+  const preview = el("preview");
+  const roi = state.review.roi;
+
+  try {
+    const context = canvas.getContext("2d");
+    context.drawImage(
+      preview,
+      roi.x, roi.y, roi.width, roi.height,
+      0, 0, canvas.width, canvas.height
+    );
+  } catch (err) {
+    // A frame that cannot be drawn yet (e.g. before the first frame decodes)
+    // is not an error worth surfacing; the next callback tries again.
+  }
+}
+
+function updateReviewReadouts() {
+  if (!state.review.active) return;
+  const preview = el("preview");
+  el("review-time-value").textContent = formatTimeTenths(preview.currentTime);
+  const playPercent = timelinePercent(preview.currentTime, preview.duration);
+  el("review-playhead").style.left = playPercent === null ? "0%" : `${playPercent}%`;
+}
+
+function updateReviewBoundaryMarkers() {
+  const preview = el("preview");
+  const duration = Number.isFinite(preview.duration) ? preview.duration : null;
+
+  [
+    ["review-marker-start", state.review.flowStartS],
+    ["review-marker-end", state.review.flowEndS],
+  ].forEach(([id, seconds]) => {
+    const marker = el(id);
+    const percent = timelinePercent(seconds, duration);
+    if (percent === null) {
+      marker.classList.add("hidden");
+    } else {
+      marker.classList.remove("hidden");
+      marker.style.left = `${percent}%`;
+    }
+  });
+}
+
+/* ------------------------------------------------------------------ */
 
 function init() {
   initUpload();
   initModes();
   initFramePicker();
   initAnalysis();
+  initZahnReview();
 }
 
-document.addEventListener("DOMContentLoaded", init);
+// Guarded so this file can also be `require()`-d from plain Node (see
+// tests_js/) to unit-test the pure functions above without a DOM.
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", init);
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    formatTimeTenths,
+    clampSeekTime,
+    stepSeekTime,
+    boundaryJumpTime,
+    isValidRoi,
+    computeReviewCanvasSize,
+    timelinePercent,
+    shouldShowZahnReview,
+  };
+}

@@ -152,6 +152,71 @@ button, .button-like {
 
 #trace-canvas { width: 100%; background: #fbfcfd; border: 1px solid var(--line); border-radius: 6px; }
 
+/* Zahn review panel --------------------------------------------------- */
+.zahn-review { margin-bottom: 1.25rem; }
+.zahn-review h3 { margin: 0 0 0.35rem; font-size: 1rem; }
+
+.review-grid {
+  display: grid;
+  grid-template-columns: minmax(160px, 320px) 1fr;
+  gap: 1.25rem;
+  align-items: start;
+  margin-top: 0.75rem;
+}
+@media (max-width: 640px) {
+  .review-grid { grid-template-columns: 1fr; }
+}
+
+.review-panel { line-height: 0; }
+#review-canvas {
+  width: 100%; height: auto; display: block;
+  background: #000; border-radius: 8px;
+  filter: grayscale(100%);
+  image-rendering: pixelated;
+}
+#review-canvas.hidden { display: none; }
+
+.review-controls { line-height: 1.5; }
+.review-time { margin: 0 0 0.5rem; font-variant-numeric: tabular-nums; }
+.review-time strong { font-size: 1.1rem; }
+
+.review-timeline { margin: 0.85rem 0; }
+.review-timeline-track {
+  position: relative;
+  height: 10px;
+  background: #e3e7ed;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.review-timeline-playhead {
+  position: absolute; top: -3px; left: 0;
+  width: 3px; height: 16px;
+  background: var(--accent);
+  border-radius: 2px;
+  transform: translateX(-1.5px);
+  pointer-events: none;
+}
+.review-timeline-marker {
+  position: absolute; top: -2px; left: 0;
+  width: 2px; height: 14px;
+  border-radius: 1px;
+  pointer-events: none;
+}
+.review-timeline-marker.start { background: var(--ok); }
+.review-timeline-marker.end { background: var(--bad); }
+
+.review-boundaries {
+  display: grid; gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  margin-top: 0.5rem;
+}
+.review-boundary {
+  display: flex; flex-direction: column; gap: 0.35rem;
+  border: 1px solid var(--line); border-radius: 8px; padding: 0.6rem 0.75rem;
+}
+.review-boundary-label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
+.review-boundary-value { font-weight: 600; }
+
 .table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.93rem; }
 th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line); white-space: nowrap; }
