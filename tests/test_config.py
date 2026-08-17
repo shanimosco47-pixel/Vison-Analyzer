@@ -163,3 +163,20 @@ class TestAppConfig:
     def test_defaults_are_local_only(self):
         """A prototype must not listen on every interface by accident."""
         assert AppConfig().host == "127.0.0.1"
+
+    def test_max_timing_error_s_defaults_to_the_documented_budget(self):
+        assert AppConfig().max_timing_error_s == pytest.approx(0.05)
+
+    def test_max_timing_error_s_can_be_overridden_from_the_environment(self):
+        config = AppConfig.from_env({"VISION_ANALYZER_MAX_TIMING_ERROR_S": "0.2"})
+        assert config.max_timing_error_s == pytest.approx(0.2)
+
+    def test_a_non_numeric_timing_budget_is_rejected(self):
+        with pytest.raises(ConfigurationError):
+            AppConfig.from_env({"VISION_ANALYZER_MAX_TIMING_ERROR_S": "not-a-number"})
+
+    def test_a_non_positive_timing_budget_is_rejected(self):
+        with pytest.raises(ConfigurationError):
+            AppConfig.from_env({"VISION_ANALYZER_MAX_TIMING_ERROR_S": "0"})
+        with pytest.raises(ConfigurationError):
+            AppConfig.from_env({"VISION_ANALYZER_MAX_TIMING_ERROR_S": "-0.05"})

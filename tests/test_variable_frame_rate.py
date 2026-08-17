@@ -35,11 +35,13 @@ file cannot express — ignored seeks, unreportable positions, failing `set()`.
 from __future__ import annotations
 
 import io
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
 import pytest
 
+from app.config import AppConfig
 from app.errors import VariableFrameRateError
 from app.video import metadata
 from app.video.metadata import (
@@ -420,6 +422,24 @@ class TestGenuineVariableRateContainers:
         assert "ffmpeg -vsync cfr" in excinfo.value.user_message
         assert "timing_drift" in (excinfo.value.detail or "")
 
+    def test_probe_video_accepts_an_explicit_wider_budget(self):
+        """The scalar override on probe_video(), not just the internal rule.
+
+        A caller with looser accuracy needs (e.g. AppConfig configured for it)
+        can widen the budget without editing app/video/metadata.py.
+        """
+        path = FIXTURES / "vfr_clustered_burst.mp4"
+        with pytest.raises(VariableFrameRateError):
+            probe_video(path)  # default 0.05 s budget still refuses it
+
+        info = probe_video(path, max_timing_error_s=1.0)  # 1 s comfortably covers it
+        assert info.frame_count == 639
+
+    def test_probe_video_defaults_to_the_module_constant(self):
+        """Direct callers with no config object see unchanged behaviour."""
+        with pytest.raises(VariableFrameRateError):
+            probe_video(FIXTURES / "vfr_clustered_burst.mp4")
+
     def test_a_recording_that_merely_starts_late_is_accepted(self):
         """A non-zero container start time is not drift."""
         _, _, result = self.sample("cfr_late_start.mp4")
@@ -530,6 +550,38 @@ class TestUploadRejectsUnreliableTiming:
         assert "ffmpeg -vsync cfr" in message  # actionable, not just a refusal
         assert "Traceback" not in message
         assert list(app.extensions["app_config"].upload_dir.glob("*")) == []
+
+    def test_the_endpoint_honours_a_configured_wider_budget(self, tmp_path):
+        """AppConfig.max_timing_error_s reaches the upload path, not just probe_video().
+
+        The default 0.05 s budget refuses this file (asserted above); a server
+        configured with a wider tolerance must accept the same bytes.
+        """
+        from app.web.routes import create_app
+
+        config = replace(
+            AppConfig(),
+            data_dir=tmp_path / "data",
+            log_level="WARNING",
+            max_timing_error_s=1.0,
+        )
+        application = create_app(config)
+        application.config.update(TESTING=True)
+        try:
+            response = application.test_client().post(
+                "/api/videos",
+                data={
+                    "file": (
+                        io.BytesIO((FIXTURES / "vfr_clustered_burst.mp4").read_bytes()),
+                        "shift_export.mp4",
+                    )
+                },
+                content_type="multipart/form-data",
+            )
+            assert response.status_code == 200
+            assert response.get_json()["frame_count"] == 639
+        finally:
+            application.extensions["analysis_service"].shutdown()
 
     def test_a_genuine_container_within_budget_is_accepted_by_the_endpoint(self, client):
         payload = (FIXTURES / "vfr_distributed.mp4").read_bytes()

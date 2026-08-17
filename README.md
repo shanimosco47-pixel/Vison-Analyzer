@@ -294,11 +294,15 @@ pass stores one float per *sample* (a 12-hour scan at one sample per 5 s is
   regularity, the windows' cadences against each other, and — the rule that
   actually bounds the damage — how far each window's first frame sits from
   where `index / fps` puts it. The *spread* of those offsets is the error a
-  measured duration inherits, and a recording is refused when it exceeds
-  `VFR_MAX_TIMING_ERROR_S` (default **0.05 s**, in `app/video/metadata.py`
-  alongside the other frame-timing thresholds). A constant offset is not drift:
-  a recording that merely starts at a non-zero timestamp shifts every reported
-  time equally and is accepted.
+  measured duration inherits, and a recording is refused when it exceeds the
+  configured budget (default **0.05 s**, `AppConfig.max_timing_error_s` /
+  `VISION_ANALYZER_MAX_TIMING_ERROR_S` — see `config.example.env`). Unlike the
+  other frame-timing thresholds, which are internal tuning constants in
+  `app/video/metadata.py`, this one is exposed centrally because it is the
+  accuracy guarantee an operator may need to tighten or relax for their own
+  footage without editing source. A constant offset is not drift: a recording
+  that merely starts at a non-zero timestamp shifts every reported time equally
+  and is accepted.
 
   This is a **bounded-accuracy** policy, not a constant-rate-only one. A file
   that drops the occasional frame — common in surveillance exports — is

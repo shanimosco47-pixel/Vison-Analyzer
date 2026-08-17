@@ -120,7 +120,7 @@ class VideoStore:
             raise UnsupportedFormatError("The uploaded file is empty.")
 
         try:
-            info = probe_video(destination)
+            info = probe_video(destination, max_timing_error_s=self.config.max_timing_error_s)
         except AnalyzerError:
             _remove_quietly(destination)
             raise

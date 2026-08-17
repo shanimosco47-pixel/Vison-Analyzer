@@ -440,15 +440,26 @@ def _refusal_message(reason: str) -> str | None:
     return None
 
 
-def probe_video(path: Path) -> VideoInfo:
+def probe_video(path: Path, *, max_timing_error_s: float = VFR_MAX_TIMING_ERROR_S) -> VideoInfo:
     """Open ``path`` and return validated metadata.
+
+    Args:
+        path: the video file to probe.
+        max_timing_error_s: how far presentation timestamps may drift from a
+            single frame rate before the file is refused as unreliably timed
+            (see :data:`VFR_MAX_TIMING_ERROR_S`). Defaults to the module
+            constant so direct callers - a script, a test, a ``VideoReader``
+            constructed without a probed ``VideoInfo`` - see unchanged
+            behaviour. The upload path passes ``AppConfig.max_timing_error_s``
+            explicitly so it can be tuned without editing source.
 
     Raises:
         VideoOpenError: the file cannot be opened/decoded at all.
         EmptyVideoError: the file opens but yields no frames.
         VideoMetadataError: the frame rate cannot be established.
-        VariableFrameRateError: the frame rate is not constant, so the file
-            cannot be timed accurately and is refused.
+        VariableFrameRateError: the frame rate is not constant, or drifts
+            beyond ``max_timing_error_s``, so the file cannot be timed
+            accurately and is refused.
     """
     path = Path(path)
     if not path.is_file():
@@ -504,7 +515,7 @@ def probe_video(path: Path) -> VideoInfo:
         # that starts steady and changes later is the common case.
         # Full VFR support is future work.
         evidence = collect_interval_windows(capture, frame_count=frame_count, fps=fps)
-        verdict = assess_frame_timing(evidence)
+        verdict = assess_frame_timing(evidence, max_timing_error_s=max_timing_error_s)
         if not verdict.reliable:
             logger.warning(
                 "Rejecting %s: frame timing not reliable (%s; %s; container claims %.3f fps)",

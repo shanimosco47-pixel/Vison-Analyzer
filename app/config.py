@@ -383,6 +383,14 @@ class AppConfig:
     # Delete uploads and their job records after this many hours of inactivity.
     retention_hours: float = 24.0
 
+    # How far a recording's presentation timestamps may drift from a single
+    # frame rate, in seconds, before the upload is refused as unreliably timed
+    # (see app.video.metadata.VFR_MAX_TIMING_ERROR_S for the mechanism). Tune
+    # this down for a use case that needs tighter accuracy than the default
+    # gives, or up if real footage is being refused for drift that does not
+    # matter to the measurement being taken.
+    max_timing_error_s: float = 0.05
+
     log_level: str = "INFO"
 
     @property
@@ -404,6 +412,8 @@ class AppConfig:
             raise ConfigurationError("The port number is invalid.")
         if self.retention_hours <= 0:
             raise ConfigurationError("The retention period must be greater than zero.")
+        if self.max_timing_error_s <= 0:
+            raise ConfigurationError("The frame-timing error budget must be greater than zero.")
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> AppConfig:
@@ -426,6 +436,11 @@ class AppConfig:
             cfg = replace(cfg, save_diagnostics=True)
         if value := env.get("VISION_ANALYZER_RETENTION_HOURS"):
             cfg = replace(cfg, retention_hours=_float_env("VISION_ANALYZER_RETENTION_HOURS", value))
+        if value := env.get("VISION_ANALYZER_MAX_TIMING_ERROR_S"):
+            cfg = replace(
+                cfg,
+                max_timing_error_s=_float_env("VISION_ANALYZER_MAX_TIMING_ERROR_S", value),
+            )
         cfg.validate()
         return cfg
 
