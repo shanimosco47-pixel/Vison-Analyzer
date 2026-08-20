@@ -1,0 +1,5 @@
+# The clips are large and fully deterministic: regenerate with
+#   python diagnostics/stage0/make_handheld_clip.py
+# The .truth.json files ARE committed - they carry the ground truth the
+# Stage 0 report is measured against.
+*.mp4

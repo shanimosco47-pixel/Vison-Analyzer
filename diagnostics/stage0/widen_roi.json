@@ -1,0 +1,234 @@
+[
+  {
+    "clip": "camera_only_white",
+    "roi": {
+      "x": 250,
+      "y": 106,
+      "width": 140,
+      "height": 256
+    },
+    "mode": "zahn_cup",
+    "flow_start_s": 2.1666666666666665,
+    "flow_end_s": 23.6,
+    "efflux_seconds": 21.433,
+    "end_confirmed": true,
+    "fps": 30.0,
+    "frames_analysed": 725,
+    "frames_with_liquid": 667,
+    "frames_disturbed": 0,
+    "timed_frames": 634,
+    "continuity": 0.9811,
+    "stream_breaks": 0,
+    "confidence": 0.98,
+    "status": "confirmed",
+    "reasons": [
+      "Stream detected continuously with a clear start and a sustained end."
+    ],
+    "processing_seconds": 1.62,
+    "sample_interval_s": 0.03333,
+    "error_s": 3.933
+  },
+  {
+    "clip": "hand_only_white",
+    "roi": {
+      "x": 255,
+      "y": 120,
+      "width": 140,
+      "height": 256
+    },
+    "mode": "zahn_cup",
+    "flow_start_s": 1.7333333333333334,
+    "flow_end_s": 25.233333333333334,
+    "efflux_seconds": 23.5,
+    "end_confirmed": true,
+    "fps": 30.0,
+    "frames_analysed": 774,
+    "frames_with_liquid": 725,
+    "frames_disturbed": 0,
+    "timed_frames": 695,
+    "continuity": 0.9928,
+    "stream_breaks": 0,
+    "confidence": 0.9611,
+    "status": "confirmed",
+    "reasons": [
+      "Stream detected continuously with a clear start and a sustained end."
+    ],
+    "processing_seconds": 1.72,
+    "sample_interval_s": 0.03333,
+    "error_s": 6.0
+  },
+  {
+    "clip": "handheld_contrast",
+    "roi": {
+      "x": 255,
+      "y": 112,
+      "width": 140,
+      "height": 256
+    },
+    "mode": "zahn_cup",
+    "flow_start_s": 5.5,
+    "flow_end_s": 7.166666666666667,
+    "efflux_seconds": 1.667,
+    "end_confirmed": true,
+    "fps": 30.0,
+    "frames_analysed": 232,
+    "frames_with_liquid": 112,
+    "frames_disturbed": 0,
+    "timed_frames": 40,
+    "continuity": 0.9,
+    "stream_breaks": 0,
+    "confidence": 0.45,
+    "status": "review",
+    "reasons": [
+      "The measured interval (1.67 s) is very short for a Zahn cup test."
+    ],
+    "processing_seconds": 0.52,
+    "sample_interval_s": 0.03333,
+    "error_s": -15.833
+  },
+  {
+    "clip": "handheld_gap_at_break",
+    "roi": {
+      "x": 255,
+      "y": 112,
+      "width": 140,
+      "height": 256
+    },
+    "mode": "zahn_cup",
+    "flow_start_s": 3.2666666666666666,
+    "flow_end_s": 24.466666666666665,
+    "efflux_seconds": 21.2,
+    "end_confirmed": true,
+    "fps": 30.0,
+    "frames_analysed": 751,
+    "frames_with_liquid": 694,
+    "frames_disturbed": 0,
+    "timed_frames": 627,
+    "continuity": 0.9649,
+    "stream_breaks": 0,
+    "confidence": 0.98,
+    "status": "confirmed",
+    "reasons": [
+      "Stream detected continuously with a clear start and a sustained end."
+    ],
+    "processing_seconds": 1.59,
+    "sample_interval_s": 0.03333,
+    "error_s": 3.7
+  },
+  {
+    "clip": "handheld_no_drops",
+    "roi": {
+      "x": 255,
+      "y": 112,
+      "width": 140,
+      "height": 256
+    },
+    "mode": "zahn_cup",
+    "flow_start_s": 3.2666666666666666,
+    "flow_end_s": 25.966666666666665,
+    "efflux_seconds": 22.7,
+    "end_confirmed": false,
+    "fps": 30.0,
+    "frames_analysed": 780,
+    "frames_with_liquid": 744,
+    "frames_disturbed": 0,
+    "timed_frames": 672,
+    "continuity": 0.9747,
+    "stream_breaks": 0,
+    "confidence": 0.5,
+    "status": "review",
+    "reasons": [
+      "The video ended while liquid was still visible, so the efflux time is a lower bound rather than a measurement."
+    ],
+    "processing_seconds": 1.58,
+    "sample_interval_s": 0.03333,
+    "error_s": 6.7
+  },
+  {
+    "clip": "handheld_white",
+    "roi": {
+      "x": 255,
+      "y": 112,
+      "width": 140,
+      "height": 256
+    },
+    "mode": "zahn_cup",
+    "flow_start_s": 3.2666666666666666,
+    "flow_end_s": 25.966666666666665,
+    "efflux_seconds": 22.7,
+    "end_confirmed": false,
+    "fps": 30.0,
+    "frames_analysed": 780,
+    "frames_with_liquid": 744,
+    "frames_disturbed": 0,
+    "timed_frames": 672,
+    "continuity": 0.9747,
+    "stream_breaks": 0,
+    "confidence": 0.5,
+    "status": "review",
+    "reasons": [
+      "The video ended while liquid was still visible, so the efflux time is a lower bound rather than a measurement."
+    ],
+    "processing_seconds": 1.7,
+    "sample_interval_s": 0.03333,
+    "error_s": 5.2
+  },
+  {
+    "clip": "static_contrast",
+    "roi": {
+      "x": 250,
+      "y": 114,
+      "width": 140,
+      "height": 256
+    },
+    "mode": "zahn_cup",
+    "flow_start_s": 3.0,
+    "flow_end_s": 20.5,
+    "efflux_seconds": 17.5,
+    "end_confirmed": true,
+    "fps": 30.0,
+    "frames_analysed": 632,
+    "frames_with_liquid": 499,
+    "frames_disturbed": 0,
+    "timed_frames": 515,
+    "continuity": 0.9476,
+    "stream_breaks": 0,
+    "confidence": 0.7978,
+    "status": "confirmed",
+    "reasons": [
+      "Stream detected continuously with a clear start and a sustained end."
+    ],
+    "processing_seconds": 1.42,
+    "sample_interval_s": 0.03333,
+    "error_s": 0.0
+  },
+  {
+    "clip": "static_white",
+    "roi": {
+      "x": 250,
+      "y": 114,
+      "width": 140,
+      "height": 256
+    },
+    "mode": "zahn_cup",
+    "flow_start_s": null,
+    "flow_end_s": null,
+    "efflux_seconds": null,
+    "end_confirmed": false,
+    "fps": 30.0,
+    "frames_analysed": 780,
+    "frames_with_liquid": 499,
+    "frames_disturbed": 0,
+    "timed_frames": 0,
+    "continuity": 0.0,
+    "stream_breaks": 0,
+    "confidence": 0.0,
+    "status": "failed",
+    "reasons": [
+      "No liquid stream was detected at the outlet."
+    ],
+    "processing_seconds": 1.85,
+    "sample_interval_s": 0.03333,
+    "error_s": null
+  }
+]

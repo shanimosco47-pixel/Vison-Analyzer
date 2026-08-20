@@ -1,0 +1,74 @@
+[
+  {
+    "clip": "camera_only_white",
+    "frames": 779,
+    "tracked_pct": 100.0,
+    "redetections": 0,
+    "err_mean_px": 0.51,
+    "err_p95_px": 0.88,
+    "err_max_px": 1.11
+  },
+  {
+    "clip": "hand_only_white",
+    "frames": 779,
+    "tracked_pct": 100.0,
+    "redetections": 0,
+    "err_mean_px": 0.82,
+    "err_p95_px": 1.7,
+    "err_max_px": 1.97
+  },
+  {
+    "clip": "handheld_contrast",
+    "frames": 779,
+    "tracked_pct": 100.0,
+    "redetections": 0,
+    "err_mean_px": 0.6,
+    "err_p95_px": 0.98,
+    "err_max_px": 1.17
+  },
+  {
+    "clip": "handheld_gap_at_break",
+    "frames": 779,
+    "tracked_pct": 84.6,
+    "redetections": 2,
+    "err_mean_px": 5.71,
+    "err_p95_px": 30.06,
+    "err_max_px": 30.99
+  },
+  {
+    "clip": "handheld_no_drops",
+    "frames": 779,
+    "tracked_pct": 100.0,
+    "redetections": 0,
+    "err_mean_px": 1.02,
+    "err_p95_px": 1.73,
+    "err_max_px": 2.26
+  },
+  {
+    "clip": "handheld_white",
+    "frames": 779,
+    "tracked_pct": 100.0,
+    "redetections": 0,
+    "err_mean_px": 1.01,
+    "err_p95_px": 1.73,
+    "err_max_px": 2.26
+  },
+  {
+    "clip": "static_contrast",
+    "frames": 779,
+    "tracked_pct": 100.0,
+    "redetections": 0,
+    "err_mean_px": 0.04,
+    "err_p95_px": 0.06,
+    "err_max_px": 0.08
+  },
+  {
+    "clip": "static_white",
+    "frames": 779,
+    "tracked_pct": 100.0,
+    "redetections": 0,
+    "err_mean_px": 0.55,
+    "err_p95_px": 0.89,
+    "err_max_px": 1.05
+  }
+]
