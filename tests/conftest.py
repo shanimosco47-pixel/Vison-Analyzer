@@ -19,7 +19,24 @@ import pytest
 from app.config import AppConfig
 from app.web.routes import create_app
 
+from ._synthetic_handheld import HandheldClip, build_handheld_clip
+
 RANDOM_SEED = 20260316
+
+# Parameters validated to reproduce the Stage 0 field bug reliably: a fixed
+# ROI measures this timeline several seconds long (frames_untracked=0, the
+# fixed path never even notices anything is wrong), while tracking measures
+# it within the +/-0.5s synthetic tolerance. See
+# diagnostics/stage0/STAGE0_REPORT.md for the real-footage version of this.
+HANDHELD_TIMELINE = {
+    "width": 480,
+    "height": 360,
+    "fps": 25.0,
+    "duration_s": 22.0,
+    "flow_start_s": 3.0,
+    "stream_break_s": 16.0,
+    "flow_end_s": 17.5,
+}
 
 
 @dataclass(frozen=True)
@@ -166,6 +183,33 @@ def quiet_video(tmp_path_factory: pytest.TempPathFactory) -> SyntheticVideo:
     return SyntheticVideo(
         path=path, fps=fps, duration_s=duration, width=width, height=height, truth={}
     )
+
+
+@pytest.fixture(scope="session")
+def handheld_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> HandheldClip:
+    """Hand-held camera *and* hand-held cup, white-on-white - the field report.
+
+    Same timeline as diagnostics/stage0/STAGE0_REPORT.md's `handheld_white`:
+    13 s of continuous stream then a sparse drop tail, with the outlet
+    drifting off a fixed ROI's default width over the run. Regression
+    fixture for the original "several seconds too long" bug and the
+    synthetic-tolerance test for its fix.
+    """
+    path = tmp_path_factory.mktemp("videos") / "handheld_zahn.mp4"
+    return build_handheld_clip(path, **HANDHELD_TIMELINE)
+
+
+@pytest.fixture(scope="session")
+def handheld_gap_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> HandheldClip:
+    """The same clip, with the outlet swung out of frame across the true break.
+
+    Occlusion covers 15.4-18.2s: the true stream break (16.0s) and the true
+    end (17.5s) both happen while the outlet cannot be seen at all. Nothing
+    can honestly measure a precise end from this footage - the fixture exists
+    to prove the detector says so instead of inventing one.
+    """
+    path = tmp_path_factory.mktemp("videos") / "handheld_gap_zahn.mp4"
+    return build_handheld_clip(path, occlusion_s=(15.4, 18.2), **HANDHELD_TIMELINE)
 
 
 @pytest.fixture

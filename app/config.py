@@ -329,6 +329,62 @@ class ZahnConfig:
     # Below this the detection is reported as failed and *no* time is given.
     fail_confidence: float = 0.40
 
+    # --- outlet tracking (hand-held camera and/or hand-held cup) ---------- #
+    # Stage 0 (diagnostics/stage0/STAGE0_REPORT.md) found a fixed analysis
+    # region losing the outlet to drift was the whole of the "several seconds
+    # too long" field report; tracking the outlet frame to frame is the fix.
+    # Named with the "zahn_" prefix (unlike the rest of this class) because it
+    # is meant to be found and toggled independently in a parameter bag shared
+    # across detectors - a deliberate rollback lever, not house style.
+    zahn_track_outlet: bool = True
+
+    # Extra margin, in source pixels, added on every side of the guard region
+    # to build the fixed capture window the tracker searches within for the
+    # whole run. This is the hard bound on cumulative drift the tracker can
+    # follow: an outlet that wanders further than this from where it was
+    # clicked over the course of the recording is reported `lost`, not
+    # silently mis-tracked. Raise it for footage with more swing.
+    track_search_margin_px: int = 80
+
+    # A single frame's estimated outlet displacement above this many pixels is
+    # treated as an unreliable fit even if RANSAC nominally supported it (a
+    # plausible symptom of motion blur or a repeating texture), and the frame
+    # falls back to prediction rather than being trusted outright.
+    track_max_frame_displacement_px: float = 40.0
+
+    # Minimum RANSAC inlier count for a frame's similarity-transform fit to be
+    # trusted. Below this, the frame is bridged (`predicted`) or, once the
+    # bridge runs out, `lost`.
+    track_min_inliers: int = 6
+
+    # Once the tracked point set falls below this count, fresh features are
+    # detected over the cup so tracking does not run down to a handful of
+    # points and become fragile.
+    track_min_features: int = 12
+
+    # How long a `predicted` (constant-velocity) bridge may cover before the
+    # tracker gives up and reports `lost`. Bridges longer than this stop being
+    # a reasonable extrapolation of where the outlet actually is.
+    track_max_bridge_s: float = 0.5
+
+    # Normalised template-match correlation (0-1) a candidate position must
+    # reach against the reference patch captured at initialisation before a
+    # `lost` tracker is allowed to resume as `tracked`. This is what makes
+    # reacquisition a *verified* claim rather than "a tracker found
+    # something": a low-texture false match is refused, and tracking stays
+    # `lost` until a confident match appears.
+    track_reacquire_min_correlation: float = 0.6
+
+    # If liquid was last confirmed before an untrusted (`lost`/`predicted`)
+    # span and no trusted evidence follows it before flow-end would otherwise
+    # be confirmed, the true break could have happened anywhere in that span.
+    # When the span is wider than this, the endpoint is reported unconfirmed
+    # with explicit bounds instead of a falsely precise duration. 0.5 s is an
+    # initial default calibrated only against synthetic footage - it is not
+    # yet validated against a labelled real hand-held clip (see
+    # diagnostics/stage0/STAGE0_REPORT.md, "What I need from you").
+    zahn_max_endpoint_uncertainty_s: float = 0.5
+
     def validate(self) -> None:
         if self.flow_start_persistence_s <= 0 or self.flow_end_persistence_s <= 0:
             raise ConfigurationError("Flow persistence values must be greater than zero.")
@@ -342,6 +398,22 @@ class ZahnConfig:
             raise ConfigurationError("The minimum difference threshold must be at least 1.")
         if not 0.0 <= self.fail_confidence <= self.review_confidence <= 1.0:
             raise ConfigurationError("Confidence thresholds must satisfy 0 <= fail <= review <= 1.")
+        if self.track_search_margin_px < 0:
+            raise ConfigurationError("The tracking search margin must not be negative.")
+        if self.track_max_frame_displacement_px <= 0:
+            raise ConfigurationError("The tracking displacement bound must be greater than zero.")
+        if self.track_min_inliers < 3:
+            raise ConfigurationError("At least 3 tracking inliers are required to fit a transform.")
+        if self.track_min_features < self.track_min_inliers:
+            raise ConfigurationError(
+                "The tracking feature-redetect floor must be at least the inlier minimum."
+            )
+        if self.track_max_bridge_s < 0:
+            raise ConfigurationError("The tracking bridge duration must not be negative.")
+        if not 0.0 < self.track_reacquire_min_correlation <= 1.0:
+            raise ConfigurationError("The reacquisition correlation must be between 0 and 1.")
+        if self.zahn_max_endpoint_uncertainty_s < 0:
+            raise ConfigurationError("The endpoint uncertainty bound must not be negative.")
 
 
 # --------------------------------------------------------------------------- #
