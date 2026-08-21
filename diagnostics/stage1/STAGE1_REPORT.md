@@ -23,7 +23,15 @@ blockers (§21): the frontend never actually sent `outlet_reference_s`,
 and the reference-frame search could falsely lock onto the wrong part of
 the frame. Both are addressed and re-validated (§22–§23), including a
 runtime bug the new fixtures used to prove it caught in themselves before
-this round was done (§21.4). Sections 1–5 are the original Stage 1
+this round was done (§21.4). A supervisor review then ran that head
+(`07ec4ee`) against the real clip directly: the frontend fix and the t=0
+false-lock fix both held, but the underlying translucent/low-texture
+tracking failure (anticipated and flagged out of Stage 1's reach at
+§18.3/§20) reproduced on the gate clip itself, plus a suspected frame
+double-count. §24 is the root-cause analysis and design proposal
+requested in response, plus the double-count's confirmed root cause -
+**no implementation in this round**, per instruction. Sections 1–5 are
+the original Stage 1
 submission, left as-is as the historical record of the first round;
 §6–§8 cover the first round's fixes; §9–§10 cover the second; §12–§13
 cover the third; §14–§15 cover the fourth.
@@ -1541,3 +1549,183 @@ report's runtime figures are.
 
 PR #4 stays **draft and unmerged**. Stages 2 and 3 are **not started**.
 Stopping here for review, per instruction.
+
+## 24. Root cause of the real-clip tracking failure, and a design proposal
+
+**No code in this section is implemented.** Per instruction, this is
+analysis and proposal only, stopped here for review before any further
+work. `07ec4ee` is unchanged.
+
+### 24.1 What the supervisor's run on `07ec4ee` showed
+
+Exact head, real clip, click `(610,1025)`, `outlet_reference_s=4.5`,
+default analysis start:
+
+* `status=review`, no precise efflux.
+* Candidate start `5.133s`, end `26.231s`, bounds `21.098–21.698s` -
+  against a visual reference of ~3.9s start, ~20.5s end, ~16.6s duration.
+* 772/812 frames untrusted (95%); trusted runs mostly `4.466–6.033s`, then
+  brief re-trusted spans at `25.498–25.664s` (0.166s) and
+  `26.164–26.231s` (0.067s).
+* The position estimate sits around x≈599–663 the whole time; the real
+  cup later moves to x≈390. "Recentering therefore follows the wrong
+  structure, not the cup."
+
+### 24.2 Root cause
+
+This is the failure §18.3 and §20 already named and flagged as out of
+Stage 1's reach - the real clip reproduces it, it does not introduce a
+new one. Restating precisely, against this run's own numbers:
+
+The tracker locks on cleanly right at the reference frame (the
+`4.466–6.033s` trusted run - about 1.5s either side of the 4.5s anchor,
+where the anchor's own reference patch still matches by construction) and
+then goes `lost` for the next ~15s as the cup keeps drifting. Every
+reacquisition and every recentre attempt after that is verified against
+the *same* stored reference patch
+(`OutletTracker._reference_patch`/`reference_patch_correlation`,
+§21.3) - built once, from whichever feature `goodFeaturesToTrack` ranked
+strongest inside the cup-sized box at the reference frame
+(`OutletTracker.__init__`'s anchor-selection comment). On an opaque,
+well-textured cup that is genuinely the cup's own rim or handle. On a
+translucent, low-texture one - this clip, evidently - it can just as
+easily be structure visible *through* the cup: background, not cup.
+
+If it is background, the verification bar this stage relies on
+(`track_reacquire_min_correlation`/`track_min_patch_correlation`, both
+correlating a *candidate* against that *same* stored patch) cannot catch
+it, for a structural reason, not a tuning one: **the check can only ever
+ask "does this still look like what I started with," and if what it
+started with was already background, then more of that same background -
+wherever it later appears - answers yes.** That is exactly consistent
+with the estimate holding at x≈599–663 (near the original click) rather
+than following the cup to x≈390: if the locked structure is static
+background (or moves only with camera pan, not with the cup's own
+independent hand-drift), the gap to the true, further-drifting cup
+position only grows over time, which is what "recentering follows the
+wrong structure" describes. The two brief re-trusted spans right at the
+end (`25.498–25.664s`, `26.164–26.231s` - 0.166s and 0.067s, a handful of
+frames each) read as one-off spurious correlations clearing the threshold
+momentarily, not genuine re-locks - short enough that a persistence
+requirement (§24.3.1) would very likely have suppressed them, though that
+cannot be confirmed without the clip.
+
+This is a real limitation of Stage 1's verification design, not a bug in
+this round's specific implementation of it: §18.3 already found the
+equivalent case (a distractor overlapping the cup at initialisation) and
+called it unsolvable at this layer for the identical reason - "the
+correlation check is circular in that case, since the reference patch
+itself is extracted from the wrong structure." This run is the first
+evidence that the identical circularity also defeats the *reacquisition
+and recentre* paths on real footage, not only the initialisation case the
+synthetic fixture targeted.
+
+### 24.3 What can and cannot be done inside Stage 1
+
+**24.3.1 Two bounded, low-risk mitigations that reduce - not eliminate -
+the failure rate.** Neither addresses the root cause above; both are
+worth doing regardless, because they attack the parts of this run's
+failure that *are* just tuning/robustness gaps, not the circular-
+verification problem itself:
+
+* **Persistence-gate reacquisition and recentre.** Both currently accept
+  on a single frame's correlation clearing the threshold
+  (`OutletTracker._match_reference_patch`,
+  `ZahnCupDetector._run_loop`'s recentre branch). Requiring the *next*
+  frame to independently reconfirm before flipping to `tracked` would
+  very likely have suppressed this run's two brief false locks (0.166s
+  and 0.067s - too short for two independent frames to both spuriously
+  agree) without weakening a genuine reacquisition, which by construction
+  stays correlated for longer than one frame.
+* **Bias anchor selection toward where a rim genuinely tends to survive
+  translucency**, rather than "whichever corner `goodFeaturesToTrack`
+  ranks strongest anywhere in the cup-sized box." `_draw_translucent_cup`'s
+  own docstring already identifies the rim as "the one feature a real
+  translucent cup usually keeps a visible edge on." Restricting the
+  anchor search to an arc near the top of the box (where a rim would be),
+  rather than the whole box, would reduce the chance the strongest corner
+  found is background showing through the body lower down - a real,
+  Stage-1-scoped algorithmic change, but a shape-prior tuned to *this*
+  clip's evident cup geometry, unvalidated against any other real
+  footage, and it does nothing for a cup whose rim itself is also
+  low-contrast.
+
+**24.3.2 Why the actual failure needs a scope change, not a tuning
+pass.** §24.2's argument is structural: any verification built on
+self-correlation to a single stored reference cannot distinguish "the
+cup, moved" from "more of the same background the reference was already
+built from." Closing that gap needs a signal that is *not* derived from
+the reference patch at all - independent evidence of which motion in the
+frame is the cup's and which is the camera's, which is exactly Stage 3's
+already-deferred camera-motion-compensation scope (§9/§18.3 both name
+it). Nothing inside Stage 1's current architecture supplies that signal;
+the scorer's own per-pixel disturbance measure was considered and
+rejected for this - a genuinely static-relative-to-camera cup rim and a
+genuinely static background patch produce the same low frame-to-frame
+difference, so it doesn't discriminate the two cases either.
+
+**24.3.3 A Stage-1-scoped alternative that sidesteps the problem instead
+of solving it: more than one operator-marked anchor.** This round's
+`_process_pre_reference_span` already tracks bidirectionally between a
+single trusted anchor and both ends of the clip. The same machinery
+generalises directly to *multiple* anchors along the timeline (e.g. the
+operator marks the outlet a second time near where the stream is
+expected to end, not just once near the start): each unsupervised
+tracking segment then only has to survive the distance between two
+human-verified points, not the whole clip unaided, bounding this failure
+mode's blast radius without requiring Stage 3's camera-motion work at
+all. This is a product/UX decision (asking for more than one click), not
+an algorithmic one - flagged here as the "explicit scope change" this
+review asked for if full in-algorithm resolution isn't possible, rather
+than implemented without that authorisation.
+
+### 24.4 The suspected frame double-count: confirmed, root-caused, not fixed
+
+Reproduced synthetically (not on the real clip - no access to it), and
+it is a genuine off-by-one, distinct from §24.2-§24.3's tracking-design
+question:
+
+```
+fps=30.0  reference_s=3.333  ->  reference frame index 99
+forward_start_s = reference_timestamp + plan.effective_interval_s
+                 = 3.300000 + 0.033333 = 3.333333
+frame_index_at(3.333333, fps=30.0) = 99   # same frame again, not 100
+```
+
+`run()` computes the forward pass's starting timestamp
+(`forward_start_s`) by *adding* one frame interval to the reference
+frame's own timestamp in floating point, then re-deriving a frame index
+from that sum via `frame_index_at`'s `floor(timestamp * fps)`. The round
+trip (`index / fps`, `+ 1/fps`, `* fps`) is not guaranteed to land back
+on exactly `index + 1` in floating point; when it lands a hair under, the
+forward pass's first `iter_samples()` call re-decodes and re-scores the
+reference frame a second time - consistent with 812 analysed rows on an
+811-frame clip. Confirmed reproducible with `app.video.sampling`'s own
+functions directly (fps=30.0, reference_s=3.333 above; also fps=29.97,
+reference_s=4.166666) - not every fps/reference_s combination triggers
+it, which is why it didn't show up in this round's own re-validation
+fixtures (whose reference timestamps happened not to land on an affected
+combination).
+
+**Proposed fix** (not applied): carry the reference frame's own integer
+index (`FrameSample.index`, already available on `reference_sample` in
+`_process_pre_reference_span`) out of that method instead of only its
+timestamp, and compute the forward pass's start via
+`frames_to_seconds(reference_index + 1, fps)` - integer arithmetic on the
+index, no floating-point round trip through a sum. Holding this fix for
+the next authorised round, per "stop implementation."
+
+## 25. Status
+
+Requirements 1-2 stand as in §23. Requirement 3 (background-through-cup
+rejection): the real clip confirms the sub-case §18.3 already flagged
+unsolvable at this layer is not a synthetic-only concern - it is the
+dominant failure mode on the one real clip tested against. §24.3
+proposes what is and is not fixable inside Stage 1's current scope, and a
+scope-preserving alternative (multiple anchors) that neither has been
+implemented nor validated. Requirement 4 (the ±0.75s real-footage
+criterion): **not met** - `status=review`, no confirmed efflux, per
+§24.1's numbers.
+
+PR #4 stays **draft and unmerged**. Stages 2 and 3 are **not started**.
+No implementation this round; stopped here for review, per instruction.
