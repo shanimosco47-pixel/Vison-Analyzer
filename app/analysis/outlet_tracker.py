@@ -144,6 +144,40 @@ _RESIDUAL_DILATE_KERNEL = np.ones((5, 5), dtype=np.uint8)
 _CONTOUR_PEAK_SUPPRESS_PX = 5
 
 
+def _contour_subpixel_offset(response: np.ndarray, max_loc: tuple[int, int]) -> tuple[float, float]:
+    """Parabolic sub-pixel refinement of ``cv2.matchTemplate``'s own
+    integer-pixel peak location - see
+    ``OutletTracker._contour_forward_match``'s own docstring for why this
+    exists. Fits a parabola through the peak and its immediate neighbours
+    independently along each axis; falls back to ``(0.0, 0.0)`` - no
+    refinement - wherever a neighbour is not available (the response
+    map's own border) or the fit is degenerate (a flat/saturated
+    neighbourhood, where a parabola is not a meaningful model).
+    """
+    x, y = max_loc
+    height, width = response.shape[:2]
+    dx = dy = 0.0
+    if 0 < x < width - 1:
+        left, center, right = (
+            float(response[y, x - 1]),
+            float(response[y, x]),
+            float(response[y, x + 1]),
+        )
+        denom = left - 2.0 * center + right
+        if abs(denom) > 1e-6:
+            dx = max(-0.5, min(0.5, 0.5 * (left - right) / denom))
+    if 0 < y < height - 1:
+        top, center, bottom = (
+            float(response[y - 1, x]),
+            float(response[y, x]),
+            float(response[y + 1, x]),
+        )
+        denom = top - 2.0 * center + bottom
+        if abs(denom) > 1e-6:
+            dy = max(-0.5, min(0.5, 0.5 * (top - bottom) / denom))
+    return dx, dy
+
+
 class TrackerInitError(Exception):
     """Raised when the initial frame has too little texture to track at all.
 
@@ -1388,7 +1422,7 @@ class OutletTracker:
 
     def _contour_forward_match(
         self, edge_region: np.ndarray, region_offset: tuple[int, int]
-    ) -> tuple[tuple[int, int] | None, float | None]:
+    ) -> tuple[tuple[float, float] | None, float | None]:
         """Best-scoring location of the stored contour template within
         ``edge_region`` (a crop of the current frame's edge map, top-left
         at ``region_offset`` in the tracker's own local coordinates), or
@@ -1397,6 +1431,17 @@ class OutletTracker:
         next-best, non-overlapping local peak - see
         ``ZahnConfig.contour_score_margin``'s own docstring for why a
         runner-up is checked at all, not just an absolute floor.
+
+        The returned location is parabolically sub-pixel refined
+        (``_contour_subpixel_offset``), not the raw integer-pixel
+        ``matchTemplate`` peak: a real regression found while calibrating
+        this round (a slow, steady pan under 1px/frame) showed integer-
+        only matching freezing at the same whole-pixel peak for several
+        consecutive frames, which then froze this tracker's own velocity
+        estimate - and, with it, where the *next* frame's search window
+        was even centred - since consecutive identical positions imply
+        zero velocity. Sub-pixel refinement is what lets a true, real
+        motion smaller than one pixel still register as motion.
         """
         template = self._contour_template
         th, tw = template.shape[:2]
@@ -1415,7 +1460,12 @@ class OutletTracker:
         second_val = float(suppressed.max()) if suppressed.size else -1.0
         if max_val - second_val < self._config.contour_score_margin:
             return None, None
-        topleft = (region_offset[0] + max_loc[0], region_offset[1] + max_loc[1])
+        max_loc_xy = (int(max_loc[0]), int(max_loc[1]))
+        sub_dx, sub_dy = _contour_subpixel_offset(response, max_loc_xy)
+        topleft = (
+            region_offset[0] + max_loc_xy[0] + sub_dx,
+            region_offset[1] + max_loc_xy[1] + sub_dy,
+        )
         return topleft, float(max_val)
 
     def _contour_roundtrip_ok(self, edge_map: np.ndarray, topleft: tuple[int, int]) -> bool:
@@ -1506,7 +1556,14 @@ class OutletTracker:
         if topleft is None:
             self._last_contour_rejection = "contour_low_score"
             return None, None
-        if not self._contour_roundtrip_ok(edge_map, topleft):
+        # The round-trip check works on whole-pixel crops (it only needs
+        # ZahnConfig.contour_max_roundtrip_px of tolerance, well above one
+        # pixel) - round the sub-pixel-refined location back to int only
+        # for that slice; the outlet/anchor positions below keep the full
+        # sub-pixel precision (see _contour_forward_match's own docstring
+        # for why that precision matters).
+        int_topleft = (int(round(topleft[0])), int(round(topleft[1])))
+        if not self._contour_roundtrip_ok(edge_map, int_topleft):
             self._last_contour_rejection = "contour_roundtrip_mismatch"
             return None, None
         outlet_xy = (
