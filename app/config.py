@@ -375,6 +375,22 @@ class ZahnConfig:
     # `lost` until a confident match appears.
     track_reacquire_min_correlation: float = 0.6
 
+    # Normalised template-match correlation (0-1) the anchor feature's
+    # implied position must reach against the reference patch for a
+    # similarity-transform fit to be accepted as `tracked`, in addition to
+    # (not instead of) the inlier-count and displacement checks above. On a
+    # translucent, low-texture cup, a majority of tracked points can be
+    # structure visible through or around the cup rather than the cup
+    # itself, and that structure can move smoothly enough to pass both of
+    # those checks - this is what refuses a plausible-looking fit that has
+    # simply locked onto the wrong thing. Lower than
+    # track_reacquire_min_correlation: a long, genuinely correct run of
+    # continuous tracking is expected to drift further from a single fixed
+    # reference snapshot (lighting, angle, focus) than a fresh cold
+    # reacquisition search is, so the same bar would produce false
+    # rejections during ordinary tracking.
+    track_min_patch_correlation: float = 0.45
+
     # If liquid was last confirmed before an untrusted (`lost`/`predicted`)
     # span and no trusted evidence follows it before flow-end would otherwise
     # be confirmed, the true break could have happened anywhere in that span.
@@ -412,6 +428,8 @@ class ZahnConfig:
             raise ConfigurationError("The tracking bridge duration must not be negative.")
         if not 0.0 < self.track_reacquire_min_correlation <= 1.0:
             raise ConfigurationError("The reacquisition correlation must be between 0 and 1.")
+        if not 0.0 < self.track_min_patch_correlation <= 1.0:
+            raise ConfigurationError("The tracking patch correlation must be between 0 and 1.")
         if self.zahn_max_endpoint_uncertainty_s < 0:
             raise ConfigurationError("The endpoint uncertainty bound must not be negative.")
 

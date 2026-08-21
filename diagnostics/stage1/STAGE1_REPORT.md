@@ -1053,3 +1053,255 @@ Stage 1's existing scope**, pending review of this design.
 for review of this diagnosis and the §17.3 design before any code change.
 PR #4 stays draft, unmerged; the real-footage criterion is **not** claimed
 to pass.
+
+## 18. Design review of §17.3 — four required changes, addressed
+
+§17.3's proposed design ("treat everything before the reference frame as
+one honestly-uncertain gap") was reviewed against real streamed
+diagnostics run on the actual clip and **rejected as insufficient**: it
+converts a wrong answer into an unmeasurable one rather than recovering
+the true, measurable start, and does not touch the geometry or
+distractor-lock failure modes at all. Four required changes were given.
+All four are addressed below; PR #4 stays draft, unmerged; Stages 2 and 3
+are not started.
+
+### 18.1 — Requirement 1: recover the true start, don't just flag it unmeasurable
+
+**Design change from §17.3.** Rather than leaving every pre-reference
+frame untracked and letting the existing gap-uncertainty machinery report
+a wide, honest "don't know," the tracker is now constructed *before* the
+sampling loop starts, pre-armed against a frame read directly at
+`outlet_reference_s` — then run forward from `analysis_start_s` in a
+normal, already-armed `TRACKED`/`PREDICTED`/`LOST` state, exactly as if
+the user had marked the outlet on the very first frame. This recovers a
+real, trackable start instead of only bounding an unknown one.
+
+Implementation, `app/analysis/zahn_detector.py`:
+
+* `configure()` now parses `outlet_reference_s` from `self.params`,
+  clamped to `[start_s, end_s]`, defaulting to `self.start_s` (today's
+  behaviour, unchanged, for callers that don't supply it — no breaking
+  change to the params contract).
+* `run()`: when `outlet_reference_s > start_s`, it reads that one frame
+  out-of-band via `VideoReader.frame_at()` (a seek, not part of the
+  forward-streaming sample loop), converts it to grayscale, and
+  constructs `OutletTracker` against it immediately — before the first
+  sample is streamed — instead of waiting for `_run_loop`'s
+  `if first_frame:` block to construct it on whatever frame happens to be
+  first. `TrackerInitError` at this point is handled exactly as before
+  (§6.2/§9.2): loud `FAILED`, no confirmed measurement.
+* New `OutletTracker.__init__` parameter `start_in_search: bool = False`.
+  When the tracker is constructed this way (pre-armed from a reference
+  frame, forward-run starting earlier), it starts in `LOST` with no
+  confident observation rather than assuming the reference frame's
+  position is already correct at `analysis_start_s` — the existing
+  reacquisition search (unchanged, the same machinery used for ordinary
+  mid-run reacquisition) is what finds and locks onto the real outlet
+  position as frames stream in from the true start. This is the load-
+  bearing piece: it is why the true start is *recovered*, not merely
+  *un-penalised*.
+
+**Verified**, `tests/test_zahn_tracking_integration.py::TestOutletReferenceFrame`
+(3 tests, new fixture `portrait_reference_frame_zahn_video`, portrait
+1080×1920, resolution-scaled drift, true `flow_start_s=3.9`, outlet marked
+at `t=4.5`):
+
+| test | what it checks | result |
+| --- | --- | --- |
+| `test_the_bug_marking_a_later_frame_is_applied_to_frame_zero` | without `outlet_reference_s`, reproduces the pre-fix failure (`flow_start_s` wrong by more than the synthetic tolerance, or `None`) | passes — confirms the bug still exists *without* the fix, so the next test is a real regression check, not a tautology |
+| `test_outlet_reference_s_recovers_the_true_start` | with `outlet_reference_s=4.5`, `analysis_start_s` left at its default (0) | passes — `status=confirmed`, `flow_start_s` and `efflux_seconds` both within ±0.5s of ground truth |
+| `test_a_reference_frame_matching_analysis_start_s_is_unaffected` | `outlet_reference_s == analysis_start_s` (today's usage pattern) | passes — unchanged behaviour, no regression for existing callers |
+
+### 18.2 — Requirement 2: fix the fixed scoring geometry for portrait outlet motion
+
+**Root cause, confirmed by reading the code.** `build_roi_from_click()`
+computed the scoring ROI's height as
+`min(configured_height, video.height - y)` — leaving zero reserved
+headroom below the ROI for the tracker's own search/guard margins
+(`guard_margin_px`, `track_search_margin_px`). On a portrait frame where
+the outlet starts well down the frame and drifts further down under
+camera/hand motion (this clip's actual geometry), the guard region has
+nowhere left to expand into and clips against the frame's bottom edge —
+independent of whether the tracker itself is correctly following the cup.
+This is a distinct failure mode from §17.2's tracking-robustness question.
+
+**Fix**, `app/analysis/zahn_detector.py::build_roi_from_click()`: the
+height computation now reserves
+`downward_headroom = config.guard_margin_px // 2 + config.track_search_margin_px`
+pixels below the ROI before clamping to the frame edge, so the guard
+geometry has the same drift budget on a tall portrait frame as it already
+had on this project's landscape fixtures. The reservation is expressed in
+terms of the tracker's own configured margins, not a new fixed pixel
+constant, so it scales with configuration rather than reproducing the
+same class of bug at a different fixed size.
+
+**Verified**, `tests/test_zahn_tracking_integration.py::TestPortraitGuardGeometry`
+(1 test, same portrait fixture as §18.1): asserts `frames_untracked /
+frames_analysed < 0.1` and `status == "confirmed"` — i.e. the overwhelming
+majority of frames track cleanly, not the near-total failure that
+edge-clipping guard geometry produces. Full existing landscape fixture
+suite re-run unchanged (no regression at the resolution this geometry was
+originally tuned against).
+
+### 18.3 — Requirement 3: prevent locking onto background through the translucent cup
+
+**What was built.** A continuous patch-correlation trust gate,
+`OutletTracker._patch_correlation_at()`, checked on every accepted
+RANSAC/inlier/displacement transform (not only at reacquisition time, as
+`track_reacquire_min_correlation` already was): the anchor feature's
+implied position under the fitted transform is checked against the
+original reference patch via `cv2.matchTemplate` (`TM_CCOEFF_NORMED`), and
+the transform is only accepted as `tracked` if that correlation clears a
+new, separately-tunable threshold, `ZahnConfig.track_min_patch_correlation`
+(default `0.45`, deliberately looser than `track_reacquire_min_correlation`'s
+`0.6` — a long correct run is expected to drift further from one fixed
+reference snapshot than a fresh reacquisition search, so the same bar
+would false-reject good tracking). This closes off the case where RANSAC
+inlier count and pixel-displacement bounds alone are satisfied by a
+smoothly, self-consistently moving *distractor* rather than the cup
+itself — exactly the "why transforms are accepted" gap named in the
+requirement.
+
+An initial implementation of the check assumed the reference patch was
+symmetric around its anchor; `_extract_patch` in fact clips asymmetrically
+near frame/crop edges, which made the check permanently fail
+(`correlation == -1.0` even at zero displacement) and broke every Zahn
+test. Fixed by recording the patch's true, possibly-asymmetric extraction
+offset once at `__init__` and reusing that exact offset for every
+subsequent correlation check, rather than re-deriving symmetric bounds
+from the candidate center each time.
+
+**What this does and does not solve — evidenced, not asserted.** Two new
+synthetic scenarios (`tests/_synthetic_handheld.py`,
+`build_translucent_cup_clip` plus an inline near-distractor generator in
+`tests/conftest.py`) were built to separate two distinct sub-cases:
+
+* **Distractor drifts near the cup mid-run, after correct initialisation**
+  (the anchor feature was genuine cup texture when tracking began; a
+  strong, stationary distractor patch is elsewhere in frame and the
+  camera/hand drift brings the tracked region close to it later) — **this
+  is the case the correlation check fixes.** Pre-fix, RANSAC/inlier/
+  displacement checks alone accept the distractor's own smooth motion and
+  report `status=confirmed` with high confidence on a wrong number.
+  Post-fix, verified by
+  `TestTrackingRefusesAStrongNearbyDistractor::test_the_result_is_not_confidently_wrong`:
+  the run either reports a genuinely correct measurement, or stays
+  honestly uncertain (`status != confirmed` with `confidence <= 0.5`) —
+  never both `status=confirmed` and wrong. This is a real safety property:
+  the tracker cannot be confidently, silently wrong about this failure
+  mode any more.
+* **Distractor already overlaps the cup at initialisation** — the true
+  worst case for a low-texture, translucent cup, where the corner
+  detector's strongest-response features may themselves be background
+  visible *through* the cup wall rather than the cup's own (weak) edges.
+  Run against `build_translucent_cup_clip`'s worst-case construction
+  (distractor overlapping the cup from `t=0`): the tracker locks onto the
+  distractor's structure from the very first frame — `confidence=0.98`, 0
+  untracked frames, a fully confident, fully wrong result. The
+  correlation check cannot catch this because it is circular in this
+  case: the reference patch itself was extracted from the wrong
+  (background/distractor) structure at `__init__` time, so every
+  subsequent frame correctly, consistently matches *that* — the check
+  verifies self-consistency, not correctness against the true cup. No
+  patch-similarity-based check evaluated *after* anchor selection can fix
+  a wrong anchor selected *at* initialisation; distinguishing "cup" from
+  "background visible through cup" at that moment requires information
+  the current architecture doesn't have — most plausibly an independent
+  estimate of camera-only motion (the frame content that should move with
+  the *background*, not the cup) to identify which candidate features move
+  with the camera and which move with the handheld object. That is Stage
+  3's deferred camera-motion-compensation scope, not a Stage-1-bounded fix.
+  **This fixture is intentionally not wired into a passing assertion** —
+  it demonstrates a known, evidenced Stage 1 limit, not a bug left
+  unfixed by oversight. It is kept as test infrastructure for when Stage 3
+  is authorized.
+
+**Conclusion for requirement 3:** the requested "add a regression whose
+tracked outlet follows the cup, with diagnostics proving scale-relative
+outlet error, trusted-frame coverage, and why transforms are accepted" is
+delivered for the tractable sub-case (mid-run drift toward a nearby
+distractor) — real fix, real regression test, real evidence of "why
+transforms are accepted" (the correlation gate itself, plus the trust
+fraction it produces). For the untractable sub-case (distractor already
+overlapping at initialisation), the same rigor is applied in the other
+direction: precise evidence for *why* it cannot be solved within Stage 1's
+architecture, rather than either a false claim of success or an unexamined
+guess.
+
+### 18.4 — Requirement 4: validate against the supplied evidence target
+
+**Not performed against the real clip in this environment** —
+`20260820_184144.mp4` is not accessible from this session (as in every
+prior round; see §17's framing). The closest available evidence is the
+synthetic fixture built for §18.1 (portrait, resolution-scaled to this
+clip's actual 1080×1920 geometry, reference frame at `t=4.5` after true
+flow has already started at `t=3.9`): with all three fixes in place, that
+scenario reports `flow_start_s` and `efflux_seconds` within the synthetic
+±0.5s tolerance of ground truth (§18.1's second test). This is **not** a
+substitute for running the actual supplied clip and comparing against the
+manual/visual ≈16.6s efflux target — it demonstrates the *mechanism* is
+correctly wired (reference-frame decoupling, search-from-start
+reacquisition, portrait guard geometry) against a fixture built to match
+the clip's known geometry, not that the real clip now passes. **The real
+±0.75s acceptance criterion against the actual clip is not claimed to be
+met here** — that validation needs to be run by whoever has the clip.
+
+## 19. Re-validation after this round's fixes
+
+```
+python -m pytest          348 passed        (pre-round: 343 passed, 0 failed)
+python -m ruff check .    All checks passed
+python -m ruff format --check .   51 files already formatted
+python -m mypy app        3 pre-existing "unused type: ignore" errors,
+                           identical on d8c3fdf before this round's changes
+                           (opencv-stub/mypy-version drift, unrelated to
+                           this round — confirmed by diffing mypy output
+                           against a worktree checked out at d8c3fdf)
+node --test tests_js/*.test.js   44 pass, 0 fail
+```
+
+5 new tests this round (§18.1's 3, §18.2's 1, §18.3's 1); no existing test
+was weakened.
+
+**Runtime**, same methodology as §7/§10, 3 trials each, `handheld_zahn_video`-
+equivalent landscape fixture (480×360), comparing `d8c3fdf` (pre-round, in
+a scratch worktree) against this round's tree:
+
+| | mean elapsed | trials |
+| --- | --- | --- |
+| before (`d8c3fdf`) | 1.335 s | 1.309 / 1.371 / 1.326 |
+| after (this round) | 1.375 s | 1.514 / 1.345 / 1.266 |
+
+The difference (~3%) is within this environment's run-to-run noise (the
+"after" trials alone span 1.266–1.514s) — the new per-frame
+`_patch_correlation_at` check, the pre-read reference frame, and the
+search-from-start reacquisition path do not add a measurable cost beyond
+that noise floor. (Absolute numbers in this environment run higher than
+earlier rounds' ~0.9s figures reported in §7/§10; that appears to be
+sandbox-level performance variance unrelated to this round's changes,
+since the `d8c3fdf` baseline measured *in this same environment* is
+likewise ~1.3s, not ~0.9s — the before/after comparison within one
+environment is what's load-bearing here, not the absolute figure against
+older rounds.) The new portrait (1080×1920) fixture, run for the first
+time this round since it didn't exist before, measures 5.672s mean — six
+times the pixel count of the landscape fixture, consistent with roughly
+linear scaling in frame area rather than a regression.
+
+## 20. Status and what remains
+
+* **Requirement 1** (reference-frame timeline recovery): done, verified
+  against a portrait fixture matching the real clip's geometry.
+* **Requirement 2** (portrait scoring-geometry fix): done, verified.
+* **Requirement 3** (translucent-cup distractor lock): partially done —
+  a real, verified safety-property fix for the tractable sub-case
+  (mid-run drift toward a nearby distractor); the untractable sub-case
+  (distractor already overlapping at cup initialisation) is precisely
+  evidenced as out of Stage 1's reach and requires Stage 3's deferred
+  camera-motion-compensation work.
+* **Requirement 4** (validation against the real clip's ~16.6s target):
+  **not performed** — no access to the real clip from this environment.
+  Synthetic-only evidence is reported in §18.4/§18.1, explicitly caveated
+  as not a substitute for running the actual file.
+
+PR #4 stays **draft and unmerged**. Stages 2 and 3 are **not started**.
+Stopping here for review, per instruction.

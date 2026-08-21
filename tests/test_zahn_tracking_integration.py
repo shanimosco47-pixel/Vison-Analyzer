@@ -35,6 +35,9 @@ from app.services.event_log import build_event_log, summarise
 from app.video.metadata import probe_video
 from app.video.reader import VideoReader
 
+from ._synthetic_handheld import MARGIN, HandheldClip, _camera_offset, _hand_offset
+from .conftest import PORTRAIT_TIMELINE
+
 # Stage 0's synthetic acceptance criterion (README "Acceptance criteria"):
 # endpoint error within +/-0.5s on synthetic tests with known ground truth.
 SYNTHETIC_TOLERANCE_S = 0.5
@@ -121,6 +124,135 @@ class TestConfidenceReflectsMotion:
         steady = _run(zahn_video.path, (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]))
         moving = _run(handheld_zahn_video.path, handheld_zahn_video.outlet_at_reference)
         assert moving.summary["confidence"] <= steady.summary["confidence"]
+
+
+class TestOutletReferenceFrame:
+    """Second Codex review round: a real clip's outlet is only markable
+    after the camera has already panned well past the true start.
+
+    ``portrait_reference_frame_zahn_video`` is resolution-scaled to the
+    real clip's own geometry (1080x1920, large early reframing); its true
+    flow start (3.9s) is well before the 4.5s frame these tests mark the
+    outlet on. Wiring ``outlet_reference_s`` through correctly must recover
+    the true start, not merely convert the failure into an honestly
+    unmeasurable one - see diagnostics/stage1/STAGE1_REPORT.md §17.3.
+    """
+
+    def _outlet_at_reference(self, clip: HandheldClip, reference_s: float) -> tuple[float, float]:
+        """Where the outlet truly is at ``reference_s`` - what a user would
+        actually click there, computed the same way the fixture itself
+        placed the cup (see build_handheld_clip)."""
+        cx, cy = _camera_offset(
+            reference_s, PORTRAIT_TIMELINE["camera_drift_px"], PORTRAIT_TIMELINE["tremor_px"]
+        )
+        hx, hy = _hand_offset(reference_s, PORTRAIT_TIMELINE["hand_drift_px"])
+        base_x = MARGIN + clip.width / 2.0
+        base_y = MARGIN + clip.height * 0.34
+        return (base_x + hx) - (MARGIN + cx), (base_y + hy) - (MARGIN + cy)
+
+    def test_the_bug_marking_a_later_frame_is_applied_to_frame_zero(
+        self, portrait_reference_frame_zahn_video
+    ):
+        """Without outlet_reference_s, the coordinates are silently wrong."""
+        clip = portrait_reference_frame_zahn_video
+        outlet_at_4_5 = self._outlet_at_reference(clip, 4.5)
+        result = _run(
+            clip.path,
+            outlet_at_4_5,
+            analysis_start_s=4.5,  # the user's natural attempted workaround
+        )
+        summary = result.summary
+        # Starting analysis after flow has already begun corrupts
+        # StreamActivityScorer's background model (it bootstraps from its
+        # first frame unconditionally) - the reported start is nowhere near
+        # the true 3.9s, and not merely imprecise: wrong by a large margin.
+        assert summary["flow_start_s"] is None or (
+            abs(summary["flow_start_s"] - clip.flow_start_s) > SYNTHETIC_TOLERANCE_S
+        )
+
+    def test_outlet_reference_s_recovers_the_true_start(self, portrait_reference_frame_zahn_video):
+        """The fix: mark on a later frame, but tell the detector which one."""
+        clip = portrait_reference_frame_zahn_video
+        outlet_at_4_5 = self._outlet_at_reference(clip, 4.5)
+        result = _run(
+            clip.path,
+            outlet_at_4_5,
+            outlet_reference_s=4.5,  # analysis_start_s stays at its default, 0
+        )
+        summary = result.summary
+        assert summary["status"] == "confirmed"
+        assert abs(summary["flow_start_s"] - clip.flow_start_s) <= SYNTHETIC_TOLERANCE_S
+        assert abs(summary["efflux_seconds"] - clip.efflux_s) <= SYNTHETIC_TOLERANCE_S
+
+    def test_a_reference_frame_matching_analysis_start_s_is_unaffected(
+        self, portrait_reference_frame_zahn_video
+    ):
+        """outlet_reference_s == analysis_start_s must behave exactly as before."""
+        clip = portrait_reference_frame_zahn_video
+        result = _run(
+            clip.path, clip.outlet_at_reference, outlet_reference_s=0.0, analysis_start_s=0.0
+        )
+        summary = result.summary
+        assert summary["status"] == "confirmed"
+        assert abs(summary["flow_start_s"] - clip.flow_start_s) <= SYNTHETIC_TOLERANCE_S
+
+
+class TestPortraitGuardGeometry:
+    """Second Codex review round: roi_height_fraction on a tall portrait
+    frame can leave the guard/capture geometry no room to follow the
+    tracked outlet drifting downward before it clips against the bottom of
+    the frame - marking otherwise-correctly-tracked frames untrusted for a
+    reason that has nothing to do with tracking quality.
+    """
+
+    def test_the_guard_region_does_not_clip_against_the_frame_edge(
+        self, portrait_reference_frame_zahn_video
+    ):
+        clip = portrait_reference_frame_zahn_video
+        result = _run(clip.path, clip.outlet_at_reference)
+        summary = result.summary
+        # Not zero untracked - hand-held motion is still hand-held motion -
+        # but nowhere near the near-total failure geometry clipping causes;
+        # the overwhelming majority of frames must track cleanly.
+        untracked_ratio = summary["frames_untracked"] / max(1, summary["frames_analysed"])
+        assert untracked_ratio < 0.1
+        assert summary["status"] == "confirmed"
+
+
+class TestTrackingRefusesAStrongNearbyDistractor:
+    """Second Codex review round: "the tracker is following the wrong
+    structure through/around the translucent cup, not merely running out
+    of search width."
+
+    A genuinely-initialised cup (anchor feature is real cup texture, not a
+    distractor) that later drifts near a strong, stationary patch is the
+    case this stage's per-frame patch-correlation check (§17, "why
+    transforms are accepted") can address: it must not let the fitted
+    transform get pulled onto the distractor and reported as confidently
+    tracked. This is a narrower, and Stage-1-solvable, claim than "the
+    tracker always finds the cup regardless of what else is in frame" -
+    see diagnostics/stage1/STAGE1_REPORT.md for why a distractor that
+    already overlaps the cup at initialisation (the true translucent-
+    material case) is not solvable at this layer, and what would be
+    needed (Stage 3's deferred camera-motion compensation).
+    """
+
+    def test_the_result_is_not_confidently_wrong(self, translucent_cup_near_distractor_zahn_video):
+        clip, _distractor_center = translucent_cup_near_distractor_zahn_video
+        result = _run(clip.path, clip.outlet_at_reference)
+        summary = result.summary
+        # The pre-fix failure mode: RANSAC/inlier/displacement checks alone
+        # accept the distractor's own smooth, self-consistent motion,
+        # reporting status=confirmed with high confidence on a wrong
+        # number. The safety property this stage can deliver is that this
+        # must not happen - either the run stays honestly uncertain
+        # (review/failed, capped confidence), or a genuinely correct
+        # measurement is reported; never a confident, wrong one.
+        if summary["status"] == "confirmed":
+            assert summary["efflux_seconds"] is not None
+            assert abs(summary["efflux_seconds"] - clip.efflux_s) <= SYNTHETIC_TOLERANCE_S
+        else:
+            assert summary["confidence"] <= 0.5
 
 
 class TestBreakDuringATrackingGap:

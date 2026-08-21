@@ -109,6 +109,22 @@ def build_roi_from_click(
     x = max(0, min(x, video.width - width))
     y = max(0, min(y, video.height - 1))
     height = min(height, video.height - y)
+    # Codex review: on a tall portrait frame, roi_height_fraction can eat
+    # nearly all the space below the click - build_guard_roi's downward
+    # margin (guard_margin_px // 2) plus the tracker's own search budget
+    # (track_search_margin_px, see _build_capture_roi) then has nowhere
+    # left to extend, so the *geometry* clips against the frame edge as
+    # soon as the tracked outlet drifts down at all, marking otherwise-
+    # correctly-tracked frames untrusted for a reason that has nothing to
+    # do with tracking quality. Reserve that downward headroom up front so
+    # the guard/capture geometry stays valid across the tracker's full
+    # configured displacement budget, the same way it already does
+    # horizontally via x's clamp above. A pathologically low click still
+    # gets the best available height (floor of 16px, matching the
+    # unconstrained case above) rather than an error - a shorter analysis
+    # region that works beats a taller one that clips.
+    downward_headroom = config.guard_margin_px // 2 + config.track_search_margin_px
+    height = max(16, min(height, video.height - y - downward_headroom))
     roi = ROI(x=x, y=y, width=width, height=height)
     roi.validate(video.width, video.height)
     return roi
@@ -786,6 +802,23 @@ class ZahnCupDetector(BaseDetector):
         if self.end_s and self.end_s <= self.start_s:
             raise ConfigurationError("The analysis end time must be after the start time.")
 
+        # The timestamp of the frame the outlet/ROI coordinates above were
+        # actually marked on - distinct from analysis_start_s, where
+        # scoring/decoding begins (Codex review: a real hand-held clip's
+        # outlet can become markable only after the camera has already
+        # panned well past frame 0, e.g. a large early reframing). Only a
+        # click carries a meaningful reference frame; a manually drawn ROI
+        # has none, so it defaults to analysis_start_s like an unsupplied
+        # value. Clamped into [start_s, end_s] defensively - a stale or
+        # out-of-range value from a caller should degrade to "no reference
+        # frame given" rather than fail the whole analysis.
+        reference_param = self.params.get("outlet_reference_s") if outlet else None
+        self.outlet_reference_s = (
+            clamp(float(reference_param), self.start_s, self.end_s or self.start_s)
+            if reference_param is not None
+            else self.start_s
+        )
+
         self.keep_diagnostics = bool(self.params.get("save_diagnostics", False))
         # Set by the service layer (job.job_id under config.diagnostics_dir),
         # not by a user-facing parameter. When present and save_diagnostics is
@@ -827,6 +860,18 @@ class ZahnCupDetector(BaseDetector):
         return ROI(x=x, y=y, width=x2 - x, height=y2 - y).clipped_to(
             self.video.width, self.video.height
         )
+
+    def _read_reference_frame_gray(self, reader: VideoReader, capture_roi: ROI) -> np.ndarray:
+        """The single frame at ``outlet_reference_s``, prepared like every
+        frame the main tracked pass decodes (the wide-capture contract is
+        always scale=1.0, no blur - see ``run()``), for pre-arming the
+        tracker before the main pass starts. One out-of-band read via
+        ``VideoReader.frame_at`` - not part of the main streaming loop, so
+        it does not change how many frames that loop itself decodes.
+        """
+        frame = reader.frame_at(self.outlet_reference_s)
+        frame = frame[capture_roi.y : capture_roi.y2, capture_roi.x : capture_roi.x2]
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     # -- execution --------------------------------------------------------- #
 
@@ -909,6 +954,36 @@ class ZahnCupDetector(BaseDetector):
 
         frames_log = self._open_tracking_frames_log() if wide_capture else None
         try:
+            if wide_capture and self.outlet_reference_s > self.start_s:
+                # The outlet was marked on a frame after analysis_start_s -
+                # a real hand-held clip can require this when the outlet
+                # only becomes markable once the camera has already panned
+                # well past the first frame (Codex review). Pre-read just
+                # that one frame to build the tracker's reference patch,
+                # then let the main pass search for it chronologically from
+                # analysis_start_s - see OutletTracker's start_in_search.
+                # This never runs an extra frame through the main decode
+                # loop itself: frame_at() is a single out-of-band read.
+                try:
+                    reference_gray = self._read_reference_frame_gray(reader, capture_roi)
+                    tracker = OutletTracker(
+                        self.config,
+                        reference_gray,
+                        reference_outlet_local,
+                        patch_half_px=patch_half_px,
+                        cup_half_width_px=cup_half_width_px,
+                        cup_height_above_px=cup_height_above_px,
+                        reference_timestamp_s=self.outlet_reference_s,
+                        start_in_search=True,
+                    )
+                except TrackerInitError as exc:
+                    logger.warning(
+                        "Zahn outlet tracking could not start for %s: %s",
+                        self.video.path.name,
+                        exc,
+                    )
+                    return self._tracking_unavailable_result(str(exc))
+                first_frame = False
             return self._run_loop(
                 reader=reader,
                 progress=progress,
@@ -1678,6 +1753,7 @@ def _zahn_config_to_dict(config: ZahnConfig) -> dict[str, Any]:
             "track_min_features",
             "track_max_bridge_s",
             "track_reacquire_min_correlation",
+            "track_min_patch_correlation",
             "zahn_max_endpoint_uncertainty_s",
         )
     }

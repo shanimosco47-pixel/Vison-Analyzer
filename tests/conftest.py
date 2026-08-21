@@ -249,6 +249,136 @@ def handheld_gap_at_start_zahn_video(tmp_path_factory: pytest.TempPathFactory) -
     return build_handheld_clip(path, occlusion_s=(2.6, 4.2), **HANDHELD_TIMELINE)
 
 
+# Second Codex review round on the real-footage validation failure: a
+# portrait, resolution-scaled timeline approximating the real clip's own
+# geometry (1080x1920, large early reframing). camera_drift_px/hand_drift_px
+# are scaled ~2.25x vs HANDHELD_TIMELINE's 480px-wide baseline - the same
+# relative motion, more raw pixels at higher resolution.
+PORTRAIT_TIMELINE = {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30.0,
+    "duration_s": 27.0,
+    "flow_start_s": 3.9,
+    "stream_break_s": 20.0,
+    "flow_end_s": 20.5,
+    "camera_drift_px": 14.0 * (1080 / 480),
+    "hand_drift_px": 12.0 * (1080 / 480),
+    "tremor_px": 1.0 * (1080 / 480),
+}
+
+
+@pytest.fixture(scope="session")
+def portrait_reference_frame_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> HandheldClip:
+    """The outlet is only markable well after the true start - the exact
+    real-footage bug (Codex review, reopened after a real clip was
+    supplied): the camera has already panned well past frame 0 by the time
+    the outlet becomes clearly visible. ``outlet_at_reference`` is this
+    clip's t=0 position; ``PORTRAIT_TIMELINE``'s own flow_start_s (3.9s) is
+    well before the 4.5s reference frame the tests mark the outlet on, so
+    the true start can only be recovered - not just honestly flagged
+    unmeasurable - if outlet_reference_s is wired through and used
+    correctly. See ZahnCupDetector.outlet_reference_s.
+    """
+    path = tmp_path_factory.mktemp("videos") / "portrait_reference_frame_zahn.mp4"
+    return build_handheld_clip(path, **PORTRAIT_TIMELINE)
+
+
+@pytest.fixture(scope="session")
+def translucent_cup_near_distractor_zahn_video(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[HandheldClip, tuple[float, float]]:
+    """A genuinely-initialised cup that drifts near a strong, stationary
+    distractor patch later in the run - not overlapping it at t=0, unlike
+    ``build_translucent_cup_clip``'s worst case (see diagnostics/stage1/
+    STAGE1_REPORT.md for why that case is not Stage-1-solvable). Tests here
+    check the safety property this stage *can* deliver: when a nearby
+    distractor is strong enough to threaten pulling the fitted transform
+    off the cup, the tracker must become honestly uncertain rather than
+    confidently wrong (Codex review: "why transforms are accepted").
+    """
+    import numpy as np
+
+    from ._synthetic_handheld import (
+        MARGIN,
+        _camera_offset,
+        _checkerboard_patch,
+        _draw_liquid,
+        _hand_offset,
+        _world_background,
+    )
+
+    def _draw_cup_with_rim_and_handle(
+        frame: np.ndarray, ox: float, oy: float, level: float
+    ) -> None:
+        x, y = int(round(ox)), int(round(oy))
+        cv2.rectangle(frame, (x - 55, y - 95), (x + 55, y - 5), level, -1)
+        cv2.ellipse(frame, (x, y - 5), (55, 13), 0, 0, 180, level, -1)
+        cv2.ellipse(frame, (x, y - 95), (55, 13), 0, 0, 360, level - 4, -1)
+        cv2.rectangle(frame, (x + 55, y - 76), (x + 82, y - 66), level - 10, -1)
+        cv2.rectangle(frame, (x + 72, y - 66), (x + 82, y - 32), level - 10, -1)
+
+    width, height, fps, duration = 1080, 1920, 30.0, 16.0
+    background_level, sensor_noise = 214, 1.8
+    camera_drift_px, hand_drift_px, tremor_px = 30.0, 26.0, 2.0
+    flow_start_s, stream_break_s, flow_end_s = 3.0, 12.0, 12.6
+    rng = np.random.default_rng(9)
+    base_x = MARGIN + width / 2.0
+    base_y = MARGIN + height * 0.34
+    world = _world_background(width, height, background_level, 6.0)
+    # Offset from the cup's t=0 position, so initialisation locks onto the
+    # genuine cup - the drift toward this distractor happens over the run.
+    distractor_center = (base_x + 140, base_y - 40)
+    _checkerboard_patch(world, distractor_center, background_level)
+
+    path = tmp_path_factory.mktemp("videos") / "translucent_near_distractor.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():  # pragma: no cover - depends on the OpenCV build
+        pytest.skip("This OpenCV build cannot write MP4 files")
+
+    reference_outlet: tuple[float, float] | None = None
+    for index in range(int(duration * fps)):
+        t = index / fps
+        cx, cy = _camera_offset(t, camera_drift_px, tremor_px)
+        x0, y0 = int(round(MARGIN + cx)), int(round(MARGIN + cy))
+        frame = world[y0 : y0 + height, x0 : x0 + width].copy()
+        hx, hy = _hand_offset(t, hand_drift_px)
+        ox = (base_x + hx) - (MARGIN + cx)
+        oy = (base_y + hy) - (MARGIN + cy)
+        if reference_outlet is None:
+            reference_outlet = (ox, oy)
+        _draw_cup_with_rim_and_handle(frame, ox, oy, float(background_level - 14))
+        _draw_liquid(
+            frame,
+            t,
+            ox,
+            oy,
+            start_s=flow_start_s,
+            break_s=stream_break_s,
+            end_s=flow_end_s,
+            level=background_level - 18,
+        )
+        frame += rng.normal(0.0, sensor_noise, frame.shape).astype(np.float32)
+        bgr = cv2.cvtColor(np.clip(frame, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        writer.write(bgr)
+    writer.release()
+
+    assert reference_outlet is not None
+    clip = HandheldClip(
+        path=path,
+        fps=fps,
+        duration_s=duration,
+        width=width,
+        height=height,
+        flow_start_s=flow_start_s,
+        stream_break_s=stream_break_s,
+        flow_end_s=flow_end_s,
+        outlet_at_reference=reference_outlet,
+        occlusion_s=None,
+    )
+    return clip, distractor_center
+
+
 @pytest.fixture
 def broken_video(tmp_path: Path) -> Path:
     """A file with a video extension that is not a video at all."""

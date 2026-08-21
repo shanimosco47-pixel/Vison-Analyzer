@@ -190,3 +190,128 @@ def build_handheld_clip(
         outlet_at_reference=reference_outlet,
         occlusion_s=occlusion_s,
     )
+
+
+def _checkerboard_patch(
+    field: np.ndarray, center: tuple[float, float], level: int, *, tile: int = 9, span: int = 70
+) -> None:
+    """A small, strongly-textured patch - exactly what goodFeaturesToTrack
+    favours, and exactly the wrong thing to favour: this patch is baked
+    into the *world* background, so it does not move with a hand-held cup
+    - only with camera pan, like the rest of the background.
+    """
+    h, w = field.shape
+    cx, cy = int(center[0]), int(center[1])
+    for gy in range(cy - span, cy + span, tile):
+        for gx in range(cx - span, cx + span, tile):
+            if 0 <= gy < h - tile and 0 <= gx < w - tile:
+                shade = level - 30 if ((gx // tile) + (gy // tile)) % 2 == 0 else level + 10
+                field[gy : gy + tile, gx : gx + tile] = float(np.clip(shade, 0, 255))
+
+
+def _draw_translucent_cup(
+    frame: np.ndarray, ox: float, oy: float, level: int, *, opacity: float
+) -> None:
+    """A low-texture, translucent cup: alpha-blended, not overwritten.
+
+    Everything about this is weaker than ``_draw_cup``: the body is a
+    broad, low-opacity tint that lets whatever is already in the frame -
+    including a distractor patch baked into the background, see
+    ``_checkerboard_patch`` - show through, rather than a solid fill that
+    would hide it completely. Only the rim is drawn close to opaque: the
+    one feature a real translucent cup usually keeps a visible edge on,
+    and so the one genuine anchor a tracker has any real chance at.
+    """
+    x, y = int(round(ox)), int(round(oy))
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x - 55, y - 95), (x + 55, y - 5), float(level), -1)
+    cv2.addWeighted(overlay, opacity, frame, 1.0 - opacity, 0.0, dst=frame)
+    cv2.ellipse(frame, (x, y - 95), (55, 13), 0, 0, 360, float(level - 8), 2)
+
+
+def build_translucent_cup_clip(
+    path: Path,
+    *,
+    width: int = 1080,
+    height: int = 1920,
+    fps: float = 30.0,
+    duration_s: float = 20.0,
+    flow_start_s: float = 3.0,
+    stream_break_s: float = 14.0,
+    flow_end_s: float = 14.6,
+    background_level: int = 214,
+    texture_strength: float = 6.0,
+    sensor_noise: float = 1.8,
+    cup_opacity: float = 0.22,
+    stream_delta: int = 18,
+    camera_drift_px: float = 30.0,
+    hand_drift_px: float = 26.0,
+    tremor_px: float = 2.0,
+    seed: int = 20260821,
+) -> HandheldClip:
+    """A hand-held clip whose cup is translucent, low-texture, over a
+    strongly-textured distractor patch baked into the (camera-relative
+    only) background - the real-footage failure mode Codex review found:
+    "the tracker is following the wrong structure through/around the
+    translucent cup." A tracker that locks onto the distractor patch
+    (stationary but for camera pan) rather than the cup itself (which also
+    carries independent hand drift) diverges from the true outlet position
+    by roughly the hand-drift magnitude; a tracker that correctly follows
+    the cup does not. Defaults to a portrait resolution and hand-held
+    reframing large enough to also exercise the resolution-scaled ROI/guard
+    geometry from the same review round.
+    """
+    rng = np.random.default_rng(seed)
+    base_x = MARGIN + width / 2.0
+    base_y = MARGIN + height * 0.34
+    world = _world_background(width, height, background_level, texture_strength)
+    _checkerboard_patch(world, (base_x, base_y), background_level)
+
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():  # pragma: no cover - depends on the OpenCV build
+        pytest.skip("This OpenCV build cannot write MP4 files")
+
+    reference_outlet: tuple[float, float] | None = None
+    total_frames = int(round(duration_s * fps))
+
+    for index in range(total_frames):
+        t = index / fps
+        cx, cy = _camera_offset(t, camera_drift_px, tremor_px)
+        x0, y0 = int(round(MARGIN + cx)), int(round(MARGIN + cy))
+        frame = world[y0 : y0 + height, x0 : x0 + width].copy()
+
+        hx, hy = _hand_offset(t, hand_drift_px)
+        ox = (base_x + hx) - (MARGIN + cx)
+        oy = (base_y + hy) - (MARGIN + cy)
+        if reference_outlet is None:
+            reference_outlet = (ox, oy)
+
+        _draw_translucent_cup(frame, ox, oy, background_level, opacity=cup_opacity)
+        _draw_liquid(
+            frame,
+            t,
+            ox,
+            oy,
+            start_s=flow_start_s,
+            break_s=stream_break_s,
+            end_s=flow_end_s,
+            level=background_level - stream_delta,
+        )
+        frame += rng.normal(0.0, sensor_noise, frame.shape).astype(np.float32)
+        bgr = cv2.cvtColor(np.clip(frame, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        writer.write(bgr)
+    writer.release()
+
+    assert reference_outlet is not None
+    return HandheldClip(
+        path=path,
+        fps=fps,
+        duration_s=duration_s,
+        width=width,
+        height=height,
+        flow_start_s=flow_start_s,
+        stream_break_s=stream_break_s,
+        flow_end_s=flow_end_s,
+        outlet_at_reference=reference_outlet,
+        occlusion_s=None,
+    )

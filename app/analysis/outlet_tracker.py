@@ -205,7 +205,30 @@ class OutletTracker:
         cup_half_width_px: int,
         cup_height_above_px: int,
         reference_timestamp_s: float = 0.0,
+        start_in_search: bool = False,
     ) -> None:
+        """Build the reference patch/features from ``reference_gray``.
+
+        ``start_in_search=True`` is for a reference frame that is not the
+        first frame the tracker will actually be fed (Codex review: a user's
+        outlet mark is only trustworthy on the frame it was made on, which
+        may sit after frames the caller still needs measured - see
+        ``ZahnCupDetector``'s ``outlet_reference_s``). The bootstrap work
+        below - feature detection, the ``TrackerInitError`` check, patch
+        extraction - is identical either way; what differs is the state
+        construction finishes in. With it False (the default, and every
+        pre-existing call site), the reference frame *is* the tracker's
+        first observed frame, exactly as before. With it True, the tracker
+        starts in ``LOST`` with no confident observation yet, so its first
+        real ``update()`` call - whenever the caller makes it, at any
+        timestamp - goes through ``_attempt_reacquisition``'s already-
+        verified template search rather than assuming temporal adjacency to
+        this frame. That search is direction- and distance-independent (it
+        matches the current frame against the stored patch, not against
+        ``reference_gray`` via optical flow), so it correctly locates the
+        cup whether the caller's first real frame is right at this
+        timestamp, earlier, or later.
+        """
         self._config = config
         self._bounds = reference_gray.shape[:2]  # (height, width)
         self._reference_outlet = np.array(outlet_xy, dtype=np.float64)
@@ -223,17 +246,24 @@ class OutletTracker:
                 f"Only {0 if points is None else len(points)} trackable feature(s) "
                 f"found in the cup region above the outlet (need >= {_MIN_INIT_FEATURES})."
             )
-        self._points: np.ndarray | None = points
         self._prev_gray = reference_gray
-        self._state = TrackState.TRACKED
         self._bridge_start_s: float | None = None
-        self._last_confident_outlet = self._outlet.copy()
-        # Set from construction, not left None until the first successful
-        # update(): the reference frame *is* a confident observation, and a
-        # gap on the very next frame must still have a timestamp and a
-        # (zero, until real motion is observed) velocity to bridge from.
-        self._last_confident_timestamp: float | None = reference_timestamp_s
         self._velocity = np.zeros(2, dtype=np.float64)
+        if start_in_search:
+            self._points: np.ndarray | None = None
+            self._state = TrackState.LOST
+            self._last_confident_outlet = self._outlet.copy()
+            self._last_confident_timestamp: float | None = None
+        else:
+            self._points = points
+            self._state = TrackState.TRACKED
+            self._last_confident_outlet = self._outlet.copy()
+            # Set from construction, not left None until the first
+            # successful update(): the reference frame *is* a confident
+            # observation, and a gap on the very next frame must still have
+            # a timestamp and a (zero, until real motion is observed)
+            # velocity to bridge from.
+            self._last_confident_timestamp = reference_timestamp_s
 
         # The reacquisition patch is centred on the *strongest* detected
         # feature, not the outlet itself and not the centroid of every
@@ -253,6 +283,33 @@ class OutletTracker:
         self._reference_patch, self._patch_outlet_offset = self._extract_patch(
             reference_gray, anchor_point, self._outlet, patch_half_px
         )
+        # Codex review: a real translucent, low-texture cup can let
+        # goodFeaturesToTrack/RANSAC lock onto structure visible through or
+        # around the cup rather than the cup itself - inlier count and
+        # per-frame displacement alone do not catch this, since the wrong
+        # structure can still move smoothly and pass both. This offset
+        # (translation-only; per-frame rotation/scale over a hand-held
+        # clip's frame interval is small enough for a plausibility check,
+        # unlike for precise tracking) lets _attempt_tracking ask, for any
+        # candidate outlet position, "does the anchor feature's implied
+        # position still look like the cup we started with" - see
+        # _patch_correlation_at.
+        self._anchor_offset_from_outlet = anchor_point - self._outlet
+        # The reference patch's own top-left corner, relative to the anchor
+        # it was cropped around - not necessarily (-patch_half_px,
+        # -patch_half_px): _extract_patch clips at the frame edge, so an
+        # anchor near an edge (a real possibility - it is simply the
+        # strongest corner found, wherever that is) produces a shorter,
+        # asymmetric patch. _patch_correlation_at must slide this exact
+        # rectangle to a new center, not re-derive a symmetric one from
+        # patch_w/patch_h alone, or it recomputes a window that was never
+        # actually extracted and can end up entirely outside the frame even
+        # at zero displacement.
+        anchor_cx = int(round(anchor_point[0]))
+        anchor_cy = int(round(anchor_point[1]))
+        patch_x0 = max(0, anchor_cx - patch_half_px)
+        patch_y0 = max(0, anchor_cy - patch_half_px)
+        self._patch_offset_from_anchor = (patch_x0 - anchor_cx, patch_y0 - anchor_cy)
 
     # -- public ------------------------------------------------------------ #
 
@@ -321,8 +378,26 @@ class OutletTracker:
                         displacement = float(np.hypot(*(candidate - self._outlet)))
                         in_bounds = self._within_bounds(candidate)
                         if displacement <= cfg.track_max_frame_displacement_px and in_bounds:
-                            accepted_outlet = candidate
-                            surviving_points = target[inlier_mask.ravel() == 1].reshape(-1, 1, 2)
+                            # Inlier count and displacement alone accept any
+                            # transform enough of the point set agrees on -
+                            # on a translucent, low-texture cup, that
+                            # majority can be structure visible through or
+                            # around the cup rather than the cup itself,
+                            # and it can move smoothly enough to pass both
+                            # checks (Codex review). Verify the anchor
+                            # feature's implied position under this
+                            # candidate still resembles the reference patch
+                            # before trusting it - the same "verified, not
+                            # assumed" bar reacquisition already has to
+                            # clear, applied continuously rather than only
+                            # after a loss.
+                            implied_anchor = candidate + self._anchor_offset_from_outlet
+                            correlation = self._patch_correlation_at(gray, implied_anchor)
+                            if correlation >= cfg.track_min_patch_correlation:
+                                accepted_outlet = candidate
+                                surviving_points = target[inlier_mask.ravel() == 1].reshape(
+                                    -1, 1, 2
+                                )
 
         if accepted_outlet is not None:
             return self._accept_tracked(
@@ -428,6 +503,27 @@ class OutletTracker:
         if not self._within_bounds(candidate):
             return None
         return candidate
+
+    def _patch_correlation_at(self, gray: np.ndarray, center: np.ndarray) -> float:
+        """Correlation between the reference patch and this frame at ``center``.
+
+        Same-size, position-only correlation, not a search - cheap enough to
+        run on every tracked frame, unlike _match_reference_patch's sliding
+        window over the whole crop. Returns -1.0 (below any real threshold)
+        when the reference-sized patch does not fully fit at this position,
+        so an edge case degrades to "cannot verify," never to a spuriously
+        high or low score from a shrunk comparison.
+        """
+        patch_h, patch_w = self._reference_patch.shape[:2]
+        cx, cy = int(round(center[0])), int(round(center[1]))
+        dx0, dy0 = self._patch_offset_from_anchor
+        x0, y0 = cx + dx0, cy + dy0
+        x1, y1 = x0 + patch_w, y0 + patch_h
+        if x0 < 0 or y0 < 0 or x1 > gray.shape[1] or y1 > gray.shape[0]:
+            return -1.0
+        candidate_patch = gray[y0:y1, x0:x1]
+        response = cv2.matchTemplate(candidate_patch, self._reference_patch, cv2.TM_CCOEFF_NORMED)
+        return float(response[0, 0])
 
     # -- helpers ------------------------------------------------------------ #
 
