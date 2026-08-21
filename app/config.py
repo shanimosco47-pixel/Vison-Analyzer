@@ -329,6 +329,275 @@ class ZahnConfig:
     # Below this the detection is reported as failed and *no* time is given.
     fail_confidence: float = 0.40
 
+    # --- outlet tracking (hand-held camera and/or hand-held cup) ---------- #
+    # Stage 0 (diagnostics/stage0/STAGE0_REPORT.md) found a fixed analysis
+    # region losing the outlet to drift was the whole of the "several seconds
+    # too long" field report; tracking the outlet frame to frame is the fix.
+    # Named with the "zahn_" prefix (unlike the rest of this class) because it
+    # is meant to be found and toggled independently in a parameter bag shared
+    # across detectors - a deliberate rollback lever, not house style.
+    zahn_track_outlet: bool = True
+
+    # Extra margin, in source pixels, added on every side of the guard region
+    # to build the fixed capture window the tracker searches within for the
+    # whole run. This is the hard bound on cumulative drift the tracker can
+    # follow: an outlet that wanders further than this from where it was
+    # clicked over the course of the recording is reported `lost`, not
+    # silently mis-tracked. Raise it for footage with more swing.
+    track_search_margin_px: int = 80
+
+    # A single frame's estimated outlet displacement above this many pixels is
+    # treated as an unreliable fit even if RANSAC nominally supported it (a
+    # plausible symptom of motion blur or a repeating texture), and the frame
+    # falls back to prediction rather than being trusted outright.
+    track_max_frame_displacement_px: float = 40.0
+
+    # Minimum RANSAC inlier count for a frame's similarity-transform fit to be
+    # trusted. Below this, the frame is bridged (`predicted`) or, once the
+    # bridge runs out, `lost`.
+    track_min_inliers: int = 6
+
+    # Once the tracked point set falls below this count, fresh features are
+    # detected over the cup so tracking does not run down to a handful of
+    # points and become fragile.
+    track_min_features: int = 12
+
+    # How long a `predicted` (constant-velocity) bridge may cover before the
+    # tracker gives up and reports `lost`. Bridges longer than this stop being
+    # a reasonable extrapolation of where the outlet actually is.
+    track_max_bridge_s: float = 0.5
+
+    # Normalised template-match correlation (0-1) a candidate position must
+    # reach against the reference patch captured at initialisation before a
+    # `lost` tracker is allowed to resume as `tracked`. This is what makes
+    # reacquisition a *verified* claim rather than "a tracker found
+    # something": a low-texture false match is refused, and tracking stays
+    # `lost` until a confident match appears.
+    track_reacquire_min_correlation: float = 0.6
+
+    # Normalised template-match correlation (0-1) the anchor feature's
+    # implied position must reach against the reference patch for a
+    # similarity-transform fit to be accepted as `tracked`, in addition to
+    # (not instead of) the inlier-count and displacement checks above. On a
+    # translucent, low-texture cup, a majority of tracked points can be
+    # structure visible through or around the cup rather than the cup
+    # itself, and that structure can move smoothly enough to pass both of
+    # those checks - this is what refuses a plausible-looking fit that has
+    # simply locked onto the wrong thing. Lower than
+    # track_reacquire_min_correlation: a long, genuinely correct run of
+    # continuous tracking is expected to drift further from a single fixed
+    # reference snapshot (lighting, angle, focus) than a fresh cold
+    # reacquisition search is, so the same bar would produce false
+    # rejections during ordinary tracking.
+    track_min_patch_correlation: float = 0.45
+
+    # The two-anchor tracking contract (Codex review, fourth round): an
+    # interior frame between the operator's two marked anchors is trusted
+    # only when tracking forward from the early anchor and tracking
+    # backward from the late anchor *independently* agree, both that the
+    # frame is `tracked` and on where within this many pixels of each
+    # other. Disagreement (or either direction losing the outlet) is not
+    # "close enough because it's between two trusted points" - it is
+    # treated exactly like an ordinary loss, feeding the same untracked/
+    # uncertainty path. Comparable to track_max_frame_displacement_px but a
+    # separate knob: this bounds disagreement between two independently
+    # accumulated tracks over a potentially long span, not one frame's own
+    # step.
+    track_reconciliation_max_disagreement_px: float = 30.0
+
+    # Stage 3 (camera-motion compensation): the minimum number of RANSAC
+    # inliers a frame-to-frame background/camera motion estimate needs
+    # before it is used at all. Features come from outside the cup/outlet/
+    # guard/stream box (see OutletTracker's background estimator), so a
+    # background-starved crop (little texture beyond the cup itself) simply
+    # cannot support this - "unavailable" in that case, never "assume zero
+    # motion." The residual-motion veto below only ever fires on an
+    # *available* estimate; an unavailable one falls back to the pre-Stage-3
+    # checks unchanged, exactly like a low-inlier cup fit already does.
+    background_motion_min_features: int = 8
+
+    # A background motion estimate below this magnitude, accumulated over
+    # background_motion_window_s (not one frame), means the camera was not
+    # moving meaningfully over that window - there is no camera motion for
+    # the residual check below to test a cup candidate against, so it is
+    # skipped rather than comparing two near-zero vectors and treating a
+    # static cup as "background-consistent." This is what keeps a
+    # genuinely stationary camera and cup (no signal to compensate for)
+    # behaving exactly as before Stage 3.
+    background_motion_min_signal_px: float = 1.5
+
+    # How far a cup/rim motion candidate's own displacement must diverge
+    # from the background/camera motion estimate, once there is a
+    # background signal to compare against, before it counts as genuine,
+    # independent cup motion rather than background showing through a
+    # translucent cup. Below this, the candidate is rejected as
+    # background-consistent regardless of how well it otherwise passes the
+    # inlier/displacement/patch-correlation checks - those checks alone
+    # cannot tell "the cup, moved" from "more of the same background the
+    # reference patch was already built from" (see diagnostics/stage1/
+    # STAGE1_REPORT.md §24.2/§27.2), which is exactly the gap this residual
+    # check exists to close. Kept close to background_motion_min_signal_px
+    # for the same single-digit-pixel-per-frame reason - real independent
+    # cup motion (a hand moving against a panning camera) is often only a
+    # few pixels' difference per frame, not a wide margin; a much higher
+    # bound would rarely engage on real footage at all. Unvalidated against
+    # real footage (no labelled translucent-cup clip has been available to
+    # calibrate against - see STAGE1_REPORT.md's other unvalidated
+    # thresholds), so a real run may need this retuned in either direction.
+    #
+    # Applied over background_motion_window_s, not a single frame (Codex
+    # review: an earlier, purely per-frame version of both this and
+    # background_motion_min_signal_px rejected clearly-correct opaque-cup
+    # tracking essentially at random - real hand-held motion oscillates,
+    # and the hand's own instantaneous velocity crosses zero periodically,
+    # which looks exactly like "no independent motion this frame" even for
+    # a genuinely, correctly tracked cup). Comparing cumulative displacement
+    # over a short window instead absorbs that oscillation while still
+    # reacting within about a second - comparable in spirit to
+    # track_max_bridge_s, a separate knob for a separate mechanism.
+    background_motion_min_residual_px: float = 2.0
+
+    # The window, in seconds, background_motion_min_signal_px/
+    # _min_residual_px are evaluated over - the cup candidate's and the
+    # background's own cumulative displacement across the last this-many
+    # seconds, not one frame's. See background_motion_min_residual_px's own
+    # docstring for why a window, not a single frame. 0.7s is an empirical
+    # balance across this stage's own synthetic fixtures, not a physical
+    # constant: 0.5s left the portrait, large-reframing fixture's ordinary
+    # oscillation reading as background-consistent too often (a genuine
+    # regression, caught before this value was chosen); 1.0s fixed that but
+    # introduced the same false-positive pattern on several other, smaller-
+    # motion fixtures. Unvalidated against real footage for the same reason
+    # as the thresholds above - the true optimum may sit outside the
+    # 0.5-1.0s range this stage's synthetic suite could distinguish within.
+    background_motion_window_s: float = 0.7
+
+    # Stage 3 actual compensation (not merely the veto above): the
+    # grayscale intensity difference, 0-255, a pixel inside the cup box
+    # must show between the current frame and the *previous* frame warped
+    # by the background transform, before it counts as evidence of
+    # independent (cup) motion rather than background moving with the
+    # camera - see OutletTracker._foreground_residual_mask. Feature
+    # detection prefers corners that also clear this residual check over
+    # plain, unfiltered cup-box corners whenever at least
+    # _MIN_INIT_FEATURES of them do - closing the gap a pure veto cannot:
+    # rejecting a bad candidate does nothing when Stage 1's own tracker
+    # never finds a plausible one to begin with, on a translucent cup
+    # where background-through-cup already dominates the raw image.
+    # Comparable in scale to sensor noise (Stage 0 measured ~1.8 grey
+    # levels of frame-to-frame noise on real footage) with margin for
+    # warp-interpolation artefacts.
+    background_motion_residual_intensity_threshold: int = 12
+
+    # Stage 3, round two (Codex review of `3208924`): on the real clip,
+    # `used_residual` fired on 805/811 frames yet only 17 ended up trusted -
+    # residual-filtered *corner* features (goodFeaturesToTrack over a
+    # translucent, low-texture cup) simply do not exist in enough density to
+    # build a trajectory from, however well the compensation math around
+    # them works. OutletTracker._contour_candidate tracks the cup's visible
+    # *geometry* instead - a gradient/edge template, matched against a
+    # background-suppressed edge map (see OutletTracker._contour_edge_map,
+    # which reuses the same _foreground_residual_mask this section's other
+    # fields already calibrate) - as a fallback whenever the corner/LK path
+    # itself finds no accepted candidate this frame, not a replacement for
+    # it (existing opaque-cup regressions keep passing through the
+    # unmodified corner path).
+    #
+    # Round three (Codex review of `f4b216c`): a *single* template, anchored
+    # on the same corner `_build_reference_patch` already selects, was still
+    # self-referential - on the real clip that corner can itself already be
+    # background-through-cup, and a Sobel transform of its patch does not
+    # fix that (real-clip result: `contour_low_score` on 551/811 rows, and
+    # the rare accepts locked onto background far from the true cup). Fixed
+    # geometry instead of a detected feature: four independent boundary
+    # *bands* (rim, both side walls, bottom/taper - see
+    # `OutletTracker._contour_band_geometry`), positioned by fixed fraction
+    # of `cup_half_width_px`/`cup_height_above_px` relative to the human-
+    # marked outlet directly, never from a detected corner. Each band is
+    # matched independently; a joint translation is accepted only when
+    # enough bands agree (`contour_min_consensus_bands`) with a real margin
+    # over the next-best joint hypothesis - one background edge winning
+    # alone is exactly what consensus exists to refuse. These fields are
+    # that mechanism's own thresholds, all unvalidated against real footage
+    # for the same reason as the background-motion fields above.
+
+    # Normalised template-match correlation (0-1) a single boundary band's
+    # own match must reach, at the *joint* (all-bands-considered) candidate
+    # translation, to count toward consensus at all. Comparable in spirit
+    # to track_reacquire_min_correlation, but over an edge/gradient
+    # representation, not raw intensity - "never trust raw-intensity
+    # matches through the cup" means this path's own acceptance never falls
+    # back to _patch_correlation_at. 0.35 (a natural-feeling floor) turned
+    # out too strict when calibrated against this stage's own low-opacity
+    # fixture: the rim (the one edge this stage's own "rim prior" - see
+    # OutletTracker._build_reference_patch - already expects to be the
+    # strongest) cleared it on 29/42 attempts, but the side walls of a
+    # genuinely faint, low-opacity cup did far less often (left_wall: 7/42)
+    # - a real, physically-expected asymmetry in how strong each part's own
+    # edge is, not a bug. 0.25 is the calibrated value.
+    contour_min_band_score: float = 0.25
+
+    # How many of the four boundary bands (rim, left wall, right wall,
+    # taper) must individually clear contour_min_band_score, at the same
+    # joint translation, before that translation is even considered - the
+    # "required consensus" the authorising review named explicitly: one
+    # band (a single background edge the cup happens to sit near) winning
+    # alone is exactly the self-referential failure this exists to refuse.
+    # Two of four - not three - because a genuinely faint, low-opacity cup's
+    # weaker parts (a side wall, the taper) frequently do not clear even the
+    # calibrated floor above; requiring two independent parts to agree still
+    # refuses a single spurious band from carrying the candidate alone,
+    # which is the property this field exists for, while remaining
+    # achievable given each part's own real, unequal signal strength
+    # (calibrated against this stage's own low-opacity fixture: two-band
+    # consensus reached on 33/42 attempts at the 0.25 floor, three-band on
+    # only 2/42 at the original 0.35 floor).
+    contour_min_consensus_bands: int = 2
+
+    # How far the joint translation's own *combined* score (summed across
+    # all four bands, then normalised per band so this stays on the same
+    # 0-1-ish scale a single band's own score is) must exceed the next-best,
+    # non-overlapping joint translation, before it counts as a genuine,
+    # unambiguous lock rather than one of several similarly-plausible
+    # translations (a flat or repetitive edge - a cup's own straight top
+    # edge, a textured background - can otherwise clear the consensus/floor
+    # checks at more than one nearby translation at once) - the "score
+    # margin" the authorising review named explicitly.
+    contour_score_margin: float = 0.15
+
+    # The "propagate bidirectionally... require geometric agreement" half of
+    # the authorisation: for each band, the same-sized patch the joint
+    # match implies *in the current frame* is matched back against a
+    # slightly larger context crop around that band's own true position in
+    # the *reference* frame (cached at construction) - mirroring the corner
+    # path's own forward-backward check, but per boundary band instead of
+    # per LK point. Averaged across every band whose own crop was
+    # computable; a genuine match's round trip lands back within this many
+    # pixels of the true position on average, a coincidental one generally
+    # does not.
+    contour_max_roundtrip_px: float = 3.0
+
+    # Padding, in pixels, added on every side of each band's own template
+    # size to build the window its own match searches within (bounded to
+    # the tracker's local crop) - large enough to give the score-margin
+    # check a real neighbourhood of alternative joint translations to rule
+    # out (contour_score_margin), without searching the entire crop on
+    # every ordinary continuous-tracking frame the corner path has already
+    # failed on. Reacquisition after a full loss searches the whole crop
+    # regardless of this value, the same way the raw-intensity reacquisition
+    # search already does - the gap's length is not known in advance.
+    contour_search_margin_px: int = 40
+
+    # If liquid was last confirmed before an untrusted (`lost`/`predicted`)
+    # span and no trusted evidence follows it before flow-end would otherwise
+    # be confirmed, the true break could have happened anywhere in that span.
+    # When the span is wider than this, the endpoint is reported unconfirmed
+    # with explicit bounds instead of a falsely precise duration. 0.5 s is an
+    # initial default calibrated only against synthetic footage - it is not
+    # yet validated against a labelled real hand-held clip (see
+    # diagnostics/stage0/STAGE0_REPORT.md, "What I need from you").
+    zahn_max_endpoint_uncertainty_s: float = 0.5
+
     def validate(self) -> None:
         if self.flow_start_persistence_s <= 0 or self.flow_end_persistence_s <= 0:
             raise ConfigurationError("Flow persistence values must be greater than zero.")
@@ -342,6 +611,54 @@ class ZahnConfig:
             raise ConfigurationError("The minimum difference threshold must be at least 1.")
         if not 0.0 <= self.fail_confidence <= self.review_confidence <= 1.0:
             raise ConfigurationError("Confidence thresholds must satisfy 0 <= fail <= review <= 1.")
+        if self.track_search_margin_px < 0:
+            raise ConfigurationError("The tracking search margin must not be negative.")
+        if self.track_max_frame_displacement_px <= 0:
+            raise ConfigurationError("The tracking displacement bound must be greater than zero.")
+        if self.track_min_inliers < 3:
+            raise ConfigurationError("At least 3 tracking inliers are required to fit a transform.")
+        if self.track_min_features < self.track_min_inliers:
+            raise ConfigurationError(
+                "The tracking feature-redetect floor must be at least the inlier minimum."
+            )
+        if self.track_max_bridge_s < 0:
+            raise ConfigurationError("The tracking bridge duration must not be negative.")
+        if not 0.0 < self.track_reacquire_min_correlation <= 1.0:
+            raise ConfigurationError("The reacquisition correlation must be between 0 and 1.")
+        if not 0.0 < self.track_min_patch_correlation <= 1.0:
+            raise ConfigurationError("The tracking patch correlation must be between 0 and 1.")
+        if self.track_reconciliation_max_disagreement_px <= 0:
+            raise ConfigurationError(
+                "The two-anchor reconciliation disagreement bound must be greater than zero."
+            )
+        if self.background_motion_min_features < 3:
+            raise ConfigurationError(
+                "At least 3 background-motion features are required to fit a transform."
+            )
+        if self.background_motion_min_signal_px < 0:
+            raise ConfigurationError("The background-motion signal floor must not be negative.")
+        if self.background_motion_min_residual_px <= 0:
+            raise ConfigurationError(
+                "The background-motion residual bound must be greater than zero."
+            )
+        if self.background_motion_window_s <= 0:
+            raise ConfigurationError("The background-motion window must be greater than zero.")
+        if not 0 <= self.background_motion_residual_intensity_threshold <= 255:
+            raise ConfigurationError(
+                "The background-motion residual intensity threshold must be between 0 and 255."
+            )
+        if not 0.0 < self.contour_min_band_score <= 1.0:
+            raise ConfigurationError("The contour band score floor must be between 0 and 1.")
+        if self.contour_min_consensus_bands < 1:
+            raise ConfigurationError("At least one contour band must be required for consensus.")
+        if self.contour_score_margin < 0:
+            raise ConfigurationError("The contour score margin must not be negative.")
+        if self.contour_max_roundtrip_px <= 0:
+            raise ConfigurationError("The contour round-trip bound must be greater than zero.")
+        if self.contour_search_margin_px <= 0:
+            raise ConfigurationError("The contour search margin must be greater than zero.")
+        if self.zahn_max_endpoint_uncertainty_s < 0:
+            raise ConfigurationError("The endpoint uncertainty bound must not be negative.")
 
 
 # --------------------------------------------------------------------------- #

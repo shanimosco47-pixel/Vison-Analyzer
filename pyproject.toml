@@ -17,7 +17,15 @@ license = { text = "Proprietary - internal use" }
 #   * every one of these is permissively licensed (Apache-2.0 / BSD / MIT).
 dependencies = [
     "opencv-python-headless>=4.9,<5",  # Apache-2.0. Video I/O and all vision work.
-    "numpy>=1.26,<3",                  # BSD-3-Clause. Array maths.
+    # BSD-3-Clause. Array maths. Upper-bounded below 2.5: NumPy 2.5 adopted
+    # PEP 695 `type` statement syntax in its own .pyi stubs, which mypy
+    # rejects under this project's `python_version = "3.10"` config
+    # ("Type statement is only supported in Python 3.12 and greater") even
+    # though nothing here uses that syntax - the failure is purely mypy
+    # parsing numpy's stub file. python/mypy#21178 tracks this as a mypy
+    # limitation; until it's resolved upstream, a clean install must not be
+    # able to resolve a NumPy version mypy cannot check under >=3.10.
+    "numpy>=1.26,<2.5",
     "flask>=3.0,<4",                   # BSD-3-Clause. Local web server.
     "pandas>=2.1,<3",                  # BSD-3-Clause. Optional DataFrame export only.
 ]

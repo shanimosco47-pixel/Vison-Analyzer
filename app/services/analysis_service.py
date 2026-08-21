@@ -48,6 +48,20 @@ JOB_RETENTION_S = 6 * 3600
 # multi-gigabyte recording and then closes the browser.
 RETENTION_SWEEP_INTERVAL_S = 300.0
 
+# Operator-only detector params that must never originate from a request.
+# diagnostics_dir chooses a filesystem write path (see ZahnCupDetector.
+# _open_tracking_frames_log): POST /analyses forwards its params dict
+# unchanged, so without this a caller could point the analysis pipeline's
+# writes at any path the server process can write to. It is always assigned
+# below, from AppConfig.diagnostics_dir, only when the operator's
+# save_diagnostics flag is on - never from a request (Codex review).
+RESERVED_PARAM_KEYS = frozenset({"diagnostics_dir"})
+
+
+def _sanitize_params(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Strip operator-only fields before a request's params are stored or used."""
+    return {key: value for key, value in params.items() if key not in RESERVED_PARAM_KEYS}
+
 
 class JobCancelled(Exception):
     """Raised inside a worker when the user cancels the job."""
@@ -148,8 +162,11 @@ class AnalysisService:
 
         The detector is constructed here, on the request thread, so an invalid
         ROI or setting is reported immediately as a normal error instead of
-        surfacing later as a mysteriously failed job.
+        surfacing later as a mysteriously failed job. Params are sanitized
+        first so an operator-only field (see RESERVED_PARAM_KEYS) can never
+        reach a detector, or even get stored on the job, from a request.
         """
+        params = _sanitize_params(params)
         detector = create_detector(mode, record.info, params)
         plan = detector.describe()
 
@@ -259,7 +276,20 @@ class AnalysisService:
             job.progress = JobProgress(stage, max(0.0, min(1.0, fraction)), message)
 
         try:
-            detector = create_detector(job.mode, record.info, job.params)
+            # job.params was already sanitized in submit() (RESERVED_PARAM_KEYS
+            # can never reach here from a request), but diagnostics_dir is
+            # reassigned unconditionally rather than with setdefault: it must
+            # always come from AppConfig, and only when save_diagnostics is
+            # enabled, never from anything a caller supplied (Codex review).
+            detector_params: dict[str, Any] = dict(job.params)
+            detector_params.pop("diagnostics_dir", None)
+            if self.config.save_diagnostics:
+                # Server-operator flag, not a per-request one - the same gate
+                # save_event_boundary_frames uses below. Streamed per-frame
+                # tracking evidence (see ZahnCupDetector._open_tracking_frames_log)
+                # only ever writes under here, one directory per job.
+                detector_params["diagnostics_dir"] = str(self.config.diagnostics_dir / job.job_id)
+            detector = create_detector(job.mode, record.info, detector_params)
             with VideoReader(record.path, record.info) as reader:
                 result = detector.run(reader, report)
                 if self.config.save_diagnostics and result.events:
@@ -272,6 +302,9 @@ class AnalysisService:
                             roi=getattr(detector, "roi", None),
                         )
                     ]
+                frames_log_path = result.diagnostics.get("tracking_frames_log")
+                if frames_log_path:
+                    job.diagnostics_paths.append(frames_log_path)
 
             job.result = result
             job.event_log = build_event_log(

@@ -183,6 +183,21 @@ and is unused.
 6. A confidence is computed from measured evidence and the result is reported as
    **detected**, **review recommended** or **detection failed**. A failed
    detection returns no time at all.
+7. **The outlet is tracked frame to frame** (`zahn_track_outlet`, on by
+   default), so the ROI and guard band move with it under a hand-held camera
+   and/or a hand-held cup — see `diagnostics/stage0/STAGE0_REPORT.md` and
+   `diagnostics/stage1/STAGE1_REPORT.md`. A single point on the outlet is
+   usually too smooth to track on its own, so a feature set over the cup body
+   is tracked instead (Lucas-Kanade with a forward-backward check, a RANSAC
+   similarity fit), and the outlet is carried under that transform. Each
+   frame is `tracked` (trustworthy), `predicted` (a short constant-velocity
+   bridge across a brief gap — diagnostic only, never used to confirm flow
+   start or end) or `lost` (excluded from scoring entirely, until a
+   reference-patch match *verifies* reacquisition). If flow-end gets
+   confirmed right after an untracked span wider than
+   `zahn_max_endpoint_uncertainty_s`, the true break could have happened
+   anywhere in that span: the endpoint is reported unconfirmed with explicit
+   bounds instead of a falsely precise duration.
 
 Analysis stops as soon as the end of flow is confirmed — there is nothing to
 learn from the rest of the recording.
@@ -206,6 +221,11 @@ because that would mean different things at 15 FPS and 60 FPS.
 | `outlet_band_fraction` | 0.22 | Height of the band under the orifice used for start detection. |
 | `disturbance_area_ratio` | 0.35 | Fraction of the guard band that must change for a frame to be discarded as disturbed. |
 | `review_confidence` / `fail_confidence` | 0.70 / 0.40 | Where "detected" becomes "review recommended" becomes "failed". |
+| `zahn_track_outlet` | on | Track the outlet frame to frame instead of a fixed region. Turn off to reproduce the pre-tracking behaviour exactly (the rollback lever). |
+| `track_search_margin_px` | 80 px | Extra margin beyond the guard region defining the fixed window the tracker searches within for the whole run — the hard bound on cumulative drift it can follow. Raise it for footage with more swing. |
+| `track_max_bridge_s` | 0.50 s | How long a `predicted` bridge may cover before the tracker gives up and reports `lost`. |
+| `track_reacquire_min_correlation` | 0.60 | Template-match correlation a candidate must reach before a `lost` tracker resumes as `tracked`. Raise it to make reacquisition stricter. |
+| `zahn_max_endpoint_uncertainty_s` | 0.50 s | How wide an untracked span next to a reported end can be before it is marked unconfirmed instead of precise. Calibrated only against synthetic footage so far. |
 
 ### Long recordings (`CoarseScanConfig`, `RefinementConfig`)
 
@@ -309,9 +329,24 @@ pass stores one float per *sample* (a 12-hour scan at one sample per 5 s is
   cup videos. Expect to tune `flow_end_persistence_s`, `activity_threshold` and
   `min_drop_area_px` against your own recordings — that is what
   `--save-diagnostics` is for.
-* **A static camera is assumed.** Camera movement is *detected* and those frames
-  are discarded, but the software does not stabilise the image. A hand-held
-  recording will produce many disturbed frames and low confidence.
+* **A static camera is assumed outside Zahn cup mode.** Camera movement is
+  *detected* and those frames are discarded, but the software does not
+  stabilise the image, and confidence drops accordingly.
+* **Zahn cup mode tracks the outlet, so a hand-held camera and/or a hand-held
+  cup are supported, not just detected-and-discarded.** A fixed analysis
+  region losing a drifting outlet was found to be the whole of a real
+  "efflux several seconds too long" field report - see
+  `diagnostics/stage0/STAGE0_REPORT.md` for the diagnosis and
+  `diagnostics/stage1/STAGE1_REPORT.md` for what tracking fixes and what it
+  does not. In short: the fix is validated against synthetic hand-held
+  footage (endpoint error within ±0.5 s) with no real hand-held clip
+  available yet to validate the ±0.75 s real-footage criterion against; a
+  low-contrast, high-motion combination that would need the deferred
+  continuity-tracing design (Stage 2) is out of scope; and the tracker can
+  only follow drift up to `track_search_margin_px` beyond the guard region
+  for the whole run - wider swings than that are correctly reported `lost`,
+  not silently mis-measured. `zahn_track_outlet` (default on) is the
+  config-only rollback to the pre-tracking fixed-region behaviour.
 * **The generic motion scan can miss thin objects.** A stream a couple of pixels
   wide is below the absolute area floor that keeps sensor noise from firing.
   Use a region of interest, or raise the sensitivity, when the thing of interest
