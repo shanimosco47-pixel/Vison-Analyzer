@@ -72,7 +72,7 @@ mask``, diagnostics/stage1/STAGE1_REPORT.md §29) still failed the real-clip
 gate: ``used_residual`` fired on 805/811 frames, but only 17 ended up
 trusted, because residual-filtered sparse *corner* features simply do not
 exist in enough density on a real translucent cup, however well the
-compensation math around them works. ``_contour_candidate`` (§30) is the
+compensation math around them works. ``_contour_candidate`` is the
 response - not another tuning of the same corner-feature path, a different
 kind of evidence: the cup's own visible *geometry* (its rim/side/bottom
 silhouette), matched as a gradient/edge template against a background-
@@ -82,6 +82,16 @@ edge template, not LK points), never gated on the raw-intensity
 correlation the corner path uses. It is consulted only when the corner/LK
 path itself finds no accepted candidate this frame - never a replacement
 for it, since the corner path still demonstrably works on opaque cups.
+
+A single template anchored on a detected feature (diagnostics/stage1/
+STAGE1_REPORT.md §30) turned out to still be self-referential - on the
+real clip that feature can itself already be background-through-cup, and
+converting its patch to Sobel edges does not fix that. §31's redesign
+positions four independent boundary bands (rim, both side walls, bottom/
+taper) by fixed fraction of the cup's own known geometry relative to the
+outlet directly, matched as one rigid body with required consensus across
+parts before a candidate is even considered - see
+``_contour_band_geometry``.
 """
 
 from __future__ import annotations
@@ -138,10 +148,37 @@ _MIN_INIT_FEATURES = 4
 _RESIDUAL_DILATE_KERNEL = np.ones((5, 5), dtype=np.uint8)
 
 # Stage 3, round two: radius (in response-map cells, i.e. pixels) suppressed
-# around a contour forward match's own best peak before looking for the
-# next-best one - see OutletTracker._contour_forward_match's own docstring
-# for why a runner-up is checked at all (ZahnConfig.contour_score_margin).
+# around a contour candidate's own best joint peak before looking for the
+# next-best one - see OutletTracker._contour_candidate's own docstring for
+# why a runner-up is checked at all (ZahnConfig.contour_score_margin).
 _CONTOUR_PEAK_SUPPRESS_PX = 5
+
+# Stage 3, round three: fixed geometric layout of the four boundary bands
+# (rim, both side walls, bottom/taper) - see
+# OutletTracker._contour_band_geometry. Horizontal offsets/sizes are a
+# fraction of cup_half_width_px directly; vertical ones are a fraction of
+# an *estimated* cup height derived from cup_half_width_px
+# (_CONTOUR_CUP_HEIGHT_SCALE), not of cup_height_above_px itself - a real
+# mismatch found while calibrating this round: cup_height_above_px is the
+# corner-search box's own generous vertical bound (in one calibration
+# fixture, sized from the *stream* analysis region below the outlet, not
+# the cup), and was observed at ~3.9x the cup's own true rim distance on
+# that fixture - fine for a search box goodFeaturesToTrack merely looks
+# within, fatal for bands whose position *is* the estimate. Everything
+# here is relative to the outlet directly, never to a detected feature -
+# the whole point of this round's redesign (module docstring). Calibrated
+# only against this stage's own synthetic fixtures, approximating a
+# typical Zahn cup's proportions - like every other geometric/threshold
+# constant in this stage, unvalidated against real footage.
+_CONTOUR_CUP_HEIGHT_SCALE = 1.4
+_CONTOUR_RIM_Y_FRACTION = 0.95
+_CONTOUR_TAPER_Y_FRACTION = 0.15
+_CONTOUR_WALL_X_FRACTION = 0.82
+_CONTOUR_WALL_Y_FRACTION = 0.5
+_CONTOUR_RIM_WIDTH_FRACTION = 0.7
+_CONTOUR_TAPER_WIDTH_FRACTION = 0.35
+_CONTOUR_WALL_HEIGHT_FRACTION = 0.5
+_CONTOUR_BAND_THICKNESS_FRACTION = 0.2
 
 
 def _contour_subpixel_offset(response: np.ndarray, max_loc: tuple[int, int]) -> tuple[float, float]:
@@ -234,22 +271,34 @@ class TrackResult:
     residual_px: float | None = None
     rejection_reason: str | None = None
     used_residual: bool = False
-    # Stage 3, round two - see the module docstring and
+    # Stage 3, round two/three - see the module docstring and
     # OutletTracker._contour_candidate. contour_available records whether a
-    # contour/edge-silhouette candidate search was actually attempted this
-    # frame (only ever true when the corner/LK path itself found no accepted
-    # candidate, and a large enough search window existed); contour_score is
-    # the best forward edge-template match score achieved, whenever a search
-    # ran (None otherwise - not merely "low", genuinely never computed);
-    # used_contour records whether *this* frame's own accepted outlet
-    # position was actually carried from the fitted cup silhouette rather
-    # than the corner/LK transform. rejection_reason gains contour-specific
-    # values ("contour_low_score", "contour_roundtrip_mismatch",
+    # multi-band contour candidate search was actually attempted this frame
+    # (only ever true when the corner/LK path itself found no accepted
+    # candidate, and every band's own window fit the crop); contour_score is
+    # the joint match's own combined score (summed across bands, normalised
+    # per band), populated as soon as a joint peak was found - even on a
+    # frame that is ultimately rejected, so the real failure is auditable,
+    # not just the final accept/reject outcome (Codex review of `f4b216c`).
+    # contour_band_scores carries each individual band's own score at that
+    # same joint peak; contour_roundtrip_error_px the averaged geometric-
+    # agreement distance (None only when no band's round-trip crop was
+    # computable at all); contour_x/contour_y the joint candidate position
+    # itself, populated whenever computed regardless of whether it was
+    # ultimately accepted. used_contour records whether *this* frame's own
+    # accepted outlet position was actually carried from the fitted cup
+    # silhouette rather than the corner/LK transform. rejection_reason
+    # gains contour-specific values ("contour_low_consensus",
+    # "contour_low_score", "contour_roundtrip_mismatch",
     # "contour_out_of_bounds") when the corner path itself found nothing to
-    # reject (no rejection_reason of its own) but a contour search was
-    # attempted and did not clear its own bar.
+    # reject but a contour search was attempted and did not clear its own
+    # bar.
     contour_available: bool = False
     contour_score: float | None = None
+    contour_band_scores: dict[str, float] | None = None
+    contour_roundtrip_error_px: float | None = None
+    contour_x: float | None = None
+    contour_y: float | None = None
     used_contour: bool = False
 
 
@@ -353,6 +402,19 @@ class _BackgroundMotionResult:
     dy: float
     inliers: int
     feature_count: int
+
+
+@dataclass(frozen=True)
+class _ContourBandTemplate:
+    """One boundary band's own edge template and round-trip context - see
+    ``OutletTracker._contour_band_geometry``/``_build_contour_evidence``.
+    """
+
+    template: np.ndarray
+    outlet_offset: tuple[float, float]
+    context: np.ndarray
+    context_anchor_local: tuple[float, float]
+    center_offset: tuple[float, float]
 
 
 class _BackgroundMotionEstimator:
@@ -643,22 +705,23 @@ class OutletTracker:
         self._reference_refined = False
         self._build_reference_patch(reference_gray, points, self._outlet)
 
-        # Stage 3, round two: the cup's visible geometry (rim/side/bottom
-        # silhouette), as a fallback for when corner/LK evidence itself
-        # finds no accepted candidate - see the module docstring and
-        # _contour_candidate. Anchored on the exact same feature
-        # _build_reference_patch just chose (recovered from the offset it
-        # stored, not re-selected independently), so both templates agree
-        # on "where the cup's own strongest, rim-biased evidence is" - see
-        # _build_reference_patch's own "rim prior" docstring.
-        anchor_point = self._outlet + self._anchor_offset_from_outlet
+        # Stage 3, round two/three: the cup's visible geometry (four
+        # boundary bands - rim, both side walls, bottom/taper, each
+        # positioned by fixed fraction of cup_half_width_px/
+        # cup_height_above_px relative to the outlet directly, never a
+        # detected feature), as a fallback for when corner/LK evidence
+        # itself finds no accepted candidate - see the module docstring
+        # and _contour_candidate.
         self._contour_refined = False
         self._last_contour_available = False
         self._last_contour_score: float | None = None
+        self._last_contour_band_scores: dict[str, float] | None = None
+        self._last_contour_roundtrip_error: float | None = None
+        self._last_contour_x: float | None = None
+        self._last_contour_y: float | None = None
         self._last_contour_rejection: str | None = None
-        self._last_contour_anchor: np.ndarray | None = None
         self._last_used_contour = False
-        self._build_contour_evidence(reference_gray, anchor_point, self._outlet)
+        self._build_contour_evidence(reference_gray, self._outlet)
 
     # -- public ------------------------------------------------------------ #
 
@@ -702,6 +765,10 @@ class OutletTracker:
         # _attempt_reacquisition below when a search actually runs.
         self._last_contour_available = False
         self._last_contour_score = None
+        self._last_contour_band_scores = None
+        self._last_contour_roundtrip_error = None
+        self._last_contour_x = None
+        self._last_contour_y = None
         self._last_contour_rejection = None
         self._last_used_contour = False
         if self._state is TrackState.LOST:
@@ -1374,229 +1441,326 @@ class OutletTracker:
         """
         edges = self._contour_raw_edges(gray)
         residual_mask = self._foreground_residual_mask(gray)
-        if residual_mask is None:
+        # An entirely empty mask - no pixel *anywhere* cleared
+        # background_motion_residual_intensity_threshold this frame - means
+        # "nothing moved enough to register this exact instant," not "there
+        # is no cup." A momentarily-static frame (a real, if unlikely,
+        # possibility - a genuinely-moving cup at a turning point, or one
+        # this residual check's own tight threshold simply did not catch
+        # this instant) would otherwise zero out every band's edge signal
+        # at once - a real bug found while calibrating this round: a
+        # refinement (_maybe_refine_contour_evidence) or the very
+        # construction call landing on such a frame silently built a
+        # template that was entirely zero, matching everywhere with a
+        # meaningless, degenerate "perfect" score. _contour_candidate's own
+        # per-band window already falls back to raw edges locally when a
+        # *search* window is empty; this is the same fallback one level up,
+        # for wherever this method is called directly (template
+        # construction/refinement, not just per-frame matching).
+        if residual_mask is None or not bool(residual_mask.any()):
             return edges
         return cv2.bitwise_and(edges, edges, mask=residual_mask)
 
-    def _build_contour_evidence(
-        self, gray: np.ndarray, anchor_point: np.ndarray, outlet: np.ndarray
-    ) -> None:
-        """(Re)build the cup-silhouette edge template and its round-trip
-        context crop, both centred on ``anchor_point`` - see
-        ``_contour_candidate`` and ``ZahnConfig.contour_max_roundtrip_px``'s
-        own docstring for what the context crop is for.
+    def _contour_band_geometry(self) -> dict[str, tuple[float, float, int, int]]:
+        """Fixed, cup-geometry-relative band definitions: name -> (center_x_
+        offset, center_y_offset, half_width_px, half_height_px), all
+        relative to the outlet - never to a detected feature. See the
+        module-level ``_CONTOUR_*_FRACTION`` constants and the module
+        docstring's account of why round three moved off a single,
+        corner-anchored template.
+        """
+        half_w = self._cup_half_width_px
+        # See the module-level constants' own docstring: cup_height_above_px
+        # is the corner-search box's own generous vertical bound, not an
+        # estimate of the cup's own visible height - clamp the *estimated*
+        # height (derived from cup_half_width_px instead) to it only as an
+        # outer safety ceiling, never use it as the estimate directly.
+        estimated_height = _CONTOUR_CUP_HEIGHT_SCALE * half_w
+        above = max(1, min(self._cup_height_above_px, int(round(estimated_height))))
+        thickness = max(3, int(round(_CONTOUR_BAND_THICKNESS_FRACTION * above)))
+        half_thickness = max(2, thickness // 2)
+        rim_half_w = max(4, int(round(_CONTOUR_RIM_WIDTH_FRACTION * half_w)))
+        taper_half_w = max(3, int(round(_CONTOUR_TAPER_WIDTH_FRACTION * half_w)))
+        wall_half_h = max(4, int(round(_CONTOUR_WALL_HEIGHT_FRACTION * above / 2.0)))
+        return {
+            "rim": (0.0, -_CONTOUR_RIM_Y_FRACTION * above, rim_half_w, half_thickness),
+            "taper": (0.0, -_CONTOUR_TAPER_Y_FRACTION * above, taper_half_w, half_thickness),
+            "left_wall": (
+                -_CONTOUR_WALL_X_FRACTION * half_w,
+                -_CONTOUR_WALL_Y_FRACTION * above,
+                half_thickness,
+                wall_half_h,
+            ),
+            "right_wall": (
+                _CONTOUR_WALL_X_FRACTION * half_w,
+                -_CONTOUR_WALL_Y_FRACTION * above,
+                half_thickness,
+                wall_half_h,
+            ),
+        }
 
-        Called once at construction (from the same anchor
-        ``_build_reference_patch`` just chose, recovered via
-        ``_anchor_offset_from_outlet`` rather than re-selected
-        independently, so both templates agree on where the cup's
-        strongest evidence is) and, Stage 3 round two, at most once more
-        (see ``_maybe_refine_contour_evidence``) - the same one-time-
-        refinement discipline ``_build_reference_patch`` already
-        established, for the same reason: the initial template can only
-        ever be built from whatever edge signal exists at construction,
-        which a translucent cup's rim may or may not offer strongly, and a
-        later frame that has already been independently verified (a
-        confirmed contour or corner accept) gives the template a second,
-        possibly better chance - bounded to once, not continuous, so this
-        cannot become the unverified self-drift the round-trip check
-        exists to catch.
+    def _build_contour_evidence(self, gray: np.ndarray, outlet: np.ndarray) -> None:
+        """(Re)build the four boundary-band edge templates and their
+        round-trip context crops, each centred on its own fixed geometric
+        offset from ``outlet`` (``_contour_band_geometry``) - never on a
+        detected corner.
+
+        Round three (Codex review of ``f4b216c``): a *single* template
+        anchored on the same corner ``_build_reference_patch`` selects was
+        self-referential - on the real clip that corner can itself already
+        be background-through-cup, and a Sobel transform of its patch does
+        not fix that. Four independent bands positioned by the cup's own
+        known geometry (rim, both side walls, bottom/taper), matched with
+        required consensus (``ZahnConfig.contour_min_consensus_bands``),
+        do not have this problem: a background edge near one band cannot
+        by itself explain agreement across the others.
+
+        Called once at construction and, Stage 3, at most once more (see
+        ``_maybe_refine_contour_evidence``) - the same one-time-refinement
+        discipline ``_build_reference_patch`` already established: the
+        initial templates can only ever be built from whatever edge signal
+        exists at construction, and a later, already-independently-
+        verified frame gives them a second, possibly better chance -
+        bounded to once, not continuous, so this cannot become the
+        unverified self-drift the round-trip check exists to catch.
         """
         edge_map = self._contour_edge_map(gray)
-        self._contour_template, self._contour_outlet_offset = self._extract_patch(
-            edge_map, anchor_point, outlet, self._patch_half_px
-        )
-        context_half = self._patch_half_px + self._config.contour_search_margin_px
-        self._contour_context, self._contour_context_anchor_local = self._extract_patch(
-            edge_map, anchor_point, anchor_point, context_half
-        )
-        # The anchor's own offset from the outlet - a Zahn cup's rim (what
-        # the template is centred on) sits well above the outlet itself
-        # (cup_height_above_px), not beside it, so a contour search
-        # centred on the *outlet* prediction with only
-        # contour_search_margin_px of margin would not even reach the
-        # rim's true location. _contour_candidate uses this to translate
-        # a predicted *outlet* position into the anchor position it
-        # should actually search around.
-        self._contour_anchor_offset_from_outlet = anchor_point - outlet
+        raw_edge_map: np.ndarray | None = None
+        bands: dict[str, _ContourBandTemplate] = {}
+        for name, (cx_off, cy_off, half_w, half_h) in self._contour_band_geometry().items():
+            center = outlet + np.array([cx_off, cy_off])
+            source = edge_map
+            template, outlet_offset = self._extract_rect_patch(
+                source, center, outlet, half_w, half_h
+            )
+            if not template.any():
+                # _contour_edge_map's own global "is there any residual
+                # anywhere in the frame" fallback is not enough on its
+                # own: residual elsewhere in the frame (noise, a
+                # distractor) does nothing for a genuinely-still band
+                # here. Each band needs its own *local* fallback - the
+                # same one _contour_candidate's own matching already
+                # applies per search window - or a template built on an
+                # unlucky frame silently ends up entirely empty (a real
+                # bug found while calibrating this round: the one-time
+                # refinement landed on exactly such a frame, and every
+                # later match against the resulting constant template
+                # degenerated to a meaningless, uniform "perfect" score).
+                if raw_edge_map is None:
+                    raw_edge_map = self._contour_raw_edges(gray)
+                source = raw_edge_map
+                template, outlet_offset = self._extract_rect_patch(
+                    source, center, outlet, half_w, half_h
+                )
+            context_half_w = half_w + self._config.contour_search_margin_px
+            context_half_h = half_h + self._config.contour_search_margin_px
+            context, context_anchor_local = self._extract_rect_patch(
+                source, center, center, context_half_w, context_half_h
+            )
+            bands[name] = _ContourBandTemplate(
+                template=template,
+                outlet_offset=outlet_offset,
+                context=context,
+                context_anchor_local=context_anchor_local,
+                center_offset=(cx_off, cy_off),
+            )
+        self._contour_bands = bands
 
-    def _contour_forward_match(
-        self, edge_region: np.ndarray, region_offset: tuple[int, int]
-    ) -> tuple[tuple[float, float] | None, float | None]:
-        """Best-scoring location of the stored contour template within
-        ``edge_region`` (a crop of the current frame's edge map, top-left
-        at ``region_offset`` in the tracker's own local coordinates), or
-        ``(None, None)`` unless a location clears both
-        ``contour_min_match_score`` and ``contour_score_margin`` over the
-        next-best, non-overlapping local peak - see
-        ``ZahnConfig.contour_score_margin``'s own docstring for why a
-        runner-up is checked at all, not just an absolute floor.
-
-        The returned location is parabolically sub-pixel refined
-        (``_contour_subpixel_offset``), not the raw integer-pixel
-        ``matchTemplate`` peak: a real regression found while calibrating
-        this round (a slow, steady pan under 1px/frame) showed integer-
-        only matching freezing at the same whole-pixel peak for several
-        consecutive frames, which then froze this tracker's own velocity
-        estimate - and, with it, where the *next* frame's search window
-        was even centred - since consecutive identical positions imply
-        zero velocity. Sub-pixel refinement is what lets a true, real
-        motion smaller than one pixel still register as motion.
+    def _contour_roundtrip_error(
+        self, edge_map: np.ndarray, search_center: np.ndarray, translation: tuple[float, float]
+    ) -> float | None:
+        """Bidirectional/geometric-agreement check, averaged over every
+        band whose own crop was computable: for each band, the same-sized
+        patch the joint match implies *in the current frame* (this band's
+        own fixed offset from ``search_center``, plus the candidate
+        ``translation``) is matched back against that band's own round-
+        trip context crop around its true position in the *reference*
+        frame (cached at construction/refinement) - the multi-band
+        analogue of the corner path's own forward-backward LK check.
+        ``None`` only when no band's crop was computable at all (search
+        too close to the crop's own edge) - never invented.
         """
-        template = self._contour_template
-        th, tw = template.shape[:2]
-        if edge_region.shape[0] < th or edge_region.shape[1] < tw:
-            return None, None
-        response = cv2.matchTemplate(edge_region, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(response)
-        if max_val < self._config.contour_min_match_score:
-            return None, None
-        suppressed = response.copy()
-        y0 = max(0, max_loc[1] - _CONTOUR_PEAK_SUPPRESS_PX)
-        y1 = min(suppressed.shape[0], max_loc[1] + _CONTOUR_PEAK_SUPPRESS_PX + 1)
-        x0 = max(0, max_loc[0] - _CONTOUR_PEAK_SUPPRESS_PX)
-        x1 = min(suppressed.shape[1], max_loc[0] + _CONTOUR_PEAK_SUPPRESS_PX + 1)
-        suppressed[y0:y1, x0:x1] = -1.0
-        second_val = float(suppressed.max()) if suppressed.size else -1.0
-        if max_val - second_val < self._config.contour_score_margin:
-            return None, None
-        max_loc_xy = (int(max_loc[0]), int(max_loc[1]))
-        sub_dx, sub_dy = _contour_subpixel_offset(response, max_loc_xy)
-        topleft = (
-            region_offset[0] + max_loc_xy[0] + sub_dx,
-            region_offset[1] + max_loc_xy[1] + sub_dy,
-        )
-        return topleft, float(max_val)
-
-    def _contour_roundtrip_ok(self, edge_map: np.ndarray, topleft: tuple[int, int]) -> bool:
-        """Bidirectional/geometric-agreement check: the same-sized patch
-        the forward match just found *in the current frame* is matched
-        back against the round-trip context crop around the true anchor in
-        the *reference* frame (cached at construction, refreshed at most
-        once - see ``_build_contour_evidence``) - the edge-template
-        analogue of the corner path's own forward-backward LK check. A
-        genuine match's round trip lands back within
-        ``contour_max_roundtrip_px`` of the true anchor; a coincidental
-        one, resembling the template's shape without truly being the same
-        cup structure, generally does not.
-        """
-        template = self._contour_template
-        context = self._contour_context
-        th, tw = template.shape[:2]
-        x0, y0 = topleft
-        candidate_patch = edge_map[y0 : y0 + th, x0 : x0 + tw]
-        if candidate_patch.shape[:2] != (th, tw):
-            return False
-        if context.shape[0] < th or context.shape[1] < tw:
-            return False
-        response = cv2.matchTemplate(context, candidate_patch, cv2.TM_CCOEFF_NORMED)
-        _, _, _, max_loc = cv2.minMaxLoc(response)
-        found_center = (max_loc[0] + tw / 2.0, max_loc[1] + th / 2.0)
-        expected = self._contour_context_anchor_local
-        distance = float(np.hypot(found_center[0] - expected[0], found_center[1] - expected[1]))
-        return distance <= self._config.contour_max_roundtrip_px
+        height, width = self._bounds
+        errors = []
+        for band in self._contour_bands.values():
+            th, tw = band.template.shape[:2]
+            cx_off, cy_off = band.center_offset
+            center = search_center + np.array([cx_off, cy_off]) + np.array(translation)
+            x0 = int(round(center[0] - tw / 2.0))
+            y0 = int(round(center[1] - th / 2.0))
+            if x0 < 0 or y0 < 0 or x0 + tw > width or y0 + th > height:
+                continue
+            candidate_patch = edge_map[y0 : y0 + th, x0 : x0 + tw]
+            if candidate_patch.shape[:2] != (th, tw):
+                continue
+            context = band.context
+            if context.shape[0] < th or context.shape[1] < tw:
+                continue
+            response = cv2.matchTemplate(context, candidate_patch, cv2.TM_CCOEFF_NORMED)
+            _, _, _, max_loc = cv2.minMaxLoc(response)
+            found_center = (max_loc[0] + tw / 2.0, max_loc[1] + th / 2.0)
+            expected = band.context_anchor_local
+            errors.append(
+                float(np.hypot(found_center[0] - expected[0], found_center[1] - expected[1]))
+            )
+        if not errors:
+            return None
+        return sum(errors) / len(errors)
 
     def _contour_candidate(
         self, gray: np.ndarray, search_center: np.ndarray, margin: int
     ) -> tuple[np.ndarray | None, float | None]:
         """Locate the cup from its own edge/silhouette geometry, independent
         of the corner/LK path - see the module docstring and
-        ``ZahnConfig.contour_min_match_score``'s own docstring for the
-        thresholds this composes. ``search_center`` is an *outlet* position
-        (the same space every caller already predicts in), translated
-        below to the anchor/rim position the template is actually built
-        around (``_contour_anchor_offset_from_outlet``) - a Zahn cup's rim
-        sits well above the outlet itself, not beside it, so searching
-        around the outlet position directly would not even reach it.
+        ``ZahnConfig.contour_min_band_score``'s own docstring for the
+        thresholds this composes. ``search_center`` is the predicted
+        *outlet* position; each of the four boundary bands is searched
+        around its own fixed geometric offset from it
+        (``_contour_band_geometry``).
+
+        Every band's window is built to the *same* size
+        (``2*margin+1`` square in response-map space) regardless of the
+        band's own template size, which is what lets their response maps
+        be summed directly into one *joint* translation hypothesis below,
+        cell for cell - a hypothesis is "the whole rigid cup moved by
+        this (dx, dy)," not any one band's own independent best guess.
+        Requires enough bands to individually clear their own score floor
+        at that joint peak (``contour_min_consensus_bands``) - the
+        "required consensus" the authorising review named explicitly, so
+        one background edge near a single band cannot carry the whole
+        candidate - and a real margin over the next-best joint hypothesis
+        (``contour_score_margin``), before the round-trip/geometric-
+        agreement check (``_contour_roundtrip_error``) gets a say at all.
 
         Only ever called when the corner/LK path itself found no accepted
         candidate this frame (``_attempt_tracking``) or the raw-intensity
         reacquisition match failed (``_attempt_reacquisition``) - never
         overrides a candidate either of those already accepted. Records
-        ``self._last_contour_available``/``_score``/``_rejection`` for the
-        caller's own diagnostics regardless of outcome (reset once per
-        frame in ``update()``); ``contour_available`` stays ``False`` when
-        the search window itself was too small to hold the template
-        (construction geometry - a search this close to the crop's own
-        edge, not a rejection of any evidence), the same "never invented,
-        only computed" convention ``_foreground_residual_mask`` follows.
+        ``self._last_contour_available``/``_score``/``_band_scores``/
+        ``_roundtrip_error``/``_rejection`` for the caller's own
+        diagnostics as soon as each becomes computable, regardless of
+        whether the candidate is ultimately accepted - "the real failure
+        is auditable," not just the final accept/reject outcome.
         """
-        edge_map = self._contour_edge_map(gray)
-        template = self._contour_template
-        th, tw = template.shape[:2]
-        half_w = tw // 2 + margin
-        half_h = th // 2 + margin
         height, width = self._bounds
-        anchor_center = search_center + self._contour_anchor_offset_from_outlet
-        cx, cy = int(round(anchor_center[0])), int(round(anchor_center[1]))
-        x0, x1 = max(0, cx - half_w), min(width, cx + half_w)
-        y0, y1 = max(0, cy - half_h), min(height, cy + half_h)
-        if x1 - x0 < tw or y1 - y0 < th:
-            return None, None
+        target_size = 2 * margin + 1
+        windows: dict[str, tuple[int, int]] = {}
+        for name, band in self._contour_bands.items():
+            th, tw = band.template.shape[:2]
+            cx_off, cy_off = band.center_offset
+            center = search_center + np.array([cx_off, cy_off])
+            cx, cy = int(round(center[0])), int(round(center[1]))
+            x0, y0 = cx - tw // 2 - margin, cy - th // 2 - margin
+            if x0 < 0 or y0 < 0 or x0 + tw + 2 * margin > width or y0 + th + 2 * margin > height:
+                # This band's own ideal window does not fit the crop this
+                # frame - rather than silently comparing a clipped,
+                # misaligned response map against the other bands' full
+                # ones, skip the whole attempt: a real cup is rarely at
+                # the very edge of a capture crop sized with
+                # track_search_margin_px of its own slack, and a wrong
+                # joint alignment is worse than a missed frame.
+                return None, None
+            windows[name] = (x0, y0)
+
         self._last_contour_available = True
-        region = edge_map[y0:y1, x0:x1]
-        if not region.any():
-            # Nothing survived background suppression *in this specific
-            # search window* - not proof there is no cup here, only that
-            # nothing moved enough this exact frame to register against
-            # background_motion_residual_intensity_threshold (see
-            # _contour_edge_map's own docstring: real independent cup
-            # motion is not constant, and a single slow frame can leave a
-            # genuinely-moving rim's own diff below that deliberately
-            # tight, pixel-precision threshold). Falling back to the raw,
-            # unsuppressed edge map for *this* window - not silently
-            # matching against an empty region - is the same "an absence
-            # of evidence is not evidence of absence" fallback
-            # _foreground_residual_mask itself already follows one level
-            # up for an unavailable transform.
-            edge_map = self._contour_raw_edges(gray)
-            region = edge_map[y0:y1, x0:x1]
-        topleft, score = self._contour_forward_match(region, (x0, y0))
-        self._last_contour_score = score
-        if topleft is None:
+        edge_map = self._contour_edge_map(gray)
+        raw_edge_map: np.ndarray | None = None
+        responses: dict[str, np.ndarray] = {}
+        combined = np.zeros((target_size, target_size), dtype=np.float64)
+        for name, band in self._contour_bands.items():
+            th, tw = band.template.shape[:2]
+            x0, y0 = windows[name]
+            region = edge_map[y0 : y0 + th + 2 * margin, x0 : x0 + tw + 2 * margin]
+            if not region.any():
+                # See _contour_edge_map's own docstring: an absence of
+                # residual evidence in this specific window is not proof
+                # there is nothing here, only that nothing moved enough
+                # this exact frame to register - fall back to raw edges
+                # for this band rather than matching against emptiness.
+                if raw_edge_map is None:
+                    raw_edge_map = self._contour_raw_edges(gray)
+                region = raw_edge_map[y0 : y0 + th + 2 * margin, x0 : x0 + tw + 2 * margin]
+            response = cv2.matchTemplate(region, band.template, cv2.TM_CCOEFF_NORMED)
+            responses[name] = response.astype(np.float64)
+            combined += responses[name]
+
+        _, _, _, peak_loc = cv2.minMaxLoc(combined.astype(np.float32))
+        peak_x, peak_y = int(peak_loc[0]), int(peak_loc[1])
+        band_scores = {name: float(resp[peak_y, peak_x]) for name, resp in responses.items()}
+        self._last_contour_band_scores = band_scores
+        n_bands = len(responses)
+        self._last_contour_score = float(combined[peak_y, peak_x]) / n_bands
+
+        sub_dx, sub_dy = _contour_subpixel_offset(combined.astype(np.float32), (peak_x, peak_y))
+        translation = (peak_x - margin + sub_dx, peak_y - margin + sub_dy)
+        candidate = search_center + np.array(translation)
+        self._last_contour_x = float(candidate[0])
+        self._last_contour_y = float(candidate[1])
+
+        consensus = sum(1 for v in band_scores.values() if v >= self._config.contour_min_band_score)
+        if consensus < self._config.contour_min_consensus_bands:
+            self._last_contour_rejection = "contour_low_consensus"
+            return None, None
+
+        suppressed = combined.copy()
+        y0s = max(0, peak_y - _CONTOUR_PEAK_SUPPRESS_PX)
+        y1s = min(suppressed.shape[0], peak_y + _CONTOUR_PEAK_SUPPRESS_PX + 1)
+        x0s = max(0, peak_x - _CONTOUR_PEAK_SUPPRESS_PX)
+        x1s = min(suppressed.shape[1], peak_x + _CONTOUR_PEAK_SUPPRESS_PX + 1)
+        suppressed[y0s:y1s, x0s:x1s] = -1e9
+        second_combined = float(suppressed.max()) if suppressed.size else -1e9
+        if (float(combined[peak_y, peak_x]) - second_combined) / n_bands < (
+            self._config.contour_score_margin
+        ):
             self._last_contour_rejection = "contour_low_score"
             return None, None
-        # The round-trip check works on whole-pixel crops (it only needs
-        # ZahnConfig.contour_max_roundtrip_px of tolerance, well above one
-        # pixel) - round the sub-pixel-refined location back to int only
-        # for that slice; the outlet/anchor positions below keep the full
-        # sub-pixel precision (see _contour_forward_match's own docstring
-        # for why that precision matters).
-        int_topleft = (int(round(topleft[0])), int(round(topleft[1])))
-        if not self._contour_roundtrip_ok(edge_map, int_topleft):
+
+        roundtrip_error = self._contour_roundtrip_error(edge_map, search_center, translation)
+        self._last_contour_roundtrip_error = roundtrip_error
+        if roundtrip_error is None or roundtrip_error > self._config.contour_max_roundtrip_px:
             self._last_contour_rejection = "contour_roundtrip_mismatch"
             return None, None
-        outlet_xy = (
-            topleft[0] + self._contour_outlet_offset[0],
-            topleft[1] + self._contour_outlet_offset[1],
-        )
-        candidate = np.array(outlet_xy, dtype=np.float64)
+
         if not self._within_bounds(candidate):
             self._last_contour_rejection = "contour_out_of_bounds"
             return None, None
+
         self._last_contour_rejection = None
-        self._last_contour_anchor = np.array(
-            [topleft[0] + tw / 2.0, topleft[1] + th / 2.0], dtype=np.float64
-        )
-        return candidate, score
+        return candidate, self._last_contour_score
 
     def _maybe_refine_contour_evidence(self, gray: np.ndarray, outlet: np.ndarray) -> None:
-        """Stage 3, round two: the one-time contour-template refinement
-        ``_build_contour_evidence`` describes - called only from
-        ``_accept_tracked``/``_attempt_reacquisition``, i.e. only on a
-        frame that has already cleared every contour check (forward score
-        and margin, round-trip agreement) or the corner path's own checks,
-        and only once per tracker (see ``self._contour_refined``), and
-        only when *this* frame's own accepted position actually came from
-        the contour path (``self._last_used_contour``) - not merely that a
-        contour search happened to run.
+        """The one-time boundary-band refinement ``_build_contour_evidence``
+        describes - called only from ``_accept_tracked``/
+        ``_attempt_reacquisition``, i.e. only on a frame that has already
+        cleared every existing check (corner or contour), and only once
+        per tracker (``self._contour_refined``). Unlike the raw-intensity
+        patch's own refinement (gated on ``used_residual`` specifically),
+        this refines from the first accepted frame *of either mechanism* -
+        a corner-confirmed accept is at least as trustworthy a position to
+        rebuild fixed-geometry bands from as a contour-confirmed one, and
+        there is no reason to wait specifically for the latter.
         """
-        if self._contour_refined or not self._last_used_contour:
-            return
-        if self._last_contour_anchor is None:
+        if self._contour_refined:
             return
         self._contour_refined = True
-        self._build_contour_evidence(gray, self._last_contour_anchor, outlet)
+        self._build_contour_evidence(gray, outlet)
+
+    def _extract_rect_patch(
+        self,
+        gray: np.ndarray,
+        center: np.ndarray,
+        anchor: np.ndarray,
+        half_w: int,
+        half_h: int,
+    ) -> tuple[np.ndarray, tuple[float, float]]:
+        """Like ``_extract_patch``, but with independent half-width/half-
+        height for the boundary bands' own rectangular (not square) crops."""
+        height, width = gray.shape[:2]
+        cx, cy = int(round(center[0])), int(round(center[1]))
+        x0, x1 = max(0, cx - half_w), min(width, cx + half_w + 1)
+        y0, y1 = max(0, cy - half_h), min(height, cy + half_h + 1)
+        patch = gray[y0:y1, x0:x1].copy()
+        return patch, (float(anchor[0]) - x0, float(anchor[1]) - y0)
 
     def _build_reference_patch(
         self, gray: np.ndarray, points: np.ndarray, outlet: np.ndarray
@@ -1750,5 +1914,9 @@ class OutletTracker:
             used_residual=self._last_detection_used_residual,
             contour_available=self._last_contour_available,
             contour_score=self._last_contour_score,
+            contour_band_scores=self._last_contour_band_scores,
+            contour_roundtrip_error_px=self._last_contour_roundtrip_error,
+            contour_x=self._last_contour_x,
+            contour_y=self._last_contour_y,
             used_contour=self._last_used_contour,
         )

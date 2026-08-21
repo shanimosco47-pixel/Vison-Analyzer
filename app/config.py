@@ -495,55 +495,95 @@ class ZahnConfig:
     # translucent, low-texture cup) simply do not exist in enough density to
     # build a trajectory from, however well the compensation math around
     # them works. OutletTracker._contour_candidate tracks the cup's visible
-    # *geometry* instead - a gradient/edge template of the rim/side/bottom
-    # silhouette, matched against a background-suppressed edge map (see
-    # OutletTracker._contour_edge_map, which reuses the same
-    # _foreground_residual_mask this section's other fields already
-    # calibrate) - as a fallback whenever the corner/LK path itself finds no
-    # accepted candidate this frame, not a replacement for it (existing
-    # opaque-cup regressions keep passing through the unmodified corner
-    # path). These four fields are that mechanism's own thresholds, all
-    # unvalidated against real footage for the same reason as the
-    # background-motion fields above.
+    # *geometry* instead - a gradient/edge template, matched against a
+    # background-suppressed edge map (see OutletTracker._contour_edge_map,
+    # which reuses the same _foreground_residual_mask this section's other
+    # fields already calibrate) - as a fallback whenever the corner/LK path
+    # itself finds no accepted candidate this frame, not a replacement for
+    # it (existing opaque-cup regressions keep passing through the
+    # unmodified corner path).
+    #
+    # Round three (Codex review of `f4b216c`): a *single* template, anchored
+    # on the same corner `_build_reference_patch` already selects, was still
+    # self-referential - on the real clip that corner can itself already be
+    # background-through-cup, and a Sobel transform of its patch does not
+    # fix that (real-clip result: `contour_low_score` on 551/811 rows, and
+    # the rare accepts locked onto background far from the true cup). Fixed
+    # geometry instead of a detected feature: four independent boundary
+    # *bands* (rim, both side walls, bottom/taper - see
+    # `OutletTracker._contour_band_geometry`), positioned by fixed fraction
+    # of `cup_half_width_px`/`cup_height_above_px` relative to the human-
+    # marked outlet directly, never from a detected corner. Each band is
+    # matched independently; a joint translation is accepted only when
+    # enough bands agree (`contour_min_consensus_bands`) with a real margin
+    # over the next-best joint hypothesis - one background edge winning
+    # alone is exactly what consensus exists to refuse. These fields are
+    # that mechanism's own thresholds, all unvalidated against real footage
+    # for the same reason as the background-motion fields above.
 
-    # Normalised template-match correlation (0-1) a contour candidate's
-    # *forward* match (this frame's edge map against the stored edge
-    # template) must reach before it is considered at all. Comparable in
-    # spirit to track_reacquire_min_correlation, but over an edge/gradient
-    # representation, not raw intensity - "never trust raw-intensity matches
-    # through the cup" (the explicit instruction this field exists to
-    # satisfy) means this path's own acceptance never falls back to
-    # _patch_correlation_at.
-    contour_min_match_score: float = 0.5
+    # Normalised template-match correlation (0-1) a single boundary band's
+    # own match must reach, at the *joint* (all-bands-considered) candidate
+    # translation, to count toward consensus at all. Comparable in spirit
+    # to track_reacquire_min_correlation, but over an edge/gradient
+    # representation, not raw intensity - "never trust raw-intensity
+    # matches through the cup" means this path's own acceptance never falls
+    # back to _patch_correlation_at. 0.35 (a natural-feeling floor) turned
+    # out too strict when calibrated against this stage's own low-opacity
+    # fixture: the rim (the one edge this stage's own "rim prior" - see
+    # OutletTracker._build_reference_patch - already expects to be the
+    # strongest) cleared it on 29/42 attempts, but the side walls of a
+    # genuinely faint, low-opacity cup did far less often (left_wall: 7/42)
+    # - a real, physically-expected asymmetry in how strong each part's own
+    # edge is, not a bug. 0.25 is the calibrated value.
+    contour_min_band_score: float = 0.25
 
-    # How far the forward match's best score must exceed the next-best,
-    # non-overlapping local peak in the same response map, before the match
-    # counts as a genuine, unambiguous lock rather than one of several
-    # similarly-plausible locations (a repetitive or low-texture edge map
-    # can otherwise clear contour_min_match_score at more than one place at
-    # once, any of which would be an equally "confident" but arbitrary
-    # pick) - the "score margin" the authorising review named explicitly.
+    # How many of the four boundary bands (rim, left wall, right wall,
+    # taper) must individually clear contour_min_band_score, at the same
+    # joint translation, before that translation is even considered - the
+    # "required consensus" the authorising review named explicitly: one
+    # band (a single background edge the cup happens to sit near) winning
+    # alone is exactly the self-referential failure this exists to refuse.
+    # Two of four - not three - because a genuinely faint, low-opacity cup's
+    # weaker parts (a side wall, the taper) frequently do not clear even the
+    # calibrated floor above; requiring two independent parts to agree still
+    # refuses a single spurious band from carrying the candidate alone,
+    # which is the property this field exists for, while remaining
+    # achievable given each part's own real, unequal signal strength
+    # (calibrated against this stage's own low-opacity fixture: two-band
+    # consensus reached on 33/42 attempts at the 0.25 floor, three-band on
+    # only 2/42 at the original 0.35 floor).
+    contour_min_consensus_bands: int = 2
+
+    # How far the joint translation's own *combined* score (summed across
+    # all four bands, then normalised per band so this stays on the same
+    # 0-1-ish scale a single band's own score is) must exceed the next-best,
+    # non-overlapping joint translation, before it counts as a genuine,
+    # unambiguous lock rather than one of several similarly-plausible
+    # translations (a flat or repetitive edge - a cup's own straight top
+    # edge, a textured background - can otherwise clear the consensus/floor
+    # checks at more than one nearby translation at once) - the "score
+    # margin" the authorising review named explicitly.
     contour_score_margin: float = 0.15
 
     # The "propagate bidirectionally... require geometric agreement" half of
-    # the authorisation: after a forward match is found, the same-sized
-    # patch it matched *in the current frame* is matched back against a
-    # slightly larger context crop around the anchor in the *reference*
-    # frame (cached at construction) - mirroring the corner path's own
-    # forward-backward check, but for the edge template instead of LK
-    # points. A genuine match's round trip lands back within this many
-    # pixels of the true anchor; a coincidental one, matching some other
-    # edge-rich structure that merely resembles the template, generally
+    # the authorisation: for each band, the same-sized patch the joint
+    # match implies *in the current frame* is matched back against a
+    # slightly larger context crop around that band's own true position in
+    # the *reference* frame (cached at construction) - mirroring the corner
+    # path's own forward-backward check, but per boundary band instead of
+    # per LK point. Averaged across every band whose own crop was
+    # computable; a genuine match's round trip lands back within this many
+    # pixels of the true position on average, a coincidental one generally
     # does not.
     contour_max_roundtrip_px: float = 3.0
 
-    # Padding, in pixels, added on every side of the edge template's own
-    # size to build the window the forward match searches within (bounded
-    # to the tracker's local crop) - large enough to give the score-margin
-    # check a real neighbourhood of alternative locations to rule out
-    # (contour_score_margin), without searching the entire crop on every
-    # ordinary continuous-tracking frame the corner path has already failed
-    # on. Reacquisition after a full loss searches the whole crop
+    # Padding, in pixels, added on every side of each band's own template
+    # size to build the window its own match searches within (bounded to
+    # the tracker's local crop) - large enough to give the score-margin
+    # check a real neighbourhood of alternative joint translations to rule
+    # out (contour_score_margin), without searching the entire crop on
+    # every ordinary continuous-tracking frame the corner path has already
+    # failed on. Reacquisition after a full loss searches the whole crop
     # regardless of this value, the same way the raw-intensity reacquisition
     # search already does - the gap's length is not known in advance.
     contour_search_margin_px: int = 40
@@ -607,8 +647,10 @@ class ZahnConfig:
             raise ConfigurationError(
                 "The background-motion residual intensity threshold must be between 0 and 255."
             )
-        if not 0.0 < self.contour_min_match_score <= 1.0:
-            raise ConfigurationError("The contour match score floor must be between 0 and 1.")
+        if not 0.0 < self.contour_min_band_score <= 1.0:
+            raise ConfigurationError("The contour band score floor must be between 0 and 1.")
+        if self.contour_min_consensus_bands < 1:
+            raise ConfigurationError("At least one contour band must be required for consensus.")
         if self.contour_score_margin < 0:
             raise ConfigurationError("The contour score margin must not be negative.")
         if self.contour_max_roundtrip_px <= 0:

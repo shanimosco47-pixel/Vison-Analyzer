@@ -2386,3 +2386,238 @@ that subsystem being fixed even if this round's tracking mechanism
 itself works as intended.
 
 PR #4 stays **draft and unmerged**. Stage 2 is **not started**.
+
+## 30. Stage 3, round three (part one): a single edge template, still self-referential
+
+Round two's residual-filtered corner selection (§29) failed the real-clip
+gate - `used_residual` fired on 805/811 frames, yet only 17 ended up
+trusted. The first response (commit `f4b216c`) tracked the cup's own
+visible geometry instead of interior texture: a gradient/edge template
+(`OutletTracker._contour_candidate`), matched against a background-
+suppressed edge map, with a forward-backward round-trip check and a
+score-margin requirement over the next-best local peak, consulted only
+when the corner/LK path itself found no accepted candidate. A genuine
+bug was found and fixed during calibration before this reached review:
+per-frame min-max normalisation of the Sobel magnitude squashed the
+rim's own faint edge relative to whatever the single strongest edge
+anywhere in the frame happened to be that frame - fixed by clipping raw
+magnitude to `[0, 255]` instead (`TM_CCOEFF_NORMED` is already invariant
+to a uniform linear rescale, so the fix is removing the per-frame
+stretch, not adding more).
+
+**Real-clip result: still failed.** `status=failed`, no start/end/efflux,
+794/811 untrusted, 20 trusted, 19 liquid frames, `47.77s` processing (up
+from `41.53s` at the previous round). The supervisor's diagnosis: the
+contour path was available on 631/811 frames and used on 71, yet
+produced **zero trusted contour frames** - `contour_low_score` fired on
+551 rows, and the rare accepts locked onto background near `(210,829)`
+rather than the true cup near `x≈390` at `t≈7.5s`. Root cause: the
+template was built around the *same* anchor point `_build_reference_
+patch` already selects for the raw-intensity patch - on the real
+translucent cup, that point can itself already be background-through-cup,
+and converting its small patch to Sobel edges does not fix the
+circularity a Codex review already named in round two's own motivation.
+A single template anchored on a detected feature is self-referential
+regardless of what representation (intensity or edge) it is compared in.
+
+## 31. Stage 3, round three (part two): fixed geometric bands, not a detected anchor
+
+The supervisor's required correction, followed directly: build a
+composite template from **fixed relative bands covering the full visible
+cup boundary** (rim, both side walls, bottom/taper), positioned by fixed
+fraction of the cup's own known geometry relative to the human-marked
+outlet directly - never from a detected feature - with **required
+consensus** across parts and a score margin, before a round-trip/
+geometric-agreement check gets a say.
+
+### 31.1 Design
+
+`OutletTracker._contour_band_geometry` defines four bands as `(center_x_
+offset, center_y_offset, half_width_px, half_height_px)` tuples relative
+to the outlet: `rim` (near the top), `left_wall`/`right_wall` (either
+side), `taper` (near the bottom, close to the outlet) - excluding the
+translucent interior and the stream below the outlet by construction,
+since none of the four bands sample either. Each band's own edge template
+is built once at construction (and refined at most once more, on the
+first frame *either* mechanism - corner or contour - independently
+confirms, mirroring `_build_reference_patch`'s own one-time-refinement
+discipline).
+
+Matching (`_contour_candidate`) treats all four bands as one rigid body:
+each band's own search window is sized to `template + 2*margin` on every
+side, which makes every band's own response map the *same*
+`(2*margin+1)²` shape regardless of the band's own template size - and
+therefore directly summable, cell for cell, into one *joint* translation
+hypothesis ("the whole cup moved by this `(dx, dy)`"), rather than four
+independent per-band guesses. A candidate is accepted only when enough
+bands individually clear their own score floor at that joint peak
+(`contour_min_consensus_bands`) - the "required consensus" the review
+named explicitly, so one background edge near a single band cannot carry
+the whole candidate - *and* the joint peak clears a real margin over the
+next-best joint hypothesis (`contour_score_margin`), *and* a per-band
+round-trip/geometric-agreement check against cached reference-frame
+context crops (`contour_max_roundtrip_px`, averaged across every band
+whose own crop was computable) passes. Sub-pixel refinement (carried over
+from round two, §29 - a real regression that round's own calibration
+found: integer-pixel-only matching froze on sub-1px/frame motion) applies
+to the joint peak the same way. New `contour_band_scores`/
+`contour_roundtrip_error_px`/`contour_x`/`contour_y` diagnostics are
+populated as soon as computed, even on a rejected frame - "the real
+failure is auditable," not just the final accept/reject outcome, per the
+review's explicit requirement.
+
+### 31.2 Three real bugs found during calibration
+
+Getting this design to produce *any* non-degenerate match at all surfaced
+three genuine bugs, none of them tuning:
+
+1. **Vertical geometry basis.** The bands' vertical offsets were
+   initially a fraction of `cup_height_above_px` - the corner-search
+   box's own generous vertical bound. On one calibration fixture that
+   value (348px, derived from the *stream* analysis region below the
+   outlet, not the cup) was ~3.9x the cup's own true rim distance
+   (~95px) - fine for a search box `goodFeaturesToTrack` merely looks
+   within, fatal for bands whose *position* is the estimate: every band
+   landed far above the actual cup, matching nothing. Fixed by deriving
+   an *estimated* cup height from `cup_half_width_px` instead
+   (`_CONTOUR_CUP_HEIGHT_SCALE`), clamped to `cup_height_above_px` only
+   as an outer safety ceiling.
+2. **Global-only empty-residual fallback.** `_contour_edge_map`'s
+   fallback to raw (unsuppressed) edges when no residual survives
+   suppression checked the *whole frame*, not the specific band crop -
+   residual elsewhere in the frame (noise, a structure outside the cup
+   box) satisfied that check while a genuinely-still band's own crop
+   stayed entirely zero, producing a *constant* template
+   (`TM_CCOEFF_NORMED` degenerates to a meaningless, uniform 1.0 against
+   a zero-variance template). Found because a one-time refinement landed
+   on exactly such a frame and every later match against the resulting
+   template silently "succeeded" everywhere. Fixed with a per-band local
+   fallback, both at template-build time and at match time.
+3. **Consensus/floor calibration.** The initial floor
+   (`contour_min_band_score=0.5`, reusing round two's single-template
+   value) and `contour_min_consensus_bands=3` almost never fired: on this
+   stage's own low-opacity fixture, the rim (this codebase's own
+   established "rim prior" - the one edge a translucent cup usually
+   keeps) cleared a 0.35 floor on 29/42 attempts, but the side walls of a
+   genuinely faint, low-opacity cup did far less often (`left_wall`:
+   7/42) - a real, physically-expected asymmetry in how strong each
+   part's own edge is, not a bug. Recalibrated to `contour_min_band_
+   score=0.25`, `contour_min_consensus_bands=2` (still a genuine
+   two-independent-parts requirement, not "one alone") - `contour_score_
+   margin`/`contour_max_roundtrip_px` were left at their original,
+   stricter values (0.15/3.0px) throughout, see §31.3.
+
+### 31.3 What extensive calibration found: safe, not yet recovering
+
+The A/B methodology every prior Stage 3 round has used - `OutletTracker.
+_contour_candidate` monkeypatched to a no-op for one arm, corner/residual
+selection unchanged in both - was run repeatedly against
+`translucent_cup_boundary_only_zahn_video` (§29's own fixture,
+cup_opacity=0.12, corner-only coverage of the true flow window under
+30%) and swept variants (opacity 0.1-0.5, distractor offset from
+coincident-with-the-cup to 2000px away, i.e. effectively absent), all
+using the same real-clip-derived guard geometry (`cup_half_width_px=70`,
+`cup_height_above_px=348`) rather than a hand-picked value:
+
+* At the calibrated, safe thresholds (§31.2's `contour_min_band_score=
+  0.25`/`_min_consensus_bands=2`, plus the original `contour_score_
+  margin=0.15`/`contour_max_roundtrip_px=3.0`), the contour path
+  **never fired at all** (`used_contour=0`) on every variant tried,
+  including the clean case with no distractor whatsoever - the joint
+  match's own response landscape on this fixture family's faint,
+  low-opacity boundary signal is close enough to the margin/round-trip
+  bars that it does not reliably clear them, and at these thresholds it
+  correctly does not try.
+* Progressively loosening `contour_score_margin` and `contour_max_
+  roundtrip_px` (down to 0.0 and up to 100px respectively) *does* make
+  the path fire - but its accepted candidates were then measured
+  directly against ground truth, not assumed: positions were wrong by
+  100-136 pixels, consistently, even on the clean no-distractor variant.
+  A flat or noisy correlation landscape on this faint a signal does not
+  reliably localise a true joint translation merely because four parts'
+  scores are summed - consensus among parts does not manufacture
+  precision none of them individually have.
+* The existing worst-case fixture (`translucent_cup_overlapping_
+  distractor_zahn_video`, distractor coincident with the cup at t=0,
+  §26.5/§28.3's own "never confidently wrong" bar) still passes
+  unmodified with the new mechanism in the default pipeline
+  (`test_background_through_cup_is_never_confidently_wrong`) - the
+  redesign does not regress that existing safety property.
+
+This is a genuine, disclosed limitation, not a passing result reached by
+loosening thresholds until a synthetic test went green: **the shipped
+thresholds are calibrated safe, and at those thresholds this round's own
+evidence does not support a "recovers trust" claim on the fixtures
+available.** The new integration test
+(`test_contour_silhouette_never_confidently_wrong_when_residual_corners_
+fail`) asserts what this round can actually stand behind - corner-only
+coverage genuinely struggles on the calibration fixture (asserted
+directly), adding the contour path never trusts *fewer* frames than
+corner-only tracking, and whenever the path does engage, its position
+error stays bounded (`<60px`) rather than merely being internally
+self-consistent. It does not assert recovered window trackability, unlike
+every prior round's own integration test - a deliberate, stated scope
+reduction from what the authorising review asked for
+("assert trusted contour frames and timing"), because asserting that
+honestly would require either loosening the thresholds past what this
+round's own measurements show is safe, or a fixture this round did not
+find. What would plausibly close this gap: a more robust joint estimator
+than per-part normalised cross-correlation (dense ECC with genuine
+iterative refinement, or aggregating evidence across several frames
+rather than one), or calibration against real footage, where the
+boundary's actual signal characteristics may differ from what this
+stage's synthetic rendering produces.
+
+### 31.4 New evidence
+
+* **Diagnostics**: `contour_band_scores` (per-part score at the joint
+  peak), `contour_roundtrip_error_px` (averaged geometric-agreement
+  distance), `contour_x`/`contour_y` (the joint candidate position) join
+  `contour_available`/`contour_score`/`used_contour` in `TrackResult`,
+  `_FrameEvidence` (including the two-anchor reconciliation path,
+  following the same "forward's own reading when available, backward's
+  otherwise" convention as every other Stage 3 field), and the streamed
+  tracking-frames log - populated as soon as computed, even on a
+  rejected frame, per the review's explicit audit requirement.
+* **Existing regressions**: full suite green, including every fixture
+  and test §26-29 already listed, plus a real regression caught and
+  fixed mid-round: `TestSearchWindowRecentres::test_recentring_keeps_
+  the_outlet_trackable_through_a_wide_pan` failed
+  (`untracked_ratio=0.369`, was under 0.3) when the contour path's
+  integer-pixel matching froze this tracker's own velocity estimate on
+  a steady, sub-1px/frame pan - fixed by parabolic sub-pixel refinement
+  of the joint peak (carried over unchanged from round two's own fix,
+  §29, now applied to the summed response map).
+* **Runtime/memory** (`handheld_zahn_video`, same measurement as
+  §26.5/§28.3/§29.3, three runs): 3.9-4.7s wall time (comparable to
+  round two's own 3.5-4.7s range), 4.7-5.6x real time. Peak RSS delta
+  ~68.5-68.7MB (unchanged order of magnitude).
+* **Gates**: `pytest` full suite - all pass (exact count in the PR
+  comment); `ruff check`, `ruff format --check`, `mypy` (29 source
+  files) all clean; `node --test tests_js/*.test.js` unaffected (no
+  frontend surface this round).
+
+### 31.5 Status
+
+The self-referential template `f4b216c` shipped is gone: contour
+evidence is now built entirely from the cup's own known geometry relative
+to the human-marked outlet, never from a detected feature, with required
+multi-part consensus before a candidate is even considered. This is
+verified *safe* - across every fixture this round tested, including a
+distractor coincident with the cup and the fixture the previous round's
+own real-clip failure was diagnosed against, the mechanism does not
+introduce a confidently wrong trusted position, and existing regressions
+(including the two established worst-case safety tests) stay green.
+
+**It is not yet verified to recover trust.** Extensive A/B calibration
+(§31.3) found that at thresholds this round's own measurements show are
+safe, the mechanism does not fire on the available synthetic fixtures;
+loosening those thresholds does make it fire, but on positions measured
+to be wrong by 100+ pixels - not a result this report will claim as a
+success. This is stated plainly rather than worked around, consistent
+with this stage's own discipline in every prior round: the ±0.75s
+real-footage criterion, and now also whether recovery is achievable at
+all on the real clip's own boundary signal, remain the supervisor's own
+run to make.
+
+PR #4 stays **draft and unmerged**. Stage 2 is **not started**.

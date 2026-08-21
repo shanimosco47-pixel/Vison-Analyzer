@@ -817,14 +817,21 @@ class _FrameEvidence:
     residual_px: float | None = None
     rejection_reason: str | None = None
     used_residual: bool = False
-    # Stage 3, round two - see OutletTracker's module docstring and
+    # Stage 3, round two/three - see OutletTracker's module docstring and
     # _contour_candidate. contour_available/contour_score mirror
     # background_available/residual_px for the cup-silhouette (edge/
-    # contour) evidence path; used_contour records whether *this* frame's
-    # own accepted position was actually carried from the fitted cup
-    # silhouette rather than the corner/LK transform.
+    # contour) evidence path; contour_band_scores/contour_roundtrip_error_px/
+    # contour_x/contour_y carry the multi-band candidate's own per-part
+    # detail for audit, populated whenever computed regardless of whether
+    # the candidate was ultimately accepted; used_contour records whether
+    # *this* frame's own accepted position was actually carried from the
+    # fitted cup silhouette rather than the corner/LK transform.
     contour_available: bool = False
     contour_score: float | None = None
+    contour_band_scores: dict[str, float] | None = None
+    contour_roundtrip_error_px: float | None = None
+    contour_x: float | None = None
+    contour_y: float | None = None
     used_contour: bool = False
 
     @classmethod
@@ -842,6 +849,10 @@ class _FrameEvidence:
             used_residual=result.used_residual,
             contour_available=result.contour_available,
             contour_score=result.contour_score,
+            contour_band_scores=result.contour_band_scores,
+            contour_roundtrip_error_px=result.contour_roundtrip_error_px,
+            contour_x=result.contour_x,
+            contour_y=result.contour_y,
             used_contour=result.used_contour,
         )
 
@@ -1367,6 +1378,18 @@ class ZahnCupDetector(BaseDetector):
         contour_score = (
             forward.contour_score if forward.contour_score is not None else backward.contour_score
         )
+        contour_band_scores = (
+            forward.contour_band_scores
+            if forward.contour_band_scores is not None
+            else backward.contour_band_scores
+        )
+        contour_roundtrip_error_px = (
+            forward.contour_roundtrip_error_px
+            if forward.contour_roundtrip_error_px is not None
+            else backward.contour_roundtrip_error_px
+        )
+        contour_x = forward.contour_x if forward.contour_x is not None else backward.contour_x
+        contour_y = forward.contour_y if forward.contour_y is not None else backward.contour_y
         used_contour = forward.used_contour or backward.used_contour
 
         if forward.state is not TrackState.TRACKED or backward.state is not TrackState.TRACKED:
@@ -1382,6 +1405,10 @@ class ZahnCupDetector(BaseDetector):
                 used_residual=used_residual,
                 contour_available=contour_available,
                 contour_score=contour_score,
+                contour_band_scores=contour_band_scores,
+                contour_roundtrip_error_px=contour_roundtrip_error_px,
+                contour_x=contour_x,
+                contour_y=contour_y,
                 used_contour=used_contour,
             )
         displacement = float(
@@ -1400,6 +1427,10 @@ class ZahnCupDetector(BaseDetector):
                 used_residual=used_residual,
                 contour_available=contour_available,
                 contour_score=contour_score,
+                contour_band_scores=contour_band_scores,
+                contour_roundtrip_error_px=contour_roundtrip_error_px,
+                contour_x=contour_x,
+                contour_y=contour_y,
                 used_contour=used_contour,
             )
         x = (forward.outlet_x + backward.outlet_x) / 2.0
@@ -1416,6 +1447,10 @@ class ZahnCupDetector(BaseDetector):
             rejection_reason=rejection_reason,
             used_residual=used_residual,
             contour_available=contour_available,
+            contour_band_scores=contour_band_scores,
+            contour_roundtrip_error_px=contour_roundtrip_error_px,
+            contour_x=contour_x,
+            contour_y=contour_y,
             contour_score=contour_score,
             used_contour=used_contour,
         )
@@ -2513,18 +2548,35 @@ class ZahnCupDetector(BaseDetector):
             ),
             "rejection_reason": evidence.rejection_reason,
             "used_residual": evidence.used_residual,
-            # Stage 3, round two - see OutletTracker's module docstring and
-            # _contour_candidate. Whether a cup-silhouette (edge/contour)
-            # search was attempted this frame, the best forward match score
-            # it achieved (None whenever no search ran), and whether this
-            # frame's own accepted position was actually carried from the
-            # fitted cup silhouette - the mechanism this round adds because
-            # residual-filtered corner features alone (used_residual above)
-            # proved too sparse to recover a trajectory on the real clip.
+            # Stage 3, round two/three - see OutletTracker's module
+            # docstring and _contour_candidate. Whether a multi-band cup-
+            # silhouette (edge/contour) search was attempted this frame;
+            # its joint combined score, each individual boundary band's
+            # own score at that same joint peak, and the averaged round-
+            # trip/geometric-agreement error - all populated as soon as
+            # computed, even on a frame that is ultimately rejected, so
+            # the real failure is auditable (Codex review of `f4b216c`:
+            # a single corner-anchored template turned out to be self-
+            # referential on the real clip); the joint candidate position
+            # itself; and whether this frame's own accepted position was
+            # actually carried from the fitted cup silhouette rather than
+            # the corner/LK transform.
             "contour_available": evidence.contour_available,
             "contour_score": (
                 round(evidence.contour_score, 3) if evidence.contour_score is not None else None
             ),
+            "contour_band_scores": (
+                {k: round(v, 3) for k, v in evidence.contour_band_scores.items()}
+                if evidence.contour_band_scores is not None
+                else None
+            ),
+            "contour_roundtrip_error_px": (
+                round(evidence.contour_roundtrip_error_px, 3)
+                if evidence.contour_roundtrip_error_px is not None
+                else None
+            ),
+            "contour_x": (round(evidence.contour_x, 3) if evidence.contour_x is not None else None),
+            "contour_y": (round(evidence.contour_y, 3) if evidence.contour_y is not None else None),
             "used_contour": evidence.used_contour,
         }
         try:
