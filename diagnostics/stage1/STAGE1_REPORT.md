@@ -1930,3 +1930,121 @@ the supervisor's own local run against this exact head to make, not
 something asserted here.
 
 PR #4 stays **draft and unmerged**. Stages 2 and 3 are **not started**.
+
+## 27. The real-clip gate result on `1d04a91`: failed, root cause, no implementation this round
+
+**No code in this section is implemented.** Per instruction ("stop
+implementation here pending an explicit scope decision from the user"),
+this is diagnosis only.
+
+### 27.1 What the supervisor's run showed
+
+Exact head `1d04a91`, real clip, early anchor `(610,1025)` at `4.5s`, late
+anchor `(390,1100)` at `20.5s`, default analysis start:
+
+* `status=failed` - no start, end, or efflux.
+* 795/811 frames untrusted; only 16 trusted, 14 of them liquid frames.
+* Trusted frames cluster in two short windows immediately around each
+  anchor - `4.466-4.500s` (early) and `20.498-20.831s` (late) - plus one
+  brief, isolated `25.464-25.531s` window past the late anchor entirely
+  (segment C, not segment B).
+* "There is no trusted overlap between forward and backward trajectories,
+  so reconciliation rejects essentially the entire measurement interval."
+* The frame count itself (811, not 812) confirms the §24.4/§26.2
+  double-count fix holds on real footage.
+
+### 27.2 Root cause: the same circularity as §24.2, now shown to defeat the *bounding* strategy itself
+
+§24.3.3 proposed the two-anchor design specifically to sidestep §24.2's
+root cause - not solve it - by bounding each unsupervised span to the
+distance between two human-verified points, rather than fixing the
+underlying self-referential verification (a candidate is only ever
+checked against the same reference patch captured once at the anchor).
+This result shows that framing was too optimistic about how short a
+"bounded" span needs to be on this footage.
+
+The evidence is the *shape* of the trusted windows, not just their count.
+Both `07ec4ee`'s single-anchor run (§24.1: trusted `4.466-6.033s`, ~1.5s
+around a 4.5s anchor) and this round's forward-from-early direction
+(§27.1: trusted `4.466-4.500s`, ~0.03s) lock on cleanly for a short window
+right at their anchor and then lose the cup as it drifts - consistent
+with §24.2's finding that `OutletTracker`'s reacquisition/continuous-
+correlation gate can only ask "does this still look like what I started
+with," and on this clip's translucent, low-texture material, what it
+started with may already be partly background. The two-anchor design's
+own backward-from-late direction shows the identical pattern in reverse
+(trusted only `20.498-20.831s`, ~0.33s around its own anchor) - which is
+the new evidence: **it is not just the forward direction that fails to
+survive the interval, both independently-seeded directions fail to
+survive it, from opposite ends.** Reconciliation was designed to catch a
+*single* direction locking onto a false correlation while the other stays
+honest; it has no mechanism to produce a trusted measurement when *both*
+directions independently lose the cup before they would ever have had a
+chance to meet in the middle. Bounding the span to ~16s (anchor to
+anchor) did not make it short enough for either direction's own,
+unchanged tracking primitive to bridge on this material - the isolated
+`25.464-25.531s` false lock past the late anchor is a further instance of
+exactly the spurious-correlation failure mode §24.3.1's persistence gate
+exists to catch, and evidently still can slip through briefly even with
+it in place.
+
+### 27.3 A gap this stage's synthetic suite did not catch, and why
+
+`translucent_cup_near_distractor_zahn_video` (§26.5, the fixture the rim
+bias and the new false-correlation test both exercise) uses a comparably
+long anchor-to-anchor span (15s of a 16s clip) and stays fully trusted
+end to end. That the real clip fails this badly at a similar span length,
+while the synthetic translucent fixture does not fail at all, means the
+synthetic material is measurably easier than the real footage - not
+merely "a different instance of the same difficulty." Concretely, the
+synthetic fixture's translucency, camera motion and lighting are each a
+deliberately simple model (a flat drawn cup shape, sinusoidal camera
+drift, uniform sensor noise); real footage's actual specular highlights,
+irregular hand motion, and lighting changes are not represented. This
+round's synthetic evidence base (§26.5's tests, all green) demonstrates
+the two-anchor *mechanism* behaves as designed - trusts only agreeing,
+independently-tracked frames, rejects a false correlation, fixes the
+frame count - but it cannot and does not demonstrate that mechanism
+*succeeds often enough* on real material to be useful, because nothing in
+this repository's synthetic suite is currently hard enough to exercise
+that failure. That gap is itself worth stating plainly rather than
+leaving implicit.
+
+### 27.4 What this does and does not rule out
+
+**Rules out:** tuning the existing safeguards further (persistence-gate
+width, disagreement tolerance, rim-bias tier) is very unlikely to help -
+§27.2's finding is that *both* independently-seeded directions lose the
+cup well before reconciliation is ever reached, not that they reach
+reconciliation and disagree. There is no disagreement to adjudicate more
+carefully when neither side produces an overlapping trusted trajectory at
+all.
+
+**Does not rule out** (not evaluated, no implementation without
+authorisation): more numerous, closely-spaced anchors (shortening every
+individual unsupervised span further); a fundamentally different
+per-frame verification signal not derived from a single stored reference
+patch (§24.3.2's already-identified need, Stage 3's deferred scope);
+accepting that this specific clip's material is outside what Stage 1's
+architecture can measure at all, and that the `status=failed` result
+observed here is in fact the *correct*, honest answer for it - the
+tool's job is to say "unmeasurable" rather than invent a number, and on
+this evidence it did.
+
+### 27.5 Status
+
+Requirement 4 (the ±0.75s real-footage criterion): **failed** on the one
+real clip tested, per the supervisor's own run. This is not attributed to
+the double-count bug (confirmed fixed - 811 frames) or the reconciliation
+safeguards (working as designed - correctly refusing to trust two
+trajectories that never overlap). It is attributed to §27.2's root cause:
+the per-frame tracking/verification primitive underlying both directions
+does not survive this clip's translucent material for anywhere near the
+anchor-to-anchor distance this round's design assumed would be
+achievable, and §27.3's gap means the current synthetic suite cannot be
+relied on to predict that in advance for future material either.
+
+Per instruction, **stopping here**: no further Stage 1 UX expansion
+(additional anchors or otherwise) or algorithmic changes are implemented
+this round pending an explicit scope decision. PR #4 stays **draft and
+unmerged**. Stages 2 and 3 are **not started**.
