@@ -455,6 +455,83 @@ class TestTrackingRefusesAStrongNearbyDistractor:
             assert distance_to_truth < distance_to_distractor
 
 
+class TestCameraMotionCompensation:
+    """Stage 3: camera-motion compensation, authorised after the two-anchor
+    design (Stage 1's own architecture) proved unable to bridge the real
+    clip's translucent, low-texture interval - diagnostics/stage1/
+    STAGE1_REPORT.md §27. ``translucent_cup_overlapping_distractor_zahn_
+    video`` is the worst case named there and in §18.3/§24.2: a strongly-
+    textured distractor already sitting under the cup at t=0, so the
+    reference patch itself would be extracted from it - no patch-
+    correlation check can distinguish that from the genuine cup, since the
+    check is circular by construction. Camera-motion compensation is a
+    different kind of evidence entirely - not "does this still look like
+    the reference," but "does this move independently of the background" -
+    which is exactly what this fixture needs to be handled safely.
+    """
+
+    def test_background_through_cup_is_never_confidently_wrong(
+        self, translucent_cup_overlapping_distractor_zahn_video
+    ):
+        clip, _distractor_center = translucent_cup_overlapping_distractor_zahn_video
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
+        summary = result.summary
+        # The same safety property TestTrackingRefusesAStrongNearbyDistractor
+        # checks for the near-but-not-overlapping case: either the result is
+        # genuinely correct, or the run stays honestly uncertain (capped
+        # confidence) - never a confident, wrong number.
+        if summary["status"] == "confirmed":
+            assert summary["efflux_seconds"] is not None
+            assert abs(summary["efflux_seconds"] - clip.efflux_s) <= SYNTHETIC_TOLERANCE_S
+        else:
+            assert summary["confidence"] <= 0.5
+
+    def test_the_veto_actually_engages_and_bounds_untracked_frames(
+        self, translucent_cup_overlapping_distractor_zahn_video, tmp_path
+    ):
+        """The mechanism claim, not just the summary outcome: on this
+        worst-case fixture, ``OutletTracker`` must actually reject a
+        meaningful share of frames as ``background_consistent`` - proof the
+        veto engages, not merely that the final result happens not to be
+        wrong - while ``MAX_TRACKING_RECENTRES`` and the existing
+        persistence gates still bound the run (a pathological clip cannot
+        recentre or reacquire without limit just because Stage 3 adds a new
+        way to lose trust). A frame-by-frame "every rejection was
+        genuinely near the distractor" claim is not checked here: a
+        rejected frame's logged position is wherever the tracker was last
+        frozen (``OutletTracker._declare_lost`` does not move
+        ``self._outlet``), not the vetoed candidate itself, and on this
+        particular fixture - built so the distractor coincides with the
+        cup's own t=0 position - "trusted" frames themselves cluster
+        exactly where truth and distractor are hard to tell apart, which
+        is the expected shape of the known circular-verification
+        limitation (§24.2), not something a per-frame position check can
+        cleanly separate out.
+        """
+        import json
+
+        clip, _distractor_center = translucent_cup_overlapping_distractor_zahn_video
+        diagnostics_dir = tmp_path / "diag"
+        result = _run(
+            clip.path, clip.outlet_at_reference, clip=clip, diagnostics_dir=str(diagnostics_dir)
+        )
+        summary = result.summary
+        log_path = Path(result.diagnostics["tracking_frames_log"])
+        records = [json.loads(line) for line in log_path.read_text().splitlines()]
+        rejected_count = sum(1 for r in records if r["rejection_reason"] == "background_consistent")
+        assert rejected_count, "expected the veto to actually engage on this fixture"
+
+        recentre_events = result.diagnostics["recentre_events"]
+        assert len(recentre_events) <= MAX_TRACKING_RECENTRES
+        # The tool's job on a case this hard is to say "unmeasurable," not
+        # invent a number confidently - status alone does not prove that
+        # (checked separately), but a run that rejects a real share of
+        # frames and still reports every one of them (none silently
+        # dropped) is at least behaving as designed.
+        assert summary["frames_untracked"] > 0
+        assert summary["frames_analysed"] == len(records)
+
+
 class TestSearchWindowRecentres:
     """Third Codex review round, against real footage: "the real cup later
     moves outside the current x=460..760 search window" - a fixed
@@ -783,9 +860,17 @@ class TestTrackingFramesLog:
             "search_roi",
             "roi",
             "guard_roi",
+            # Stage 3 camera-motion compensation - see OutletTracker's
+            # module docstring and _BackgroundMotionEstimator.
+            "background_available",
+            "background_dx",
+            "background_dy",
+            "residual_px",
+            "rejection_reason",
         }
         assert first["state"] in {"tracked", "predicted", "lost"}
         assert isinstance(first["trusted"], bool)
+        assert isinstance(first["background_available"], bool)
         assert set(first["search_roi"]) == {"x", "y", "width", "height"}
         # Timestamps are monotonic - one line per frame, in decode order.
         timestamps = [record["timestamp_s"] for record in records]

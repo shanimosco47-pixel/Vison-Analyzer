@@ -405,6 +405,73 @@ class ZahnConfig:
     # step.
     track_reconciliation_max_disagreement_px: float = 30.0
 
+    # Stage 3 (camera-motion compensation): the minimum number of RANSAC
+    # inliers a frame-to-frame background/camera motion estimate needs
+    # before it is used at all. Features come from outside the cup/outlet/
+    # guard/stream box (see OutletTracker's background estimator), so a
+    # background-starved crop (little texture beyond the cup itself) simply
+    # cannot support this - "unavailable" in that case, never "assume zero
+    # motion." The residual-motion veto below only ever fires on an
+    # *available* estimate; an unavailable one falls back to the pre-Stage-3
+    # checks unchanged, exactly like a low-inlier cup fit already does.
+    background_motion_min_features: int = 8
+
+    # A background motion estimate below this magnitude, accumulated over
+    # background_motion_window_s (not one frame), means the camera was not
+    # moving meaningfully over that window - there is no camera motion for
+    # the residual check below to test a cup candidate against, so it is
+    # skipped rather than comparing two near-zero vectors and treating a
+    # static cup as "background-consistent." This is what keeps a
+    # genuinely stationary camera and cup (no signal to compensate for)
+    # behaving exactly as before Stage 3.
+    background_motion_min_signal_px: float = 1.5
+
+    # How far a cup/rim motion candidate's own displacement must diverge
+    # from the background/camera motion estimate, once there is a
+    # background signal to compare against, before it counts as genuine,
+    # independent cup motion rather than background showing through a
+    # translucent cup. Below this, the candidate is rejected as
+    # background-consistent regardless of how well it otherwise passes the
+    # inlier/displacement/patch-correlation checks - those checks alone
+    # cannot tell "the cup, moved" from "more of the same background the
+    # reference patch was already built from" (see diagnostics/stage1/
+    # STAGE1_REPORT.md §24.2/§27.2), which is exactly the gap this residual
+    # check exists to close. Kept close to background_motion_min_signal_px
+    # for the same single-digit-pixel-per-frame reason - real independent
+    # cup motion (a hand moving against a panning camera) is often only a
+    # few pixels' difference per frame, not a wide margin; a much higher
+    # bound would rarely engage on real footage at all. Unvalidated against
+    # real footage (no labelled translucent-cup clip has been available to
+    # calibrate against - see STAGE1_REPORT.md's other unvalidated
+    # thresholds), so a real run may need this retuned in either direction.
+    #
+    # Applied over background_motion_window_s, not a single frame (Codex
+    # review: an earlier, purely per-frame version of both this and
+    # background_motion_min_signal_px rejected clearly-correct opaque-cup
+    # tracking essentially at random - real hand-held motion oscillates,
+    # and the hand's own instantaneous velocity crosses zero periodically,
+    # which looks exactly like "no independent motion this frame" even for
+    # a genuinely, correctly tracked cup). Comparing cumulative displacement
+    # over a short window instead absorbs that oscillation while still
+    # reacting within about a second - comparable in spirit to
+    # track_max_bridge_s, a separate knob for a separate mechanism.
+    background_motion_min_residual_px: float = 2.0
+
+    # The window, in seconds, background_motion_min_signal_px/
+    # _min_residual_px are evaluated over - the cup candidate's and the
+    # background's own cumulative displacement across the last this-many
+    # seconds, not one frame's. See background_motion_min_residual_px's own
+    # docstring for why a window, not a single frame. 0.7s is an empirical
+    # balance across this stage's own synthetic fixtures, not a physical
+    # constant: 0.5s left the portrait, large-reframing fixture's ordinary
+    # oscillation reading as background-consistent too often (a genuine
+    # regression, caught before this value was chosen); 1.0s fixed that but
+    # introduced the same false-positive pattern on several other, smaller-
+    # motion fixtures. Unvalidated against real footage for the same reason
+    # as the thresholds above - the true optimum may sit outside the
+    # 0.5-1.0s range this stage's synthetic suite could distinguish within.
+    background_motion_window_s: float = 0.7
+
     # If liquid was last confirmed before an untrusted (`lost`/`predicted`)
     # span and no trusted evidence follows it before flow-end would otherwise
     # be confirmed, the true break could have happened anywhere in that span.
@@ -448,6 +515,18 @@ class ZahnConfig:
             raise ConfigurationError(
                 "The two-anchor reconciliation disagreement bound must be greater than zero."
             )
+        if self.background_motion_min_features < 3:
+            raise ConfigurationError(
+                "At least 3 background-motion features are required to fit a transform."
+            )
+        if self.background_motion_min_signal_px < 0:
+            raise ConfigurationError("The background-motion signal floor must not be negative.")
+        if self.background_motion_min_residual_px <= 0:
+            raise ConfigurationError(
+                "The background-motion residual bound must be greater than zero."
+            )
+        if self.background_motion_window_s <= 0:
+            raise ConfigurationError("The background-motion window must be greater than zero.")
         if self.zahn_max_endpoint_uncertainty_s < 0:
             raise ConfigurationError("The endpoint uncertainty bound must not be negative.")
 

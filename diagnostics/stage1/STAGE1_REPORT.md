@@ -2048,3 +2048,163 @@ Per instruction, **stopping here**: no further Stage 1 UX expansion
 (additional anchors or otherwise) or algorithmic changes are implemented
 this round pending an explicit scope decision. PR #4 stays **draft and
 unmerged**. Stages 2 and 3 are **not started**.
+
+## 28. Stage 3: camera-motion compensation, implemented per user authorisation
+
+The user's explicit decision (PR comment, following §27): approve a
+bounded Stage 3 - estimate dominant camera/background motion from
+features outside the cup/outlet/guard/stream regions, express candidate
+cup motion relative to that background model, and fuse the residual with
+the existing anchors and tracker states, rejecting a background-consistent
+candidate as a cup anchor. Stage 2 stays deferred. This section is that
+implementation.
+
+### 28.1 Design
+
+`OutletTracker` now owns a second, lighter-weight estimator alongside its
+own cup tracking: `_BackgroundMotionEstimator` runs the same
+LK-pyramid-plus-forward-backward-check-plus-RANSAC-affine-fit pattern the
+cup transform already uses (§"Method" above), but over features detected
+*outside* a cup/outlet/stream-sized exclusion box, giving a per-frame
+estimate of the scene's own dominant (camera) motion, independent of
+whatever the cup tracker itself is doing.
+
+Two veto points, both additive (never a new way to become trusted, only a
+new way to lose it - the existing inlier/displacement/patch-correlation
+and reacquisition-correlation checks still gate acceptance first):
+
+* **Continuous tracking** (`OutletTracker._background_veto`): compares
+  the cup candidate's displacement over a short rolling window against
+  the background's own cumulative displacement over the same window. A
+  residual below `background_motion_min_residual_px` - after there is
+  enough background signal (`background_motion_min_signal_px`) to test
+  against at all - means the "cup" moved exactly as much as the camera
+  did and nothing more: background showing through a translucent cup,
+  not the cup itself. Rejected candidates fall back to the existing
+  bridge/lost path, exactly like any other rejection.
+* **Reacquisition** (`OutletTracker._background_veto_since_confident`):
+  the same principle over the (potentially longer) span since the last
+  confident observation, comparing the reacquired candidate's total
+  displacement against the background's own cumulative displacement over
+  that gap. A background-consistent reacquisition restarts the two-frame
+  persistence count rather than confirming - the existing spurious-match
+  safeguard (§21.3) and this one compose, not replace each other.
+
+`ZahnConfig` gains four new fields (`background_motion_min_features`,
+`background_motion_min_signal_px`, `background_motion_min_residual_px`,
+`background_motion_window_s`), all explicitly documented as unvalidated
+against real footage (no labelled translucent-cup clip has been
+available to calibrate against, same caveat as this stage's other
+thresholds).
+
+### 28.2 Two bugs found and fixed before this reached review
+
+**28.2.1 The exclusion box could swallow the entire capture crop.**
+First implementation reused `cup_height_above_px` symmetrically above
+*and* below the outlet for the background exclusion zone. That value is
+already sized to the guard region's own (generous) scale for cup feature
+selection; doubling it regularly exceeded the capture crop itself,
+leaving zero pixels for background feature detection - caught on the
+first real regression run against a translucent-cup fixture: `background_
+available` was `False` on effectively every frame, so the veto never
+engaged at all (0 rejections, `status=review` on a confidently-wrong
+number). Fixed by keeping the above-outlet bound exactly equal to
+`_feature_mask`'s own cup box (so it can never clip real cup texture) and
+using a smaller, independent bound below it (`cup_half_width_px`, always
+narrower than a Zahn cup's tall, narrow guard region).
+
+**28.2.2 A purely per-frame residual check rejected clearly-correct
+opaque-cup tracking.** With the exclusion fixed, the veto engaged - but
+broke five previously-passing regression tests, most severely a portrait,
+large-reframing fixture (95.8% untracked, was under 10%). Root cause: real
+hand-held motion oscillates (tremor, natural sway), so the hand's own
+instantaneous velocity crosses zero periodically: at that instant, a
+genuinely, correctly tracked opaque cup's own per-frame residual against
+the background is unremarkably small too - indistinguishable, one frame
+at a time, from actual background-consistency. A per-frame check rejects
+essentially at random relative to the hand's own motion cycle. Fixed by
+comparing *cumulative* displacement over a short rolling window
+(`background_motion_window_s`) instead of one frame's delta -
+`OutletTracker` now keeps a small bounded history
+(`self._motion_history`) of recent (timestamp, outlet position,
+background cumulative offset) samples for exactly this comparison. The
+window length itself was calibrated empirically against this stage's own
+synthetic fixtures (0.5s under-served the portrait fixture's large,
+slow-oscillating motion; 1.0s over-corrected and broke several smaller-
+motion fixtures instead; 0.7s is the value that leaves the full existing
+suite green) - explicitly flagged in `ZahnConfig`'s own docstring as an
+empirical balance, not a physical constant, since the true optimum may
+sit outside what this stage's synthetic suite can distinguish.
+
+### 28.3 New evidence
+
+* **`translucent_cup_overlapping_distractor_zahn_video`** (new fixture,
+  wrapping the already-present but previously-unused
+  `build_translucent_cup_clip`): a strongly-textured distractor patch
+  sitting *under* the translucent cup at t=0 - the exact worst case
+  §18.3/§24.2 named as unsolvable by patch-correlation alone, since the
+  reference patch itself would be extracted from the distractor. Camera-
+  motion compensation is evidence of a different kind - not "does this
+  still look like the reference" but "does this move independently of the
+  background" - so this is the case that actually exercises Stage 3,
+  not one Stage 1's own checks already handled.
+* `TestCameraMotionCompensation::test_background_through_cup_is_never_
+  confidently_wrong`: the same safety property §26.5's distractor test
+  already established for the near-but-not-overlapping case, now checked
+  against the overlapping worst case - either a genuinely correct
+  measurement, or an honestly uncertain one (capped confidence), never a
+  confident, wrong number. On this fixture: `status=review`,
+  `confidence<=0.45`, 543/600 frames correctly left untracked (previously
+  0/600 - a confidently wrong efflux - before the exclusion-mask and
+  windowing fixes above).
+* `test_the_veto_actually_engages_and_bounds_untracked_frames`: proves the
+  mechanism itself engages (`rejection_reason == "background_consistent"`
+  fires) rather than merely happening not to look wrong, while
+  `MAX_TRACKING_RECENTRES` still bounds the run and every frame is still
+  reported (none silently dropped).
+* **Existing regressions**: full suite green - static-camera/static-cup
+  (`zahn_video`-based tests), opaque-cup (`handheld_zahn_video`),
+  occlusion/gap (`TestBreakDuringATrackingGap*`,
+  `TestUnresolvedGapInTheMiddleOfFlow`), portrait geometry
+  (`TestPortraitGuardGeometry`, `TestOutletReferenceFrame`), search-window
+  recentring, the near-distractor case (§26.5), and all result-contract/
+  security tests - all pass unmodified in substance (only the diagnostics-
+  log schema test gained the five new streamed fields it now also
+  writes).
+* **Streamed diagnostics**: `_write_tracking_frame_log`'s record gained
+  `background_available`, `background_dx`, `background_dy`,
+  `residual_px`, `rejection_reason` - the global-motion estimate, the
+  cup's residual against it, and the decision, per frame, sufficient to
+  audit a real run's background-through-cup rejections one frame at a
+  time (the explicit evidence requirement from the authorisation).
+* **Runtime/memory** (`handheld_zahn_video`, same measurement as §26.5):
+  2.51s wall time (was 1.34s - the added background estimator's own
+  LK/RANSAC pass roughly doubles per-frame cost), still 8.8x real time
+  (was 16.4x). Peak RSS unchanged (153.5MB vs 153.8MB) - the estimator
+  tracks a small, bounded feature set and a short rolling history, no
+  additional frame buffering.
+* **Gates**: `pytest` - 361 tests (359 before this round + 2 new), all
+  pass - `ruff check`, `ruff format --check`, `mypy` (29 files) all
+  clean. `node --test tests_js/*.test.js` 58/58 (unchanged - no frontend
+  surface this round).
+
+### 28.4 Status
+
+Camera-motion compensation is implemented as authorised: a genuine second
+evidence source (background/camera motion, not the circular reference-
+patch correlation), fused as an additive veto over both the continuous-
+tracking and reacquisition paths, with the required regressions (static,
+opaque, occlusion/gap, portrait, and the new translucent-over-textured-
+background-with-independent-motion case) all green and streamed
+diagnostics sufficient to audit a real run frame by frame.
+
+**Not independently verified against the real clip.** Per the same
+discipline as every prior round: the ±0.75s real-footage criterion is the
+supervisor's own run against this exact head to make, not a claim made
+here. §28.2's calibration (window length, signal/residual thresholds) is
+explicitly empirical, tuned only against this stage's synthetic fixtures -
+real translucent material's actual motion characteristics may call for
+retuning in either direction, and this report says so rather than
+implying the synthetic result generalises.
+
+PR #4 stays **draft and unmerged**. Stage 2 is **not started**.

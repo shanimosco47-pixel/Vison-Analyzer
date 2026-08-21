@@ -43,6 +43,28 @@ States
               is not proof the outlet was ever seen during that gap - see
               :class:`app.analysis.zahn_detector.FlowStateMachine` for how
               that uncertainty is carried into the reported timestamps.
+
+Camera-motion compensation (Stage 3)
+-------------------------------------
+
+Every check above verifies a candidate against this tracker's *own* stored
+reference - inlier count, displacement, patch correlation. On a translucent,
+low-texture cup, that verification is circular: if the reference patch was
+itself extracted from background visible through the cup, "more of that
+same background, wherever it later appears" answers every one of those
+checks correctly (diagnostics/stage1/STAGE1_REPORT.md §24.2/§27.2). Closing
+that gap needs evidence that is not derived from the reference patch at
+all - ``_BackgroundMotionEstimator`` supplies it, tracking features
+*outside* the cup/outlet/guard/stream box to estimate the frame's dominant
+camera/background motion independently, and ``_background_veto`` /
+``_background_veto_since_confident`` reject a candidate whose own
+displacement is indistinguishable from that background motion alone - real
+cup motion (a hand holding the cup independently of the camera) has a
+residual on top of it; background seen through the cup does not. This is
+purely a veto: an unavailable estimate (too little background texture) or
+one with no real camera motion to test against never grants trust a
+candidate would not already have earned from the checks above - see
+``ZahnConfig.background_motion_min_signal_px``/``_min_residual_px``.
 """
 
 from __future__ import annotations
@@ -130,6 +152,21 @@ class TrackResult:
     inliers: int
     feature_count: int
     reacquired: bool = False
+    # Stage 3 camera-motion compensation - see the module docstring and
+    # _BackgroundMotionEstimator. background_dx/dy/available describe this
+    # frame's independently-estimated camera/background motion regardless
+    # of outcome (0.0/False when unavailable); residual_px is the cup
+    # candidate's own displacement once that background motion is
+    # subtracted out, only ever populated when there was a background
+    # signal to compare against; rejection_reason names *why* a frame that
+    # would otherwise have been accepted was not - "background_consistent"
+    # today, None whenever the veto did not change the outcome (including
+    # every frame before Stage 3 existed).
+    background_dx: float = 0.0
+    background_dy: float = 0.0
+    background_available: bool = False
+    residual_px: float | None = None
+    rejection_reason: str | None = None
 
 
 def _feature_mask(
@@ -184,6 +221,197 @@ def _detect_features(
         mask=mask,
         blockSize=_FEATURE_BLOCK_SIZE,
     )
+
+
+def _background_mask(
+    shape: tuple[int, int],
+    outlet_xy: tuple[float, float],
+    *,
+    half_width_px: int,
+    above_px: int,
+    below_px: int,
+) -> np.ndarray:
+    """Everywhere outside a cup+outlet+stream-sized box around the outlet.
+
+    Stage 3 (camera-motion compensation): unlike ``_feature_mask``'s
+    cup-only box (all above the outlet, by design - see its own
+    docstring), this also excludes a region *below* it, where the stream
+    falls - background/camera motion evidence must come from neither the
+    cup nor the stream. Deliberately *not* symmetric at the same height in
+    both directions: ``above_px`` matches ``_feature_mask``'s own bound
+    exactly, so this can never clip into pixels the cup's own feature
+    detection already treats as "the cup" (a real regression - an earlier,
+    symmetric-at-full-height version of this box occasionally left a sliver
+    of true cup texture outside the exclusion zone, on tight synthetic
+    geometry where the cup's own patch nearly fills its allotted box).
+    ``below_px`` is independently sized, smaller - a coarse box, not a
+    precise stream boundary; the point is "not obviously cup or stream,"
+    not an exact cut.
+    """
+    height, width = shape
+    mask = np.full(shape, 255, dtype=np.uint8)
+    top = max(0, int(outlet_xy[1]) - above_px)
+    bottom = min(height, int(outlet_xy[1]) + below_px)
+    left = max(0, int(outlet_xy[0]) - half_width_px)
+    right = min(width, int(outlet_xy[0]) + half_width_px)
+    if bottom > top and right > left:
+        mask[top:bottom, left:right] = 0
+    return mask
+
+
+@dataclass(frozen=True)
+class _BackgroundMotionResult:
+    """One frame's background/camera motion estimate, in the tracker's
+    local crop pixel space - see ``_BackgroundMotionEstimator``."""
+
+    available: bool
+    dx: float
+    dy: float
+    inliers: int
+    feature_count: int
+
+
+class _BackgroundMotionEstimator:
+    """Frame-to-frame dominant camera/background motion, from features
+    outside the cup/outlet/guard/stream box - Stage 3 camera-motion
+    compensation (see the module docstring, and diagnostics/stage1/
+    STAGE1_REPORT.md §27-28).
+
+    Deliberately simpler than ``OutletTracker``'s own cup tracking: this
+    only ever needs *this frame's* motion (plus a running total since
+    construction, for the reacquisition path's longer-span comparison),
+    never a notion of being "lost" - a frame with too few background
+    features to fit reports ``available=False`` and tries a fresh
+    detection next frame, the same way a thin cup point set redetects
+    rather than failing outright.
+    """
+
+    def __init__(
+        self,
+        config: ZahnConfig,
+        reference_gray: np.ndarray,
+        outlet_xy: tuple[float, float],
+        *,
+        half_width_px: int,
+        above_px: int,
+        below_px: int,
+    ) -> None:
+        self._config = config
+        self._half_width_px = half_width_px
+        self._above_px = above_px
+        self._below_px = below_px
+        self._points = self._detect(reference_gray, outlet_xy)
+        # Total background displacement since construction, evaluated at
+        # the outlet's own (moving) position each frame - see update()'s
+        # "predicted at the outlet" derivation. Only ever accumulated on an
+        # *available* frame; an unavailable one contributes nothing, a
+        # conservative (understates true motion) rather than incorrect
+        # approximation - see the module docstring.
+        self.cumulative_dx = 0.0
+        self.cumulative_dy = 0.0
+
+    def _detect(self, gray: np.ndarray, outlet_xy: tuple[float, float]) -> np.ndarray | None:
+        mask = _background_mask(
+            gray.shape[:2],
+            outlet_xy,
+            half_width_px=self._half_width_px,
+            above_px=self._above_px,
+            below_px=self._below_px,
+        )
+        return cv2.goodFeaturesToTrack(
+            gray,
+            maxCorners=_MAX_FEATURES,
+            qualityLevel=_FEATURE_QUALITY,
+            minDistance=_FEATURE_MIN_DISTANCE_PX,
+            mask=mask,
+            blockSize=_FEATURE_BLOCK_SIZE,
+        )
+
+    def update(
+        self, prev_gray: np.ndarray, gray: np.ndarray, outlet_xy: tuple[float, float]
+    ) -> _BackgroundMotionResult:
+        cfg = self._config
+        min_features = cfg.background_motion_min_features
+        if self._points is None or len(self._points) < min_features:
+            self._points = self._detect(gray, outlet_xy)
+            feature_count = 0 if self._points is None else len(self._points)
+            return _BackgroundMotionResult(
+                available=False, dx=0.0, dy=0.0, inliers=0, feature_count=feature_count
+            )
+
+        forward, fwd_ok, _ = cv2.calcOpticalFlowPyrLK(  # type: ignore[call-overload]
+            prev_gray,
+            gray,
+            self._points,
+            None,
+            winSize=_LK_WIN_SIZE,
+            maxLevel=_LK_MAX_LEVEL,
+            criteria=_LK_CRITERIA,
+        )
+        backward, back_ok, _ = cv2.calcOpticalFlowPyrLK(  # type: ignore[call-overload]
+            gray,
+            prev_gray,
+            forward,
+            None,
+            winSize=_LK_WIN_SIZE,
+            maxLevel=_LK_MAX_LEVEL,
+            criteria=_LK_CRITERIA,
+        )
+        good = (fwd_ok.ravel() == 1) & (back_ok.ravel() == 1)
+        fb_error = np.linalg.norm(backward - self._points, axis=2).ravel()
+        good &= fb_error < _FORWARD_BACKWARD_MAX_PX
+        source, target = self._points[good], forward[good]
+
+        feature_count = len(source)
+        if feature_count < min_features:
+            self._points = self._detect(gray, outlet_xy)
+            return _BackgroundMotionResult(
+                available=False, dx=0.0, dy=0.0, inliers=0, feature_count=feature_count
+            )
+
+        matrix, inlier_mask = cv2.estimateAffinePartial2D(
+            source,
+            target,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=_RANSAC_REPROJ_PX,
+            maxIters=_RANSAC_MAX_ITERS,
+        )
+        if matrix is None or inlier_mask is None:
+            self._points = self._detect(gray, outlet_xy)
+            return _BackgroundMotionResult(
+                available=False, dx=0.0, dy=0.0, inliers=0, feature_count=feature_count
+            )
+
+        inliers = int(inlier_mask.sum())
+        if inliers < min_features:
+            self._points = self._detect(gray, outlet_xy)
+            return _BackgroundMotionResult(
+                available=False, dx=0.0, dy=0.0, inliers=inliers, feature_count=feature_count
+            )
+
+        # The displacement this transform implies *at the outlet's own
+        # position*, not the raw matrix translation term - background
+        # features sit far from the outlet, so any rotation/scale in the
+        # fit would otherwise make the two not directly comparable to the
+        # cup transform's own candidate (also evaluated at the outlet -
+        # see OutletTracker._attempt_tracking).
+        homogeneous = np.array([outlet_xy[0], outlet_xy[1], 1.0])
+        predicted = matrix @ homogeneous
+        dx = float(predicted[0] - outlet_xy[0])
+        dy = float(predicted[1] - outlet_xy[1])
+        self.cumulative_dx += dx
+        self.cumulative_dy += dy
+
+        survivors = target[inlier_mask.ravel() == 1].reshape(-1, 1, 2)
+        if len(survivors) < min_features:
+            fresh = self._detect(gray, outlet_xy)
+            if fresh is not None and len(fresh) >= min_features:
+                survivors = fresh
+        self._points = survivors
+
+        return _BackgroundMotionResult(
+            available=True, dx=dx, dy=dy, inliers=inliers, feature_count=feature_count
+        )
 
 
 class OutletTracker:
@@ -249,6 +477,53 @@ class OutletTracker:
         # gap on the very next frame must still have a timestamp and a
         # (zero, until real motion is observed) velocity to bridge from.
         self._last_confident_timestamp: float | None = reference_timestamp_s
+
+        # Stage 3: dominant camera/background motion, from features outside
+        # the cup/outlet/guard/stream box - see _BackgroundMotionEstimator
+        # and the module docstring. The width and above-outlet height match
+        # cup feature selection's own bound exactly (cup_half_width_px/
+        # cup_height_above_px - the same values _detect_cup_features uses),
+        # so this can never pick up real cup texture as "background." Below
+        # the outlet (the stream's own space) uses a smaller, independent
+        # bound - reusing cup_height_above_px there too, symmetrically,
+        # regularly exceeds the capture crop the caller decodes each frame
+        # (cup_height_above_px is already sized to the guard region's own
+        # generous scale), leaving no pixels at all for background feature
+        # detection (caught by a Stage 3 regression: a portrait clip's
+        # background estimate came back unavailable on effectively every
+        # frame). cup_half_width_px is comfortably smaller in every
+        # geometry this stage builds (a Zahn cup's guard region is narrow
+        # and tall, not wide) and keeps the total exclusion within the
+        # crop's own margin (track_search_margin_px) on every side.
+        self._background = _BackgroundMotionEstimator(
+            config,
+            reference_gray,
+            outlet_xy,
+            half_width_px=cup_half_width_px,
+            above_px=cup_height_above_px,
+            below_px=cup_half_width_px,
+        )
+        self._last_background = _BackgroundMotionResult(
+            available=False, dx=0.0, dy=0.0, inliers=0, feature_count=0
+        )
+        # Snapshot of self._background's cumulative offset at the moment
+        # _last_confident_outlet/_timestamp were last set - see
+        # _background_veto_since_confident. The reference frame is itself a
+        # confident observation (same reasoning as _last_confident_timestamp
+        # above), so this starts at the estimator's own zero.
+        self._last_confident_background_cumulative: tuple[float, float] = (0.0, 0.0)
+        # A short rolling history of (timestamp, outlet position, background
+        # cumulative offset), bounded to background_motion_window_s - see
+        # _background_veto. Comparing *cumulative* displacement over a
+        # window, not one frame's, is what lets a real hand's own
+        # oscillating motion (its instantaneous velocity crosses zero
+        # periodically - tremor, natural sway) look unremarkable near a
+        # turning point without a single such frame - or several - being
+        # mistaken for background-consistency (Codex review: an earlier,
+        # purely per-frame version of this veto rejected clearly-correct
+        # opaque-cup tracking at effectively random points in the hand's
+        # own motion cycle).
+        self._motion_history: list[tuple[float, float, float, float, float]] = []
 
         # The reacquisition patch is centred on a strong detected feature
         # near the *top* of the search box, not the single strongest corner
@@ -325,6 +600,33 @@ class OutletTracker:
 
     def update(self, gray: np.ndarray, timestamp_s: float) -> TrackResult:
         """Feed the next frame (same crop geometry as initialisation)."""
+        # Computed unconditionally, tracked/predicted/lost alike - Stage 3's
+        # veto checks (in _attempt_tracking/_attempt_reacquisition) and the
+        # streamed diagnostics both need this frame's background estimate
+        # regardless of the cup's own state, and a LOST run's background
+        # motion must keep accumulating so a later reacquisition's "since
+        # last confident" comparison (_background_veto_since_confident)
+        # covers the whole gap, not just the frames the cup happened to be
+        # tracked on.
+        self._last_background = self._background.update(
+            self._prev_gray, gray, (self._outlet[0], self._outlet[1])
+        )
+        # Recorded before this frame's own candidate is known - "where did
+        # we believe the outlet was, going into this frame" - so
+        # _background_veto can compare against a point genuinely
+        # window_s ago, not one that already includes this frame's result.
+        self._motion_history.append(
+            (
+                timestamp_s,
+                float(self._outlet[0]),
+                float(self._outlet[1]),
+                self._background.cumulative_dx,
+                self._background.cumulative_dy,
+            )
+        )
+        window_s = self._config.background_motion_window_s
+        while len(self._motion_history) > 1 and timestamp_s - self._motion_history[0][0] > window_s:
+            self._motion_history.pop(0)
         if self._state is TrackState.LOST:
             result = self._attempt_reacquisition(gray, timestamp_s)
         else:
@@ -340,6 +642,8 @@ class OutletTracker:
         feature_count = 0 if self._points is None else len(self._points)
         accepted_outlet: np.ndarray | None = None
         surviving_points: np.ndarray | None = None
+        residual_px: float | None = None
+        rejection_reason: str | None = None
 
         if self._points is not None and len(self._points) >= cfg.track_min_inliers:
             # cv2's type stub does not mark nextPts as Optional even though
@@ -400,16 +704,80 @@ class OutletTracker:
                             implied_anchor = candidate + self._anchor_offset_from_outlet
                             correlation = self._patch_correlation_at(gray, implied_anchor)
                             if correlation >= cfg.track_min_patch_correlation:
-                                accepted_outlet = candidate
-                                surviving_points = target[inlier_mask.ravel() == 1].reshape(
-                                    -1, 1, 2
+                                residual_px, rejection_reason = self._background_veto(
+                                    candidate, timestamp_s
                                 )
+                                if rejection_reason is None:
+                                    accepted_outlet = candidate
+                                    surviving_points = target[inlier_mask.ravel() == 1].reshape(
+                                        -1, 1, 2
+                                    )
 
         if accepted_outlet is not None:
             return self._accept_tracked(
-                accepted_outlet, surviving_points, gray, timestamp_s, inliers, feature_count
+                accepted_outlet,
+                surviving_points,
+                gray,
+                timestamp_s,
+                inliers,
+                feature_count,
+                residual_px=residual_px,
             )
-        return self._enter_or_continue_bridge(timestamp_s, inliers, feature_count)
+        return self._enter_or_continue_bridge(
+            timestamp_s,
+            inliers,
+            feature_count,
+            residual_px=residual_px,
+            rejection_reason=rejection_reason,
+        )
+
+    def _background_veto(
+        self, candidate: np.ndarray, timestamp_s: float
+    ) -> tuple[float | None, str | None]:
+        """Stage 3, continuous-tracking path: over the last
+        ``background_motion_window_s``, has this cup candidate shown
+        genuine motion of its own, or is its cumulative displacement
+        exactly explained by background/camera motion alone?
+
+        Only ever a veto - an *available* background estimate with a real
+        signal to test against can reject a candidate the checks above
+        would otherwise accept; it never accepts one those checks reject,
+        and an unavailable, signal-free, or not-yet-full-window estimate
+        never changes the outcome at all (see
+        ``background_motion_min_signal_px``'s own docstring in
+        ``ZahnConfig``).
+
+        A *window*, not a single frame's displacement (Codex review: an
+        earlier, purely per-frame version of this check rejected clearly-
+        correct opaque-cup tracking at effectively random points in the
+        hand's own motion cycle - real hand-held motion oscillates, and its
+        instantaneous velocity crosses zero periodically, which looks
+        exactly like "no independent motion" even for a genuine, correctly
+        tracked cup at that instant). ``_motion_history`` (populated in
+        ``update()``) supplies the window's starting point.
+        """
+        background = self._last_background
+        if not background.available:
+            return None, None
+        window_s = self._config.background_motion_window_s
+        history = self._motion_history
+        if not history or timestamp_s - history[0][0] < window_s:
+            return None, None
+        origin_ts, origin_x, origin_y, origin_background_dx, origin_background_dy = history[0]
+        del origin_ts
+        background_window_dx = self._background.cumulative_dx - origin_background_dx
+        background_window_dy = self._background.cumulative_dy - origin_background_dy
+        background_speed = float(np.hypot(background_window_dx, background_window_dy))
+        if background_speed < self._config.background_motion_min_signal_px:
+            return None, None
+        cup_window_dx = float(candidate[0] - origin_x)
+        cup_window_dy = float(candidate[1] - origin_y)
+        residual = float(
+            np.hypot(cup_window_dx - background_window_dx, cup_window_dy - background_window_dy)
+        )
+        if residual < self._config.background_motion_min_residual_px:
+            return residual, "background_consistent"
+        return residual, None
 
     def _accept_tracked(
         self,
@@ -419,6 +787,8 @@ class OutletTracker:
         timestamp_s: float,
         inliers: int,
         feature_count: int,
+        *,
+        residual_px: float | None = None,
     ) -> TrackResult:
         cfg = self._config
         if self._last_confident_timestamp is not None:
@@ -428,6 +798,10 @@ class OutletTracker:
         self._outlet = outlet
         self._last_confident_outlet = outlet.copy()
         self._last_confident_timestamp = timestamp_s
+        self._last_confident_background_cumulative = (
+            self._background.cumulative_dx,
+            self._background.cumulative_dy,
+        )
         self._bridge_start_s = None
         self._state = TrackState.TRACKED
 
@@ -437,10 +811,21 @@ class OutletTracker:
                 points = fresh
         self._points = points
 
-        return self._result(TrackState.TRACKED, inliers=inliers, feature_count=feature_count)
+        return self._result(
+            TrackState.TRACKED,
+            inliers=inliers,
+            feature_count=feature_count,
+            residual_px=residual_px,
+        )
 
     def _enter_or_continue_bridge(
-        self, timestamp_s: float, inliers: int, feature_count: int
+        self,
+        timestamp_s: float,
+        inliers: int,
+        feature_count: int,
+        *,
+        residual_px: float | None = None,
+        rejection_reason: str | None = None,
     ) -> TrackResult:
         cfg = self._config
         if self._bridge_start_s is None:
@@ -448,23 +833,46 @@ class OutletTracker:
 
         bridge_elapsed = timestamp_s - self._bridge_start_s
         if self._last_confident_timestamp is None or bridge_elapsed > cfg.track_max_bridge_s:
-            return self._declare_lost(inliers, feature_count)
+            return self._declare_lost(
+                inliers, feature_count, residual_px=residual_px, rejection_reason=rejection_reason
+            )
 
         predicted = self._last_confident_outlet + self._velocity * (
             timestamp_s - self._last_confident_timestamp
         )
         if not self._within_bounds(predicted):
-            return self._declare_lost(inliers, feature_count)
+            return self._declare_lost(
+                inliers, feature_count, residual_px=residual_px, rejection_reason=rejection_reason
+            )
 
         self._outlet = predicted
         self._state = TrackState.PREDICTED
-        return self._result(TrackState.PREDICTED, inliers=inliers, feature_count=feature_count)
+        return self._result(
+            TrackState.PREDICTED,
+            inliers=inliers,
+            feature_count=feature_count,
+            residual_px=residual_px,
+            rejection_reason=rejection_reason,
+        )
 
-    def _declare_lost(self, inliers: int, feature_count: int) -> TrackResult:
+    def _declare_lost(
+        self,
+        inliers: int,
+        feature_count: int,
+        *,
+        residual_px: float | None = None,
+        rejection_reason: str | None = None,
+    ) -> TrackResult:
         self._state = TrackState.LOST
         self._points = None
         self._pending_reacquisition = None  # a fresh loss starts its own confirmation count
-        return self._result(TrackState.LOST, inliers=inliers, feature_count=feature_count)
+        return self._result(
+            TrackState.LOST,
+            inliers=inliers,
+            feature_count=feature_count,
+            residual_px=residual_px,
+            rejection_reason=rejection_reason,
+        )
 
     # -- lost/reacquisition branch ------------------------------------------ #
 
@@ -490,6 +898,15 @@ class OutletTracker:
         frame's worth of scrutiny, while a genuine reacquisition, sitting on
         the actual cup, keeps matching on the very next frame as a matter of
         course.
+
+        Stage 3 adds one more gate after the persistence check passes: the
+        candidate's *total* displacement since the last confident
+        observation must not be exactly explained by how far the
+        background/camera has moved over that same span (see
+        ``_background_veto_since_confident``) - the reacquisition-path
+        counterpart of ``_attempt_tracking``'s own veto, closing the same
+        circular-verification gap for template matching that the continuous
+        patch-correlation check already had for the similarity-transform fit.
         """
         candidate = self._match_reference_patch(gray)
         if candidate is None:
@@ -508,10 +925,32 @@ class OutletTracker:
             self._pending_reacquisition = candidate
             return self._result(TrackState.LOST, inliers=0, feature_count=0)
 
+        residual_px, rejection_reason = self._background_veto_since_confident(candidate)
+        if rejection_reason is not None:
+            # Background-consistent even after two independent frames
+            # agreeing with each other - still not proof it is the cup,
+            # only that it is not a one-off spurious match. Restart the
+            # persistence count from this candidate, the same as an
+            # inconsistent hit above: a later frame might yet show genuine
+            # residual motion once the candidate (or the true cup) actually
+            # moves independently of the camera.
+            self._pending_reacquisition = candidate
+            return self._result(
+                TrackState.LOST,
+                inliers=0,
+                feature_count=0,
+                residual_px=residual_px,
+                rejection_reason=rejection_reason,
+            )
+
         self._pending_reacquisition = None
         self._outlet = candidate
         self._last_confident_outlet = candidate.copy()
         self._last_confident_timestamp = timestamp_s
+        self._last_confident_background_cumulative = (
+            self._background.cumulative_dx,
+            self._background.cumulative_dy,
+        )
         self._velocity = np.zeros(2, dtype=np.float64)
         self._bridge_start_s = None
         self._state = TrackState.TRACKED
@@ -519,8 +958,45 @@ class OutletTracker:
 
         feature_count = 0 if self._points is None else len(self._points)
         return self._result(
-            TrackState.TRACKED, inliers=0, feature_count=feature_count, reacquired=True
+            TrackState.TRACKED,
+            inliers=0,
+            feature_count=feature_count,
+            reacquired=True,
+            residual_px=residual_px,
         )
+
+    def _background_veto_since_confident(
+        self, candidate: np.ndarray
+    ) -> tuple[float | None, str | None]:
+        """Stage 3, reacquisition path: does the candidate's *total*
+        displacement since the last confident observation have genuine
+        motion of its own, or is it exactly explained by how far the
+        background/camera has moved over that same span?
+
+        Mirrors ``_background_veto``'s continuous-tracking check, but
+        against the *cumulative* background offset since last confidence -
+        a reacquisition can follow an arbitrarily long gap, not just one
+        frame - using this tracker's own reference-patch template match,
+        not a fresh similarity fit.
+        """
+        background = self._last_background
+        if not background.available:
+            return None, None
+        cumulative_dx = (
+            self._background.cumulative_dx - self._last_confident_background_cumulative[0]
+        )
+        cumulative_dy = (
+            self._background.cumulative_dy - self._last_confident_background_cumulative[1]
+        )
+        background_speed = float(np.hypot(cumulative_dx, cumulative_dy))
+        if background_speed < self._config.background_motion_min_signal_px:
+            return None, None
+        cup_dx = float(candidate[0] - self._last_confident_outlet[0])
+        cup_dy = float(candidate[1] - self._last_confident_outlet[1])
+        residual = float(np.hypot(cup_dx - cumulative_dx, cup_dy - cumulative_dy))
+        if residual < self._config.background_motion_min_residual_px:
+            return residual, "background_consistent"
+        return residual, None
 
     def _match_reference_patch(self, gray: np.ndarray) -> np.ndarray | None:
         patch = self._reference_patch
@@ -625,8 +1101,11 @@ class OutletTracker:
         inliers: int,
         feature_count: int,
         reacquired: bool = False,
+        residual_px: float | None = None,
+        rejection_reason: str | None = None,
     ) -> TrackResult:
         offset = self._outlet - self._reference_outlet
+        background = self._last_background
         return TrackResult(
             state=state,
             outlet_x=float(self._outlet[0]),
@@ -636,4 +1115,9 @@ class OutletTracker:
             inliers=inliers,
             feature_count=feature_count,
             reacquired=reacquired,
+            background_dx=background.dx,
+            background_dy=background.dy,
+            background_available=background.available,
+            residual_px=residual_px,
+            rejection_reason=rejection_reason,
         )

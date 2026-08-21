@@ -495,6 +495,35 @@ def translucent_cup_near_distractor_zahn_video(
     return clip, distractor_center
 
 
+@pytest.fixture(scope="session")
+def translucent_cup_overlapping_distractor_zahn_video(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[HandheldClip, tuple[float, float]]:
+    """Stage 3's own regression case: a strongly-textured distractor patch
+    that already sits *under* the translucent cup at t=0, unlike
+    ``translucent_cup_near_distractor_zahn_video``'s "drifts near it later"
+    case - the worst case ``build_translucent_cup_clip`` exists for, and
+    the one diagnostics/stage1/STAGE1_REPORT.md's earlier rounds (§18.3,
+    §24.2) named as *not solvable* by patch-correlation verification alone,
+    since the reference patch itself would be extracted from the
+    distractor - "more of the same background, wherever it later appears"
+    (the checkerboard, still visible through the translucent cup at every
+    later frame, since it only moves with camera pan) answers that
+    verification correctly. Camera-motion compensation (Stage 3) is a
+    different kind of evidence - not "does this still look like the
+    reference," but "does this move independently of the background" - so
+    this is the fixture that actually exercises it, not merely a case
+    Stage 1's own checks already handled.
+    """
+    from ._synthetic_handheld import MARGIN, build_translucent_cup_clip
+
+    path = tmp_path_factory.mktemp("videos") / "translucent_overlapping_distractor.mp4"
+    width, height = 1080, 1920
+    clip = build_translucent_cup_clip(path, width=width, height=height)
+    distractor_center = (MARGIN + width / 2.0, MARGIN + height * 0.34)
+    return clip, distractor_center
+
+
 @pytest.fixture
 def broken_video(tmp_path: Path) -> Path:
     """A file with a video extension that is not a video at all."""

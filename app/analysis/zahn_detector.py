@@ -797,6 +797,41 @@ class _PreReferenceResult:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class _FrameEvidence:
+    """One frame's tracking verdict, ready to score - the common shape
+    every ``OutletTracker``-driven segment (pre-reference, between-anchors,
+    continuation) produces before calling ``_process_tracked_frame``,
+    whether it comes from a real ``TrackResult``, two reconciled ones
+    (``_reconcile_between_anchors``), or a hardcoded anchor frame that was
+    never run through a tracker at all.
+    """
+
+    state: TrackState
+    local_x: float
+    local_y: float
+    reacquired: bool = False
+    background_dx: float = 0.0
+    background_dy: float = 0.0
+    background_available: bool = False
+    residual_px: float | None = None
+    rejection_reason: str | None = None
+
+    @classmethod
+    def from_result(cls, result: TrackResult) -> _FrameEvidence:
+        return cls(
+            state=result.state,
+            local_x=result.outlet_x,
+            local_y=result.outlet_y,
+            reacquired=result.reacquired,
+            background_dx=result.background_dx,
+            background_dy=result.background_dy,
+            background_available=result.background_available,
+            residual_px=result.residual_px,
+            rejection_reason=result.rejection_reason,
+        )
+
+
 class ZahnCupDetector(BaseDetector):
     """Measures Zahn cup efflux time from a side-on recording."""
 
@@ -1024,10 +1059,7 @@ class ZahnCupDetector(BaseDetector):
         capture_gray: np.ndarray,
         sample_index: int,
         timestamp_s: float,
-        state: TrackState,
-        local_outlet_x: float,
-        local_outlet_y: float,
-        reacquired: bool,
+        evidence: _FrameEvidence,
         capture_roi: ROI,
         scale: float,
         scorer: StreamActivityScorer,
@@ -1038,7 +1070,7 @@ class ZahnCupDetector(BaseDetector):
         """Score one tracked frame and feed it into the shared scorer/state
         machine/trace/diagnostics log - the wide-capture (tracking-on) path.
 
-        ``local_outlet_x/y`` is the tracker's outlet position local to
+        ``evidence.local_x/y`` is the tracker's outlet position local to
         whichever ``capture_roi`` is currently in effect - which can change
         mid-run (a recentre re-anchors the search window - see
         ``_run_segment``). The returned ``offset_x/offset_y`` is therefore
@@ -1050,8 +1082,9 @@ class ZahnCupDetector(BaseDetector):
         diagnostic derived from ``offset_x/offset_y`` - use one formula
         regardless of how many recentres have happened.
         """
-        offset_x = capture_roi.x + local_outlet_x - self.outlet_xy[0]
-        offset_y = capture_roi.y + local_outlet_y - self.outlet_xy[1]
+        state = evidence.state
+        offset_x = capture_roi.x + evidence.local_x - self.outlet_xy[0]
+        offset_y = capture_roi.y + evidence.local_y - self.outlet_xy[1]
         trusted = state == TrackState.TRACKED
         scored: ScoreSample | None = None
         if state != TrackState.LOST:
@@ -1078,7 +1111,7 @@ class ZahnCupDetector(BaseDetector):
 
         if frames_log is not None:
             self._write_tracking_frame_log(
-                frames_log, timestamp_s, state, offset_x, offset_y, reacquired, trusted, capture_roi
+                frames_log, timestamp_s, offset_x, offset_y, trusted, capture_roi, evidence
             )
         return trusted, offset_x, offset_y
 
@@ -1179,29 +1212,19 @@ class ZahnCupDetector(BaseDetector):
         last_timestamp = self.start_s
         for sample in samples:
             if sample is reference_sample:
-                state, local_x, local_y, reacquired = (
-                    TrackState.TRACKED,
-                    reference_outlet_local[0],
-                    reference_outlet_local[1],
-                    False,
+                evidence = _FrameEvidence(
+                    state=TrackState.TRACKED,
+                    local_x=reference_outlet_local[0],
+                    local_y=reference_outlet_local[1],
                 )
             else:
-                result = backward_results[sample.index]
-                state, local_x, local_y, reacquired = (
-                    result.state,
-                    result.outlet_x,
-                    result.outlet_y,
-                    result.reacquired,
-                )
+                evidence = _FrameEvidence.from_result(backward_results[sample.index])
 
             _trusted, offset_x, offset_y = self._process_tracked_frame(
                 capture_gray=sample.image,
                 sample_index=sample.index,
                 timestamp_s=sample.timestamp_s,
-                state=state,
-                local_outlet_x=local_x,
-                local_outlet_y=local_y,
-                reacquired=reacquired,
+                evidence=evidence,
                 capture_roi=capture_roi,
                 scale=scale,
                 scorer=scorer,
@@ -1213,12 +1236,17 @@ class ZahnCupDetector(BaseDetector):
 
             if (
                 self.keep_diagnostics
-                and (state != last_state or reacquired)
+                and (evidence.state != last_state or evidence.reacquired)
                 and len(transitions) < MAX_DIAGNOSTIC_TRANSITIONS
             ):
-                last_state = state
+                last_state = evidence.state
                 entry = self._diagnostic_transition(
-                    sample.timestamp_s, state, offset_x, offset_y, reacquired, capture_roi
+                    sample.timestamp_s,
+                    evidence.state,
+                    offset_x,
+                    offset_y,
+                    evidence.reacquired,
+                    capture_roi,
                 )
                 if entry is not None:
                     transitions.append(entry)
@@ -1226,7 +1254,7 @@ class ZahnCupDetector(BaseDetector):
             if machine.finished:
                 machine.measurement.stopped_early = True
                 return _PreReferenceResult(
-                    status="finished", last_state=state, last_timestamp=last_timestamp
+                    status="finished", last_state=evidence.state, last_timestamp=last_timestamp
                 )
 
         try:
@@ -1286,7 +1314,7 @@ class ZahnCupDetector(BaseDetector):
 
     def _reconcile_between_anchors(
         self, forward: TrackResult, backward: TrackResult
-    ) -> tuple[TrackState, float, float, bool]:
+    ) -> _FrameEvidence:
         """Trust an interior frame between two anchors only when *both*
         directions independently agree it is tracked, and on where.
 
@@ -1299,17 +1327,64 @@ class ZahnCupDetector(BaseDetector):
         `lost` here, feeding the same untracked/uncertainty machinery a
         genuine loss already does - not a special "probably fine, it's
         between two anchors" exemption.
+
+        Background-motion diagnostics (Stage 3) are carried through from
+        whichever side actually has them to report - forward's own reading
+        when available, backward's otherwise, and either direction's own
+        ``rejection_reason`` if either was itself vetoed - so a frame lost
+        to reconciliation disagreement is still auditable, not just a bare
+        ``lost``.
         """
+        background_dx = (
+            forward.background_dx if forward.background_available else backward.background_dx
+        )
+        background_dy = (
+            forward.background_dy if forward.background_available else backward.background_dy
+        )
+        background_available = forward.background_available or backward.background_available
+        residual_px = (
+            forward.residual_px if forward.residual_px is not None else backward.residual_px
+        )
+        rejection_reason = forward.rejection_reason or backward.rejection_reason
+
         if forward.state is not TrackState.TRACKED or backward.state is not TrackState.TRACKED:
-            return TrackState.LOST, 0.0, 0.0, False
+            return _FrameEvidence(
+                state=TrackState.LOST,
+                local_x=0.0,
+                local_y=0.0,
+                background_dx=background_dx,
+                background_dy=background_dy,
+                background_available=background_available,
+                residual_px=residual_px,
+                rejection_reason=rejection_reason,
+            )
         displacement = float(
             np.hypot(forward.outlet_x - backward.outlet_x, forward.outlet_y - backward.outlet_y)
         )
         if displacement > self.config.track_reconciliation_max_disagreement_px:
-            return TrackState.LOST, 0.0, 0.0, False
+            return _FrameEvidence(
+                state=TrackState.LOST,
+                local_x=0.0,
+                local_y=0.0,
+                background_dx=background_dx,
+                background_dy=background_dy,
+                background_available=background_available,
+                residual_px=residual_px,
+                rejection_reason=rejection_reason,
+            )
         x = (forward.outlet_x + backward.outlet_x) / 2.0
         y = (forward.outlet_y + backward.outlet_y) / 2.0
-        return TrackState.TRACKED, x, y, forward.reacquired or backward.reacquired
+        return _FrameEvidence(
+            state=TrackState.TRACKED,
+            local_x=x,
+            local_y=y,
+            reacquired=forward.reacquired or backward.reacquired,
+            background_dx=background_dx,
+            background_dy=background_dy,
+            background_available=background_available,
+            residual_px=residual_px,
+            rejection_reason=rejection_reason,
+        )
 
     def _process_between_anchors_span(
         self,
@@ -1415,21 +1490,15 @@ class ZahnCupDetector(BaseDetector):
         frames_to_score = samples if include_early_frame else samples[1:]
         for sample in frames_to_score:
             if sample is early_sample:
-                state, local_x, local_y, reacquired = (
-                    TrackState.TRACKED,
-                    early_local[0],
-                    early_local[1],
-                    False,
+                evidence = _FrameEvidence(
+                    state=TrackState.TRACKED, local_x=early_local[0], local_y=early_local[1]
                 )
             elif sample is late_sample:
-                state, local_x, local_y, reacquired = (
-                    TrackState.TRACKED,
-                    late_local[0],
-                    late_local[1],
-                    False,
+                evidence = _FrameEvidence(
+                    state=TrackState.TRACKED, local_x=late_local[0], local_y=late_local[1]
                 )
             else:
-                state, local_x, local_y, reacquired = self._reconcile_between_anchors(
+                evidence = self._reconcile_between_anchors(
                     forward_results[sample.index], backward_results[sample.index]
                 )
 
@@ -1437,10 +1506,7 @@ class ZahnCupDetector(BaseDetector):
                 capture_gray=sample.image,
                 sample_index=sample.index,
                 timestamp_s=sample.timestamp_s,
-                state=state,
-                local_outlet_x=local_x,
-                local_outlet_y=local_y,
-                reacquired=reacquired,
+                evidence=evidence,
                 capture_roi=capture_roi,
                 scale=scale,
                 scorer=scorer,
@@ -1452,12 +1518,17 @@ class ZahnCupDetector(BaseDetector):
 
             if (
                 self.keep_diagnostics
-                and (state != last_state or reacquired)
+                and (evidence.state != last_state or evidence.reacquired)
                 and len(transitions) < MAX_DIAGNOSTIC_TRANSITIONS
             ):
-                last_state = state
+                last_state = evidence.state
                 entry = self._diagnostic_transition(
-                    sample.timestamp_s, state, offset_x, offset_y, reacquired, capture_roi
+                    sample.timestamp_s,
+                    evidence.state,
+                    offset_x,
+                    offset_y,
+                    evidence.reacquired,
+                    capture_roi,
                 )
                 if entry is not None:
                     transitions.append(entry)
@@ -1465,7 +1536,7 @@ class ZahnCupDetector(BaseDetector):
             if machine.finished:
                 machine.measurement.stopped_early = True
                 return _PreReferenceResult(
-                    status="finished", last_state=state, last_timestamp=last_timestamp
+                    status="finished", last_state=evidence.state, last_timestamp=last_timestamp
                 )
 
         try:
@@ -2196,21 +2267,20 @@ class ZahnCupDetector(BaseDetector):
             local_outlet_x = local_outlet_y = 0.0
             offset_x = offset_y = 0.0
             reacquired = False
+            evidence = _FrameEvidence(state=state, local_x=local_outlet_x, local_y=local_outlet_y)
             if tracker is not None:
                 result = tracker.update(capture_gray, sample.timestamp_s)
                 state = result.state
                 local_outlet_x, local_outlet_y = result.outlet_x, result.outlet_y
                 reacquired = result.reacquired
+                evidence = _FrameEvidence.from_result(result)
 
             if wide_capture:
                 _trusted, offset_x, offset_y = self._process_tracked_frame(
                     capture_gray=capture_gray,
                     sample_index=sample.index,
                     timestamp_s=sample.timestamp_s,
-                    state=state,
-                    local_outlet_x=local_outlet_x,
-                    local_outlet_y=local_outlet_y,
-                    reacquired=reacquired,
+                    evidence=evidence,
                     capture_roi=capture_roi,
                     scale=scale,
                     scorer=scorer,
@@ -2374,23 +2444,37 @@ class ZahnCupDetector(BaseDetector):
         self,
         frames_log: TextIO,
         timestamp_s: float,
-        state: TrackState,
         offset_x: float,
         offset_y: float,
-        reacquired: bool,
         trusted: bool,
         capture_roi: ROI,
+        evidence: _FrameEvidence,
     ) -> None:
         geometry = self._tracked_geometry(offset_x, offset_y)
         roi, guard_roi = geometry if geometry is not None else (None, None)
         record = {
             "timestamp_s": round(timestamp_s, 3),
-            "state": state.value,
+            "state": evidence.state.value,
             "trusted": trusted,
-            "reacquired": bool(reacquired),
+            "reacquired": bool(evidence.reacquired),
             "search_roi": capture_roi.to_dict(),
             "roi": roi.to_dict() if roi is not None else None,
             "guard_roi": guard_roi.to_dict() if guard_roi is not None else None,
+            # Stage 3 camera-motion compensation - see OutletTracker's
+            # module docstring and _BackgroundMotionEstimator. The frame's
+            # independently-estimated background/camera motion, the cup
+            # candidate's residual once that motion is subtracted out (only
+            # ever populated when there was a background signal to compare
+            # against), and *why* a frame that would otherwise have been
+            # accepted was not - together enough to audit a real run's
+            # background-through-cup rejections frame by frame.
+            "background_available": evidence.background_available,
+            "background_dx": round(evidence.background_dx, 3),
+            "background_dy": round(evidence.background_dy, 3),
+            "residual_px": (
+                round(evidence.residual_px, 3) if evidence.residual_px is not None else None
+            ),
+            "rejection_reason": evidence.rejection_reason,
         }
         try:
             frames_log.write(json.dumps(record) + "\n")
@@ -2881,6 +2965,10 @@ def _zahn_config_to_dict(config: ZahnConfig) -> dict[str, Any]:
             "track_reacquire_min_correlation",
             "track_min_patch_correlation",
             "track_reconciliation_max_disagreement_px",
+            "background_motion_min_features",
+            "background_motion_min_signal_px",
+            "background_motion_min_residual_px",
+            "background_motion_window_s",
             "zahn_max_endpoint_uncertainty_s",
         )
     }
