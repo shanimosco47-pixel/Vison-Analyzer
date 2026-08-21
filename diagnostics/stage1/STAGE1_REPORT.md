@@ -11,7 +11,12 @@ gaps plus two minor issues (§9); all were addressed and re-validated
 (§10). A third review round found one remaining blocking gap in that
 fix's own semantics (§12); it was addressed and re-validated (§13). A
 fourth review round found a state-timing bug in *that* fix (§14); it is
-addressed and re-validated (§15). Sections 1–5 are the original Stage 1
+addressed and re-validated (§15). A fifth, independent verification round
+found and closed two reproducibility gaps (§16). A real hand-held clip was
+then supplied for the first time and **fails the real-footage acceptance
+criterion** at the current head; §17 is the diagnosis and a proposed
+design, stopped here for review before any implementation, per instruction.
+Sections 1–5 are the original Stage 1
 submission, left as-is as the historical record of the first round;
 §6–§8 cover the first round's fixes; §9–§10 cover the second; §12–§13
 cover the third; §14–§15 cover the fourth.
@@ -854,3 +859,197 @@ Windows machine is available in this environment - **exact clean-environment
 Windows pass/skip counts, and confirmation of the NumPy bound against the
 originally-reported 2.5.2, remain to be run by the supervisor** on their
 own Windows/clean-venv setup, as neither is reproducible from here.
+
+## 17. First real-footage validation — reopened, diagnosis and proposed design (not yet implemented)
+
+A real hand-held clip (`20260820_184144.mp4`, 1080×1920 portrait, 811
+frames, 30.0028 fps, 27.03 s) was supplied for the first time and run
+against `c1d091f`. It fails: `FAILED` status, no start/end/duration,
+806–811 of 811 (or 671–676 of 676) frames untracked depending on params.
+Manual frame review puts the true flow window at roughly 3.8–20.6 s
+(efflux ≈ 16.6 s ± 0.2 s review uncertainty). Two blockers were named. This
+section is the diagnosis and a proposed design for both, **stopped here
+before any implementation**, per the instruction not to attempt a broad
+rewrite without review. No production or test code changed in this round -
+only this report.
+
+### 17.1 — Blocker 1: the frame-picker's timestamp never reaches the backend
+
+**Confirmed by reading the code.** `loadFrameFromPreview()`
+(`app/web/static/app.js:371`) stores the picker frame's timestamp in
+`state.frameTime`, but `collectParams()` (`app/web/static/app.js:492`)
+never reads it - only `state.outlet`/`state.roi` are sent.
+`ZahnCupDetector.configure()` (`app/analysis/zahn_detector.py:749`) takes
+those coordinates as `self.outlet_xy` with no associated timestamp, and
+`run()` constructs the `OutletTracker` on the *first* decoded sample -
+i.e. at `analysis_start_s` (default `0.0`), never at whatever frame the
+user actually looked at. A mark made on a later preview frame is silently
+reinterpreted as a mark on frame 0 (or whatever `analysis_start_s` is).
+
+**Synthetically confirmed, with a second, deeper mechanism found in the
+process.** A portrait (1080×1920), resolution-scaled synthetic clip (see
+`build_handheld_clip` in `tests/_synthetic_handheld.py`, `camera_drift_px`/
+`hand_drift_px`/`tremor_px` scaled ×2.25 to represent the same real-world
+motion at higher pixel density; ground truth `flow_start_s=3.9`) was run
+three ways:
+
+| scenario | `outlet` marked at | `analysis_start_s` | result |
+| --- | --- | --- | --- |
+| A (baseline) | t=0 (matches default) | 0 (default) | confirmed, 0.98 confidence, `flow_start_s=3.9` - correct |
+| B (the reported bug) | t=4.5 s | 0 (unchanged - the bug) | confirmed, 0.98 confidence, `flow_start_s=3.9` - correct *in this run*, because the t=0→t=4.5 drift in this synthetic clip (≈26 px) was small enough for the tracker to self-correct from a slightly wrong anchor. **This does not mean the bug is harmless** - see the real clip's reported 800+/811 untracked frames, which implies drift far larger than 26 px; the synthetic clip's drift magnitude was a rough estimate, not measured from the real footage, so scenario B under-reproduces the real severity. It reproduces the *mechanism*, not the *magnitude*. |
+| C (the user's attempted workaround) | t=4.5 s | 4.5 (matched) | **`status=review`, `flow_start_s=20.0`, `flow_end_s=26.97`, `efflux_seconds=6.97`** - wrong by roughly 15 s against the true 3.9 s start, with `confidence=0.5` and reason "video ended while liquid was still visible." Silently, badly wrong - not just imprecise. |
+
+Scenario C is the important one: it reproduces the report's "starting there
+can discard or contaminate the true start" concretely, and running it down
+found the actual mechanism, distinct from the tracking/geometry question
+in §17.2 below - **`StreamActivityScorer`'s background model**
+(`app/analysis/zahn_detector.py:216-224`):
+
+```python
+if self._background is None:
+    self._background = current.copy()
+    return ScoreSample(value=0.0, extras={"outlet_score": 0.0, "noise_sigma": 0.0})
+```
+
+The very first frame the scorer ever sees becomes the "empty cup"
+baseline, unconditionally - there is a real safeguard against the stream
+ever being absorbed into the background afterward (line 268: "the
+background is only refreshed while nothing is happening, so the stream
+can never dissolve into the reference image"), but that safeguard begins
+only from the *second* frame. If `analysis_start_s` lands after flow has
+already started - exactly what happens when a user sets it to the first
+frame where the outlet becomes markable, because the outlet was not
+markable any earlier - the first frame already shows the stream, so the
+stream itself becomes "background," and the scorer stops seeing it as
+liquid for as long as it stays in the same place. Scenario C's continuous
+stream (3.9-20.0 s) sits still relative to the tracked crop and gets
+absorbed; the intermittent drops after 20.0 s move to a new position each
+frame and stand out against the (now stream-shaped) background, which is
+why detection only picks up around t≈20.0 - matching the observed
+`flow_start_s=20.0` exactly.
+
+**This is the load-bearing finding for the design below:** fixing only the
+outlet-coordinate/reference-frame mismatch is not sufficient. Any design
+that lets `analysis_start_s` (i.e. where scoring/background-model decoding
+begins) land after flow has already started will keep producing this
+failure mode, independent of whether the tracker itself is correctly
+anchored.
+
+### 17.2 — Blocker 2: tracking not robust on this real cup/reframing
+
+Even with `analysis_start_s=4.5` and matching coordinates, the supervisor
+reports the tracker goes untracked almost immediately (671/676 untracked,
+4 liquid frames) - a different failure from §17.1's background-model
+problem, since that scenario already has the coordinates and start time
+consistent with each other.
+
+**What was checked and ruled out:** the ROI/guard/cup-feature-search-box
+geometry (`default_roi_width_px=60`, `guard_margin_px=40`,
+`track_search_margin_px=80` - all fixed absolute pixels, independent of
+`video.width`/`video.height`) was a plausible suspect, since the real clip
+is 1080×1920 versus this project's ~480×360 synthetic fixtures. Testing a
+resolution-scaled synthetic clip at the real clip's exact resolution with
+proportionally scaled camera/hand drift (scenario A above) tracked
+cleanly - 0 untracked frames, 0.98 confidence. **The fixed-pixel geometry
+constants are not, by themselves, sufficient to reproduce a tracking
+failure at this resolution and this drift magnitude.** That does not clear
+them entirely (the real clip's actual drift magnitude and cup pixel size
+are unknown here - "large early reframing" could still exceed what was
+tested), but it means resolution alone is not the likely root cause.
+
+**What could not be checked here:** the real clip's outlet region is
+described as "low-texture translucent cup" - material behaviour
+(translucency, refraction as liquid moves behind/through the cup wall,
+low local contrast) that this project's synthetic generator does not
+attempt to model (its cup is a flat, opaque intensity block plus a rim and
+handle, added in an earlier round specifically to *avoid* too few
+trackable corners - see the Codex-review §6.1 fixture fix). Whether
+`cv2.goodFeaturesToTrack`'s corner detection genuinely cannot find enough
+stable corners on real translucent material, or whether frame-to-frame LK
+correspondence is unstable under real refraction/reflection changes, or
+whether `track_min_features=12`/`track_min_inliers=6`/
+`track_reacquire_min_correlation=0.6` are simply mistuned for this
+material, cannot be determined without either the real clip or a
+synthetic fixture that actually models low-texture/translucent rendering
+- neither of which exists yet.
+
+**Recommended next step, not yet done:** the streamed per-frame
+diagnostics built this session (`diagnostics_dir`, §6.5/§9.5) exist
+precisely for this - re-running the real clip with diagnostics enabled
+would show, frame by frame, the tracked outlet position, search window,
+scoring ROI, state and reacquisition decisions, which would show *where
+and why* tracking is failing (feature count trending to zero? RANSAC
+inlier count collapsing? reacquisition never clearing
+`track_reacquire_min_correlation`?) rather than guessing from aggregate
+counts. That diagnosis has to happen against the real clip or an
+accurately modelled synthetic one; it was not attempted here since the
+clip is not available in this environment and a low-texture/translucent
+synthetic model does not exist yet to build one from.
+
+### 17.3 — Proposed design for §17.1 (recommended: correctable within Stage 1)
+
+The key insight from §17.1's investigation: the fix does **not** need
+bidirectional/backward tracking or a second decode pass. It can reuse the
+gap-uncertainty machinery already built and tested this stage (§6.3, §9.3,
+§12.1, §14.1) almost unchanged:
+
+1. **Wire the timestamp through.** `loadFrameFromPreview()` already has
+   the picker frame's timestamp; `collectParams()` needs to send it
+   alongside `outlet`/`roi` as a new field (e.g. `outlet_reference_s`).
+   `ZahnCupDetector.configure()` reads it, defaulting to `analysis_start_s`
+   when absent (preserves today's behaviour for direct API callers that
+   don't supply it - no breaking change to the params contract).
+2. **Do not move where scoring/decoding starts.** The sampling plan keeps
+   spanning `[analysis_start_s, analysis_end_s]` exactly as today - this
+   is what keeps `StreamActivityScorer`'s background model calibrating on
+   a genuinely quiet frame (§17.1's finding) rather than moving the
+   corruption to a different starting point.
+3. **Delay tracker construction until the reference frame, not the first
+   sample.** `_run_loop`'s `if first_frame:` block currently constructs
+   `OutletTracker` unconditionally on the very first decoded sample. It
+   would instead wait until `sample.timestamp_s >= outlet_reference_s`,
+   constructing the tracker there with the user's (now correctly matched)
+   coordinates. Samples before that point have no tracker yet - fed to
+   `machine.update(..., trusted=False)` with a zero-value sample, exactly
+   like an ordinary untracked/`lost` span today. `TrackerInitError` at the
+   reference frame is handled exactly as it is now (§6.2/§9.2): loud
+   `FAILED`, no confirmed measurement, only `zahn_track_outlet=False` may
+   fall back.
+4. **Let the existing uncertainty machinery do the rest.** If the true
+   flow start falls before the reference frame - exactly this clip's
+   situation - it now sits inside a leading "gap" the same shape as any
+   other untracked span. `start_uncertain`/`start_uncertainty_bounds`
+   (§6.3) already exist to handle precisely this: report a bounded,
+   honestly-uncertain start (`[analysis_start_s, outlet_reference_s]` at
+   worst) rather than either a wrong precise number (§17.1's scenario C)
+   or a silent failure (§17.1's scenario B pattern on the real clip's true
+   drift magnitude).
+
+This is a bounded, comprehensible change confined to: one frontend field,
+one new detector param with a backward-compatible default, and a
+restructure of *when* (not *whether*) `_run_loop` constructs the tracker.
+It does not touch `OutletTracker` itself, the state machine's core logic,
+or introduce a second decode pass. **Recommendation: implementable within
+Stage 1's existing scope**, pending review of this design.
+
+### 17.4 — Scope recommendation
+
+* **§17.1 (frame-picker/reference-frame semantics): Stage 1-correctable.**
+  Proposed design above; requires review before implementation, not a
+  scope decision.
+* **§17.2 (real low-texture/translucent-cup tracking robustness): scope
+  currently undetermined.** Could not be reproduced or root-caused from
+  here without either the real clip or an accurately-modelled synthetic
+  low-texture/translucent fixture. Depending on what the recommended
+  per-frame diagnostics run turns up, this may be a parameter-tuning fix
+  within Stage 1, or it may be exactly the "continuity/contrast-anchor
+  tracing" and motion-robustness work Stage 0 already scoped out to Stage
+  2/3 (§4.3 of this report, and Stage 0's own recommendation). **No claim
+  either way is made here** - this needs either the real clip run through
+  the streamed diagnostics, or an explicit decision to treat it as a
+  Stage 2/3 question without further synthetic diagnosis.
+
+**Not implementing either fix in this round**, per instruction: stopping
+for review of this diagnosis and the §17.3 design before any code change.
+PR #4 stays draft, unmerged; the real-footage criterion is **not** claimed
+to pass.
