@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 
 from app.analysis.zahn_detector import ZahnCupDetector
+from app.services.event_log import build_event_log, summarise
 from app.video.metadata import probe_video
 from app.video.reader import VideoReader
 
@@ -42,6 +43,24 @@ def _run(video_path, outlet_xy, **params):
     )
     with VideoReader(video_path, info) as reader:
         return detector.run(reader)
+
+
+def _assert_no_precise_duration_leaks(result) -> None:
+    """Codex review: Event.duration_s is always end_s - start_s, computed by
+    the shared Event/EventLog contract regardless of what a detail dict
+    says. An uncertain measurement must not produce an Event at all -
+    checked here at every layer a UI, API or CSV export could read a
+    duration from, not only the events list itself.
+    """
+    assert result.events == []
+    assert result.to_dict()["events"] == []
+    log = build_event_log(result.events, video=None)
+    assert log.rows() == []
+    csv_lines = [line for line in log.to_csv().splitlines() if line]
+    assert len(csv_lines) == 1  # header only - no data row carrying a duration
+    counts = summarise(result.events)
+    assert counts["total"] == 0
+    assert counts["total_active_seconds"] == 0
 
 
 @pytest.fixture(scope="session")
@@ -127,6 +146,17 @@ class TestBreakDuringATrackingGap:
         bounds_lo, bounds_hi = summary["efflux_seconds_bounds"]
         assert bounds_lo <= clip.efflux_s <= bounds_hi
 
+    def test_no_event_is_emitted_for_an_uncertain_measurement(self, handheld_gap_zahn_video):
+        """Codex review: Event.duration_s is precise regardless of `details`.
+
+        The bounded candidate stays visible in the summary; it must not also
+        reach the events list, DetectorResult.to_dict(), the CSV export, or
+        the review-count totals as a precise, confirmed-shaped occurrence.
+        """
+        clip = handheld_gap_zahn_video
+        result = _run(clip.path, clip.outlet_at_reference)
+        _assert_no_precise_duration_leaks(result)
+
     def test_fixed_roi_cannot_see_through_the_same_gap_either(self, handheld_gap_zahn_video):
         """Sanity check: the gap is real footage, not a tracking-only artefact."""
         clip = handheld_gap_zahn_video
@@ -167,18 +197,20 @@ class TestBreakDuringATrackingGapAtStart:
         assert summary["status"] == "review"
         assert summary["confidence"] <= 0.5
 
-    def test_the_event_is_preserved_for_review_without_a_precise_duration(
+    def test_no_event_is_emitted_for_an_uncertain_measurement(
         self, handheld_gap_at_start_zahn_video
     ):
-        """Codex review: preserve a candidate, but never present it as precise."""
+        """Codex review: Event.duration_s is precise regardless of `details`.
+
+        A first fix suppressed only ``details["efflux_seconds"]`` on the
+        Event - but Event.duration_s is always end_s - start_s, computed by
+        the shared Event/EventLog contract, and reaches the CSV export and
+        review-count totals independently of `details`. The candidate stays
+        visible in the summary; it must not also reach the events list.
+        """
         clip = handheld_gap_at_start_zahn_video
         result = _run(clip.path, clip.outlet_at_reference)
-        assert len(result.events) == 1
-        event = result.events[0]
-        assert event.status.value == "review"
-        assert event.details["efflux_seconds"] is None
-        assert event.details["efflux_seconds_bounds"] is not None
-        assert event.details["start_uncertain"] is True
+        _assert_no_precise_duration_leaks(result)
 
 
 class TestTrackingInitFailure:

@@ -97,10 +97,16 @@ _MIN_INIT_FEATURES = 4
 class TrackerInitError(Exception):
     """Raised when the initial frame has too little texture to track at all.
 
-    Callers should treat this as "tracking is not usable for this recording"
-    and fall back to the fixed-ROI path - the same behaviour as
-    ``zahn_track_outlet=False`` - rather than run a tracker that can never
-    lock on.
+    While ``zahn_track_outlet=True`` (the default), a caller must treat this
+    as a hard failure - report it with an explicit reason and no confirmed
+    measurement - not fall back to the fixed-ROI path. That path is the
+    known-bad geometry this stage exists to move away from, and using it
+    silently on the exact condition tracking could not even start under
+    would guess under precisely the circumstance guessing is meant to be
+    refused. Falling back to fixed geometry is available only via an
+    explicit ``zahn_track_outlet=False`` - a caller choice made before
+    tracking was ever attempted, not a reaction to this exception. See
+    ``ZahnCupDetector._tracking_unavailable_result``.
     """
 
 

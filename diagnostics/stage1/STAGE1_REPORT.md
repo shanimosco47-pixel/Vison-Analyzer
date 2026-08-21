@@ -5,10 +5,12 @@ comment on PR #4 (2026-08-20). **This is not ready to merge as a final
 review** — it is the evidence package for Codex review, on a still-draft PR.
 
 **Update, same PR:** the first Codex review round asked for five specific
-changes (§6). All five are implemented, tested, and re-validated (§7) in
-this revision. Sections 1–5 below are the original Stage 1 submission,
-left as-is as the historical record of what that round reviewed; §6–§8
-cover what changed since.
+changes (§6). All five were implemented, tested, and re-validated (§7).
+A second review round of that revision found three remaining blocking
+gaps plus two minor issues (§9); all are addressed and re-validated (§10).
+Sections 1–5 are the original Stage 1 submission, left as-is as the
+historical record of the first round; §6–§8 cover the first round's
+fixes; §9–§10 cover the second.
 
 Product decision in force (final, per the approval comment): single Zahn
 mode, outlet tracking on by default, `zahn_track_outlet` as a config-only
@@ -425,3 +427,164 @@ a time, never accumulated.
 * `app/services/analysis_service.py::AnalysisService._run_job` (§6.5) —
   `diagnostics_dir` is only ever injected server-side, gated on the
   operator config flag, never accepted as a request param.
+
+## 9. Second Codex review round — three blocking gaps, addressed
+
+Codex re-reviewed `c0e4cc8` (§6–§8's revision): the five original findings
+were substantially addressed, but re-review surfaced three remaining
+blocking gaps, plus two minor issues. All five are fixed below.
+
+### 9.1 — An uncertain measurement still produced an Event with a precise `duration_s`
+
+**Finding:** §6.4's fix set `details["efflux_seconds"]` to `null` on the
+`Event`, but `Event.duration_s` is a property computed fresh as
+`end_s - start_s`, independent of `details` — and it is what
+`Event.to_dict()` serializes, what `EventLog.rows()` (and therefore the
+CSV export) reads, and what `summarise()` sums into
+`total_active_seconds`. The uncertainty flag existed on the Event but
+nothing in the shared Event/EventLog contract actually respected it, so a
+precise duration was still reachable through every one of those paths.
+
+**Fix, exactly as Codex's own suggested direction:** rather than change the
+shared `Event` contract (used by every detector) to support a genuinely
+unknown/bounded duration, `_build_result()` now emits **no `Event` at all**
+when `measurement.start_uncertain or measurement.end_uncertain`. The
+bounded candidate remains fully visible in `summary`
+(`flow_start_s`/`flow_end_s`/`efflux_seconds_bounds`/`start_uncertain`/
+`end_uncertain`) — nothing about being able to inspect an uncertain
+measurement was lost — it simply never becomes an `Event` a downstream
+consumer (UI, API, CSV, event count) could mistake for a confirmed
+occurrence.
+
+**Evidence:** both `TestBreakDuringATrackingGap` (end-uncertain) and
+`TestBreakDuringATrackingGapAtStart` (start-uncertain) in
+`tests/test_zahn_tracking_integration.py` now include
+`test_no_event_is_emitted_for_an_uncertain_measurement`, using a shared
+`_assert_no_precise_duration_leaks()` helper that checks, at every layer
+Codex named: `result.events == []`, `DetectorResult.to_dict()["events"] ==
+[]`, `build_event_log(...).rows() == []`, the CSV export has no data row,
+and `summarise(...)["total_active_seconds"] == 0`.
+
+### 9.2 — `diagnostics_dir` was a client-controlled filesystem write path
+
+**Finding:** `POST /analyses` forwards its `params` dict essentially
+unchanged; `AnalysisService.submit` stored it on the job; and
+`ZahnCupDetector.configure()` read `params["diagnostics_dir"]` straight
+through — so `_open_tracking_frames_log()` would `mkdir`/write wherever a
+caller named, even with `AppConfig.save_diagnostics` off. A caller could
+choose any writable server path.
+
+**Fix:** `analysis_service.py` gained `RESERVED_PARAM_KEYS = {"diagnostics_dir"}`
+and `_sanitize_params()`, applied in `submit()` **before** the detector is
+even constructed for planning and **before** the value is stored on
+`job.params` — a request can no longer get this key queued at all, let
+alone acted on. `_run_job()` was also hardened to assign (not merely
+`setdefault`) `diagnostics_dir` from `AppConfig.diagnostics_dir` only when
+`self.config.save_diagnostics` is on, popping any stray key first — belt
+and suspenders on top of the earlier sanitization.
+
+**Evidence:** two new regression tests in `tests/test_web.py`:
+`test_a_submitted_diagnostics_dir_is_stripped_and_cannot_write_anywhere`
+posts a `diagnostics_dir` pointed at an attacker-chosen `tmp_path`
+directory against a default (`save_diagnostics=False`) app, and asserts
+both that the stored job's params never contain the key and that the
+directory is never created; `test_diagnostics_dir_stays_server_owned_even_with_diagnostics_enabled`
+does the same against a `save_diagnostics=True` app and additionally
+confirms the legitimate frames log is written under the server's own
+`AppConfig.diagnostics_dir / job_id` instead.
+
+### 9.3 — A long tracking gap in the *middle* of flow was forgotten once liquid returned
+
+**Finding:** `FlowStateMachine._update_flowing` cleared `_gap_after_activity`
+the instant fresh trusted liquid arrived. A gap wider than
+`zahn_max_endpoint_uncertainty_s` occurring mid-flow — liquid before,
+liquid after, then a later, ordinary end — left no trace by the time that
+end was confirmed, so the result came back `CONFIRMED` even though a span
+long enough to lose confidence in had gone unobserved. This conflicts with
+the acceptance criterion that a measurement be invalid/unconfirmed when
+tracking is lost longer than the defined duration, wherever in the run
+that happens.
+
+**Fix:** `FlowStateMachine` gained `_unresolved_flow_gap`, set once (the
+first qualifying gap only, never overwritten) whenever a gap closes while
+flowing and exceeds `zahn_max_endpoint_uncertainty_s` — and, unlike
+`_gap_after_activity`, deliberately **never cleared** by subsequent trusted
+liquid. When an end is eventually confirmed, both signals are combined:
+if either the immediately-adjacent gap or any earlier unresolved one
+qualifies, `end_confirmed` is forced `False`, `end_uncertain` is set, and
+`end_uncertainty_bounds` becomes the widest span covering whichever
+qualifying gap(s) were seen.
+
+**Evidence:** new `TestUntrackedGapsDuringFlow` in
+`tests/test_zahn_state_machine.py` (fast, unit-level — no video decoding,
+`FlowStateMachine.update(..., trusted=False)` fed directly): a >0.5 s
+untracked gap in the middle of an otherwise clean run (liquid before,
+liquid after, a later normal end) now reports `end_confirmed=False`,
+`end_uncertain=True`, with bounds bracketing the mid-flow gap even though
+the reported `end_s` itself is unchanged; a companion test confirms a
+short (<0.5 s) mid-flow gap does *not* taint the result, isolating the
+behaviour to gap width, not position.
+
+### 9.4 — Minor: stale `TrackerInitError` docstring
+
+**Finding:** the docstring still instructed callers to "fall back to the
+fixed-ROI path" — exactly the behaviour §6.2 removed.
+
+**Fix:** rewritten to state the actual (and only sanctioned) contract:
+report failure with no confirmed measurement while `zahn_track_outlet=True`;
+the fixed-ROI path is available only via an explicit
+`zahn_track_outlet=False` set before tracking was ever attempted, never as
+a reaction to this exception.
+
+### 9.5 — Minor: the frames log wrote each line but did not flush as claimed
+
+**Finding:** `_open_tracking_frames_log()`'s docstring said lines are
+"written and flushed... as the run progresses," but `_write_tracking_frame_log()`
+only called `.write()` — Python's own buffering could hold lines back for
+an arbitrary, unbounded time, so the file was not actually inspectable
+mid-run the way the report claimed.
+
+**Fix:** added an explicit `frames_log.flush()` after every write, so the
+claim is now literally true rather than merely aspirational.
+
+## 10. Re-validation after the second round's fixes
+
+```
+python -m pytest          336 passed        (previous: 331 passed, 0 failed)
+python -m ruff check .    All checks passed
+python -m ruff format --check .   all files already formatted
+python -m mypy app        Success: no issues found in 29 source files
+node --test tests_js/*.test.js   44 pass, 0 fail
+```
+
+5 new tests this round: 2 in `test_zahn_state_machine.py` (§9.3), 1 in
+`test_zahn_tracking_integration.py` (§9.1 — `TestBreakDuringATrackingGap`
+gained a no-Event assertion; `TestBreakDuringATrackingGapAtStart`'s
+existing Event test was rewritten in place rather than added to), 2 in
+`test_web.py` (§9.2).
+
+**Runtime**, same `handheld_zahn_video` fixture, 3 trials each, after this
+round's fixes (the new per-frame `flush()` call from §9.5 is the only
+change with any plausible runtime cost):
+
+| | mean elapsed | trials |
+| --- | --- | --- |
+| no `diagnostics_dir` | 0.880 s | 0.940 / 0.861 / 0.838 |
+| with `diagnostics_dir` (now flushed per line) | 0.897 s | 0.898 / 0.872 / 0.921 |
+
+Consistent with the first round's measurements (§7) — no regression;
+flushing every line costs roughly 2% over the already-negligible
+streaming overhead, still comfortably within run-to-run noise.
+
+## 11. What to look for in this round's review
+
+* `app/analysis/zahn_detector.py::ZahnCupDetector._build_result` (§9.1) —
+  the Event-creation condition now includes `not uncertain`; `summary`
+  still carries the full bounded candidate.
+* `app/services/analysis_service.py::_sanitize_params` /
+  `AnalysisService.submit` / `_run_job` (§9.2) — sanitization happens
+  before the job is even constructed, not only before the detector runs.
+* `app/analysis/zahn_detector.py::FlowStateMachine._unresolved_flow_gap`
+  (§9.3) — set once, on the first qualifying gap, and specifically **not**
+  cleared by `_update_flowing`'s liquid-resumes branch (contrast with
+  `_gap_after_activity` just above it, which still is).

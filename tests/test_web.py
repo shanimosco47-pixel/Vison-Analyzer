@@ -206,6 +206,90 @@ class TestAnalysisJobs:
         assert summary["efflux_seconds"] == pytest.approx(zahn_video.truth["efflux_s"], abs=0.5)
         assert summary["status"] in {"confirmed", "review"}
 
+    def test_a_submitted_diagnostics_dir_is_stripped_and_cannot_write_anywhere(
+        self, client, app, zahn_video, tmp_path
+    ):
+        """Codex review: diagnostics_dir chooses a filesystem write path.
+
+        POST /analyses forwards its params dict essentially unchanged; a
+        detector reading params["diagnostics_dir"] straight through would
+        let any caller point the analysis pipeline's writes at any path the
+        server process can write to. It must be stripped before the request
+        is even queued, regardless of whether the server operator has
+        diagnostics enabled.
+        """
+        attacker_target = tmp_path / "attacker_chosen_directory"
+        video_id = upload(client, zahn_video.path).get_json()["video_id"]
+        started = client.post(
+            "/api/analyses",
+            json={
+                "video_id": video_id,
+                "mode": "zahn_cup",
+                "params": {
+                    "outlet": {
+                        "x": int(zahn_video.truth["outlet_x"]),
+                        "y": int(zahn_video.truth["outlet_y"]),
+                    },
+                    "diagnostics_dir": str(attacker_target),
+                },
+            },
+        ).get_json()
+
+        # Stripped before the job is even stored, not merely unused at run time.
+        service = app.extensions["analysis_service"]
+        stored_job = service.get(started["job_id"])
+        assert "diagnostics_dir" not in stored_job.params
+
+        finished = wait_for_job(client, started["job_id"])
+        assert finished["status"] == "complete"
+        assert not attacker_target.exists()
+
+    def test_diagnostics_dir_stays_server_owned_even_with_diagnostics_enabled(
+        self, tmp_path, zahn_video
+    ):
+        """Even a save_diagnostics=True server ignores a client-supplied path.
+
+        Diagnostics must still land only under AppConfig.diagnostics_dir, one
+        directory per job id chosen by the service - never at whatever path a
+        request happened to name.
+        """
+        attacker_target = tmp_path / "attacker_chosen_directory"
+        config = replace(
+            AppConfig(),
+            data_dir=tmp_path / "data",
+            max_upload_mb=64,
+            log_level="WARNING",
+            save_diagnostics=True,
+        )
+        application = create_app(config)
+        application.config.update(TESTING=True)
+        diag_client = application.test_client()
+        try:
+            video_id = upload(diag_client, zahn_video.path).get_json()["video_id"]
+            started = diag_client.post(
+                "/api/analyses",
+                json={
+                    "video_id": video_id,
+                    "mode": "zahn_cup",
+                    "params": {
+                        "outlet": {
+                            "x": int(zahn_video.truth["outlet_x"]),
+                            "y": int(zahn_video.truth["outlet_y"]),
+                        },
+                        "diagnostics_dir": str(attacker_target),
+                    },
+                },
+            ).get_json()
+            finished = wait_for_job(diag_client, started["job_id"])
+            assert finished["status"] == "complete"
+            assert not attacker_target.exists()
+            # The legitimate, server-chosen location is used instead.
+            job_diagnostics_dir = config.diagnostics_dir / started["job_id"]
+            frames_log = job_diagnostics_dir / "zahn_tracking_frames.jsonl"
+            assert frames_log.exists()
+        finally:
+            application.extensions["analysis_service"].shutdown()
+
     def test_wall_clock_columns_appear_when_a_start_time_is_given(self, client, motion_video):
         video_id = upload(client, motion_video.path).get_json()["video_id"]
         started = client.post(

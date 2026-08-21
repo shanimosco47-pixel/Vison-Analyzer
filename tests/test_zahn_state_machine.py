@@ -47,6 +47,17 @@ def feed(machine: FlowStateMachine, samples: list[ScoreSample], start_s: float =
     return timestamp
 
 
+def feed_trust(
+    machine: FlowStateMachine, entries: list[tuple[ScoreSample, bool]], start_s: float = 0.0
+) -> float:
+    """Like ``feed``, but each frame carries its own ``trusted`` flag."""
+    timestamp = start_s
+    for index, (sample, trusted) in enumerate(entries):
+        timestamp = start_s + index * FRAME
+        machine.update(timestamp, sample, trusted=trusted)
+    return timestamp
+
+
 def config(**overrides) -> ZahnConfig:
     base = ZahnConfig()
     for key, value in overrides.items():
@@ -198,6 +209,62 @@ class TestFlowEnd:
         last = feed(machine, sequence)
         measurement = machine.finalize(last)
         assert measurement.efflux_s == pytest.approx(10.0, abs=2 * FRAME)
+
+
+class TestUntrackedGapsDuringFlow:
+    """Codex review: a gap forgotten once trusted liquid returns is a bug.
+
+    ``_gap_after_activity`` alone is cleared by ``_update_flowing`` the
+    moment fresh trusted liquid arrives - a gap in the *middle* of an
+    otherwise clean run left no trace by the time a much later, ordinary
+    end was confirmed. The acceptance criterion is that tracking lost
+    longer than ``zahn_max_endpoint_uncertainty_s`` must make the
+    measurement unconfirmed wherever in the run it happens, not only right
+    at the reported end.
+    """
+
+    def test_a_long_gap_in_the_middle_of_flow_still_poisons_a_later_clean_end(self):
+        machine = FlowStateMachine(config(flow_start_persistence_s=0.2, flow_end_persistence_s=0.5))
+        entries: list[tuple[ScoreSample, bool]] = []
+        entries += [(liquid(), True)] * 30  # 1.2 s of clean, trusted flow
+        gap_liquid_before_idx = len(entries) - 1
+        entries += [(empty(), False)] * 15  # 0.6 s untracked gap (> the 0.5 s default)
+        gap_liquid_after_idx = len(entries)
+        entries += [(liquid(), True)] * 50  # flow visibly, trustedly continues
+        last_liquid_index = len(entries) - 1
+        entries += [(empty(), True)] * 20  # 0.8 s of trusted absence: ends cleanly
+
+        feed_trust(machine, entries)
+
+        assert machine.finished
+        # The reported end itself is still exactly where the last liquid was.
+        assert machine.measurement.end_s == pytest.approx(last_liquid_index * FRAME, abs=FRAME)
+        # But it must NOT be reported confirmed and precise: a >0.5 s
+        # untracked gap happened earlier in the run, even though liquid
+        # visibly - and trustedly - returned afterward.
+        assert machine.measurement.end_confirmed is False
+        assert machine.measurement.end_uncertain is True
+        bounds = machine.measurement.end_uncertainty_bounds
+        assert bounds is not None
+        lo, hi = bounds
+        assert lo <= gap_liquid_before_idx * FRAME
+        assert hi >= gap_liquid_after_idx * FRAME
+
+    def test_a_short_gap_in_the_middle_of_flow_does_not_taint_a_later_end(self):
+        """Sanity check: this is about the gap's *width*, not its position."""
+        machine = FlowStateMachine(config(flow_start_persistence_s=0.2, flow_end_persistence_s=0.5))
+        entries: list[tuple[ScoreSample, bool]] = []
+        entries += [(liquid(), True)] * 30
+        entries += [(empty(), False)] * 3  # 0.12 s: well under the 0.5 s default
+        entries += [(liquid(), True)] * 50
+        entries += [(empty(), True)] * 20
+
+        feed_trust(machine, entries)
+
+        assert machine.finished
+        assert machine.measurement.end_confirmed is True
+        assert machine.measurement.end_uncertain is False
+        assert machine.measurement.end_uncertainty_bounds is None
 
 
 class TestBreaksAndContinuity:

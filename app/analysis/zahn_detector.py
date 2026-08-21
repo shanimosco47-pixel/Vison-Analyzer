@@ -379,10 +379,14 @@ class FlowMeasurement:
     mean_noise_sigma: float = 0.0
     stopped_early: bool = False
     # Set when the reported end sits right after an untrusted (lost/predicted
-    # tracking, or disturbed) span wider than zahn_max_endpoint_uncertainty_s:
-    # the true break could have happened anywhere in end_uncertainty_bounds,
-    # so end_confirmed is also forced False rather than reporting a falsely
-    # precise duration.
+    # tracking) span wider than zahn_max_endpoint_uncertainty_s, OR when any
+    # such span occurred anywhere earlier while flow was ongoing - even if
+    # trusted liquid resumed afterward and flow appeared to continue
+    # normally to a later, clean end (Codex review: tracking loss long
+    # enough to lose confidence must not be forgotten just because liquid
+    # came back). Either way the true break could have happened anywhere in
+    # end_uncertainty_bounds, so end_confirmed is also forced False rather
+    # than reporting a falsely precise duration.
     end_uncertain: bool = False
     end_uncertainty_bounds: tuple[float, float] | None = None
     # Symmetric case: the persistence run that confirmed the start began
@@ -435,6 +439,16 @@ class FlowStateMachine:
         # timing could actually fall within. See update()'s `trusted` param.
         self._gap_open = False
         self._gap_after_activity: tuple[float, float] | None = None
+        # Codex review: _gap_after_activity alone is forgotten the moment
+        # fresh trusted liquid arrives (see _update_flowing), so a long gap
+        # in the *middle* of an otherwise continuous-looking run - liquid
+        # before, liquid after - left no trace by the time a later, clean
+        # end was confirmed. That is exactly the case the acceptance
+        # criterion means by "tracking lost longer than the defined
+        # duration": once any such gap has been seen while flowing, this
+        # is set once and never cleared, so it still poisons the eventual
+        # end confirmation however long afterward flow actually stops.
+        self._unresolved_flow_gap: tuple[float, float] | None = None
         # Symmetric bookkeeping for the start side: the timestamp of the
         # last trusted frame seen at all (regardless of content - "flow
         # hadn't started as of here" is valid negative evidence even from a
@@ -518,7 +532,13 @@ class FlowStateMachine:
                     # span itself, since ordinary quiet-but-trusted frames
                     # right before it are equally unable to prove flow had
                     # already ended.
-                    self._gap_after_activity = (self._last_activity_s, timestamp_s)
+                    gap = (self._last_activity_s, timestamp_s)
+                    self._gap_after_activity = gap
+                    if (
+                        self._unresolved_flow_gap is None
+                        and (gap[1] - gap[0]) > self.config.zahn_max_endpoint_uncertainty_s
+                    ):
+                        self._unresolved_flow_gap = gap
             elif self._gap_start_ts is not None:
                 # Symmetric case, still waiting for flow to start: the last
                 # trusted frame before the gap - whatever it showed - is
@@ -607,9 +627,13 @@ class FlowStateMachine:
                 self._gap_started_s = None
             self._last_activity_s = timestamp_s
             self.absence_timer.reset()
-            # Fresh, trusted liquid supersedes any earlier gap: flow
-            # demonstrably continued past it, so it is no longer adjacent to
-            # whatever end eventually gets reported.
+            # Fresh, trusted liquid supersedes the *adjacency* signal: flow
+            # demonstrably continued past it, so this particular gap is no
+            # longer immediately next to whatever end eventually gets
+            # reported. _unresolved_flow_gap is deliberately NOT cleared
+            # here - see its docstring: a gap seen anywhere while flowing
+            # must keep poisoning the eventual end confirmation, however
+            # long afterward flow actually stops (Codex review).
             self._gap_after_activity = None
             return
 
@@ -624,15 +648,24 @@ class FlowStateMachine:
             # The frames spent proving the absence are not part of the timed
             # interval; removing them keeps the continuity ratio honest.
             self.measurement.timed_frames -= self._frames_since_activity
+
+            candidate_bounds: list[tuple[float, float]] = []
             if self._gap_after_activity is not None:
                 gap_start, gap_end = self._gap_after_activity
                 if (gap_end - gap_start) > self.config.zahn_max_endpoint_uncertainty_s:
-                    # The break could have happened anywhere in that span:
-                    # reporting a precise, confirmed number would be inventing
-                    # certainty the evidence does not support.
-                    self.measurement.end_confirmed = False
-                    self.measurement.end_uncertain = True
-                    self.measurement.end_uncertainty_bounds = (gap_start, gap_end)
+                    candidate_bounds.append((gap_start, gap_end))
+            if self._unresolved_flow_gap is not None:
+                candidate_bounds.append(self._unresolved_flow_gap)
+            if candidate_bounds:
+                # The break could have happened anywhere any of these spans
+                # cover: reporting a precise, confirmed number would be
+                # inventing certainty the evidence does not support.
+                self.measurement.end_confirmed = False
+                self.measurement.end_uncertain = True
+                self.measurement.end_uncertainty_bounds = (
+                    min(bound[0] for bound in candidate_bounds),
+                    max(bound[1] for bound in candidate_bounds),
+                )
             logger.info(
                 "Zahn flow end detected at %.3fs (no liquid for %.2fs, confirmed at %.3fs)",
                 self.measurement.end_s if self.measurement.end_s is not None else -1.0,
@@ -1122,6 +1155,12 @@ class ZahnCupDetector(BaseDetector):
         }
         try:
             frames_log.write(json.dumps(record) + "\n")
+            # Deliberate, not incidental: the point of streaming instead of
+            # accumulating is that an operator can inspect the file while
+            # the run is still in progress (e.g. `tail -f`), not only after
+            # it closes. Python's own buffering would otherwise hold lines
+            # back for an arbitrary, unbounded time (Codex review).
+            frames_log.flush()
         except OSError:
             logger.warning("Could not write to tracking frames log", exc_info=True)
 
@@ -1257,12 +1296,19 @@ class ZahnCupDetector(BaseDetector):
         }
 
         events: list[Event] = []
-        if measurement.start_s is not None and measurement.end_s is not None:
-            # A candidate is preserved for review even when uncertain - the
-            # timestamps themselves (the earliest-supported bounds) are still
-            # useful to look at - but its details carry no precise
-            # efflux_seconds, only the bounds, so nothing downstream can
-            # present it as an authoritative number.
+        # Codex review: Event.duration_s is always end_s - start_s, computed
+        # fresh by the shared Event/EventLog contract regardless of what
+        # `details` says - build_event_log's CSV rows, DetectorResult.to_dict
+        # and summarise()'s total_active_seconds all read it directly. Only
+        # suppressing "efflux_seconds" in `details` therefore did not stop an
+        # uncertain measurement from presenting a precise duration elsewhere.
+        # Changing that shared contract to carry a genuinely unknown/bounded
+        # duration is out of scope here, so the focused fix is this: no Event
+        # at all for an uncertain measurement. The bounded candidate stays
+        # visible in `summary` (flow_start_s/flow_end_s/efflux_seconds_bounds
+        # /start_uncertain/end_uncertain), just never as an Event a
+        # downstream consumer could mistake for a confirmed occurrence.
+        if measurement.start_s is not None and measurement.end_s is not None and not uncertain:
             events.append(
                 Event(
                     label="Zahn cup efflux",
