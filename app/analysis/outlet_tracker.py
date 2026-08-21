@@ -205,29 +205,18 @@ class OutletTracker:
         cup_half_width_px: int,
         cup_height_above_px: int,
         reference_timestamp_s: float = 0.0,
-        start_in_search: bool = False,
     ) -> None:
         """Build the reference patch/features from ``reference_gray``.
 
-        ``start_in_search=True`` is for a reference frame that is not the
-        first frame the tracker will actually be fed (Codex review: a user's
-        outlet mark is only trustworthy on the frame it was made on, which
-        may sit after frames the caller still needs measured - see
-        ``ZahnCupDetector``'s ``outlet_reference_s``). The bootstrap work
-        below - feature detection, the ``TrackerInitError`` check, patch
-        extraction - is identical either way; what differs is the state
-        construction finishes in. With it False (the default, and every
-        pre-existing call site), the reference frame *is* the tracker's
-        first observed frame, exactly as before. With it True, the tracker
-        starts in ``LOST`` with no confident observation yet, so its first
-        real ``update()`` call - whenever the caller makes it, at any
-        timestamp - goes through ``_attempt_reacquisition``'s already-
-        verified template search rather than assuming temporal adjacency to
-        this frame. That search is direction- and distance-independent (it
-        matches the current frame against the stored patch, not against
-        ``reference_gray`` via optical flow), so it correctly locates the
-        cup whether the caller's first real frame is right at this
-        timestamp, earlier, or later.
+        ``reference_gray`` is always treated as the tracker's first
+        confidently-observed frame: every caller either feeds frames
+        starting from this exact one, or (for a reference frame that is not
+        chronologically first - see ``ZahnCupDetector``'s
+        ``outlet_reference_s`` and ``_process_pre_reference_span``) tracks
+        *backward* from it through already-decoded frames via ordinary
+        optical flow, which needs no separate bootstrap state: LK does not
+        care which way time runs, only that consecutive frames are close in
+        content.
         """
         self._config = config
         self._bounds = reference_gray.shape[:2]  # (height, width)
@@ -249,21 +238,14 @@ class OutletTracker:
         self._prev_gray = reference_gray
         self._bridge_start_s: float | None = None
         self._velocity = np.zeros(2, dtype=np.float64)
-        if start_in_search:
-            self._points: np.ndarray | None = None
-            self._state = TrackState.LOST
-            self._last_confident_outlet = self._outlet.copy()
-            self._last_confident_timestamp: float | None = None
-        else:
-            self._points = points
-            self._state = TrackState.TRACKED
-            self._last_confident_outlet = self._outlet.copy()
-            # Set from construction, not left None until the first
-            # successful update(): the reference frame *is* a confident
-            # observation, and a gap on the very next frame must still have
-            # a timestamp and a (zero, until real motion is observed)
-            # velocity to bridge from.
-            self._last_confident_timestamp = reference_timestamp_s
+        self._points: np.ndarray | None = points
+        self._state = TrackState.TRACKED
+        self._last_confident_outlet = self._outlet.copy()
+        # Set from construction, not left None until the first successful
+        # update(): the reference frame *is* a confident observation, and a
+        # gap on the very next frame must still have a timestamp and a
+        # (zero, until real motion is observed) velocity to bridge from.
+        self._last_confident_timestamp: float | None = reference_timestamp_s
 
         # The reacquisition patch is centred on the *strongest* detected
         # feature, not the outlet itself and not the centroid of every
@@ -524,6 +506,27 @@ class OutletTracker:
         candidate_patch = gray[y0:y1, x0:x1]
         response = cv2.matchTemplate(candidate_patch, self._reference_patch, cv2.TM_CCOEFF_NORMED)
         return float(response[0, 0])
+
+    def reference_patch_correlation(
+        self, gray: np.ndarray, outlet_xy: tuple[float, float]
+    ) -> float:
+        """Correlation between this tracker's stored reference patch and
+        ``gray`` at ``outlet_xy`` (an *outlet* position, converted to the
+        anchor position ``_patch_correlation_at`` expects the same way
+        ``_attempt_tracking`` does).
+
+        Public entry point for verifying a *candidate* position before
+        trusting it, without first constructing a whole new tracker there -
+        used by ``ZahnCupDetector`` to check a recentre candidate is
+        genuinely the cup this tracker was already following, not whatever
+        happens to sit at an extrapolated position during a real occlusion
+        (Codex review: a fresh tracker built there would report `tracked`
+        unconditionally, with no correlation check at all - exactly the
+        "verified, not assumed" gap reacquisition already closes for a
+        cold search within a fixed window, reopened for a moving one).
+        """
+        implied_anchor = np.array(outlet_xy, dtype=np.float64) + self._anchor_offset_from_outlet
+        return self._patch_correlation_at(gray, implied_anchor)
 
     # -- helpers ------------------------------------------------------------ #
 

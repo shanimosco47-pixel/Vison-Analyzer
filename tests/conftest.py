@@ -285,6 +285,96 @@ def portrait_reference_frame_zahn_video(tmp_path_factory: pytest.TempPathFactory
 
 
 @pytest.fixture(scope="session")
+def wide_pan_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> HandheldClip:
+    """The outlet pans steadily, in one direction, far enough that a fixed,
+    click-anchored search window cannot contain it for the whole run - only
+    a search window that recentres on the tracker's last credible estimate
+    can. Third Codex review round, against real footage: "the real cup
+    later moves outside the current x=460..760 search window."
+
+    A *steady, one-directional* pan (not ``build_handheld_clip``'s
+    oscillating hand/camera drift, whose sinusoidal reversals stress
+    velocity extrapolation in a way a real single reframe usually does not)
+    - 380px of total drift, guard half-width (~70px) + track_search_margin_px
+    (80px default) bounds a fixed window to ~150px from the click, so this
+    comfortably needs at least one recentre, at a per-frame speed (<1px)
+    ordinary optical flow tracks easily between them. See
+    diagnostics/stage1/STAGE1_REPORT.md and
+    ZahnCupDetector._run_segment/_build_capture_roi's recentring.
+
+    A *flat* background, deliberately, unlike most other fixtures here: with
+    the camera held still and only the cup panning, ``_world_background``'s
+    spatial texture (and the distractor shapes baked into it) would slide
+    past the tracked analysis window as it follows the cup across 380px of
+    otherwise-static scene, and StreamActivityScorer's own background model
+    - built for a *stable* view - would read that sliding texture as
+    spurious activity. That is a real, separate scoring-side limitation
+    (background stability assumes a window that does not itself sweep
+    across a textured static scene) worth its own coverage another time;
+    this fixture isolates the one thing it exists to test - the search
+    window recentring - by removing that confound rather than compounding
+    two different failure modes in one fixture. The cup's own drawn shading
+    (rim/handle/nose edges) still gives the tracker plenty to key on.
+    """
+    import numpy as np
+
+    from ._synthetic_handheld import MARGIN, _draw_cup, _draw_liquid
+
+    width, height, fps, duration = 640, 480, 25.0, 16.0
+    background_level, sensor_noise = 214, 1.8
+    cup_delta, stream_delta = 14, 18
+    flow_start_s, stream_break_s, flow_end_s = 2.0, 11.0, 12.0
+    base_x, base_y, total_dx = 150.0, 250.0, 380.0
+    rng = np.random.default_rng(20260821)
+    world = np.full(
+        (height + 2 * MARGIN, width + 2 * MARGIN), float(background_level), dtype=np.float32
+    )
+
+    path = tmp_path_factory.mktemp("videos") / "wide_pan_zahn.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():  # pragma: no cover - depends on the OpenCV build
+        pytest.skip("This OpenCV build cannot write MP4 files")
+
+    reference_outlet: tuple[float, float] | None = None
+    total_frames = int(round(duration * fps))
+    for index in range(total_frames):
+        t = index / fps
+        frame = world[MARGIN : MARGIN + height, MARGIN : MARGIN + width].copy()
+        ox, oy = base_x + (total_dx / duration) * t, base_y
+        if reference_outlet is None:
+            reference_outlet = (ox, oy)
+        _draw_cup(frame, ox, oy, background_level - cup_delta)
+        _draw_liquid(
+            frame,
+            t,
+            ox,
+            oy,
+            start_s=flow_start_s,
+            break_s=stream_break_s,
+            end_s=flow_end_s,
+            level=background_level - stream_delta,
+        )
+        frame += rng.normal(0.0, sensor_noise, frame.shape).astype(np.float32)
+        bgr = cv2.cvtColor(np.clip(frame, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        writer.write(bgr)
+    writer.release()
+
+    assert reference_outlet is not None
+    return HandheldClip(
+        path=path,
+        fps=fps,
+        duration_s=duration,
+        width=width,
+        height=height,
+        flow_start_s=flow_start_s,
+        stream_break_s=stream_break_s,
+        flow_end_s=flow_end_s,
+        outlet_at_reference=reference_outlet,
+        occlusion_s=None,
+    )
+
+
+@pytest.fixture(scope="session")
 def translucent_cup_near_distractor_zahn_video(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> tuple[HandheldClip, tuple[float, float]]:

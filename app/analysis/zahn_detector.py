@@ -61,7 +61,7 @@ from .base_detector import (
     ScoreSample,
     null_progress,
 )
-from .outlet_tracker import OutletTracker, TrackerInitError, TrackState
+from .outlet_tracker import OutletTracker, TrackerInitError, TrackResult, TrackState
 from .temporal import PersistenceTimer, clamp, safe_ratio
 
 logger = get_logger(__name__)
@@ -77,6 +77,14 @@ PROGRESS_UPDATE_INTERVAL_S = 0.4
 # not pixels) as they happen, bounded so a long run of flicker between states
 # cannot grow this without limit.
 MAX_DIAGNOSTIC_TRANSITIONS = 60
+
+# How many times one run may recentre its capture/search window on the
+# tracker's last credible estimate (see ZahnCupDetector._run_segment). Each
+# recentre costs one extra out-of-band frame read; bounding the count caps
+# that cost and stops a pathological run (repeatedly drifting back to an
+# edge) from recentring without limit, while still comfortably covering the
+# handful of large reframings a real hand-held clip actually needs.
+MAX_TRACKING_RECENTRES = 8
 
 
 # --------------------------------------------------------------------------- #
@@ -752,6 +760,38 @@ class FlowStateMachine:
 # --------------------------------------------------------------------------- #
 
 
+@dataclass
+class _SegmentResult:
+    """How one decode segment (``ZahnCupDetector._run_segment``) ended."""
+
+    status: str  # "finished" | "exhausted" | "recentre" | "init_failed"
+    last_timestamp: float
+    last_state: TrackState | None
+    last_report: float
+    # The tracker as of this segment's end - may be a *new* instance the
+    # segment constructed itself (a cold start on its own first frame), so
+    # the caller must always take this over whatever it passed in, not
+    # assume its own reference is still current (Codex review: a stale
+    # caller-side None here, when the segment had actually cold-started one
+    # internally, broke the recentre-verification path's assumption that a
+    # tracker is always present at that point).
+    tracker: OutletTracker | None = None
+    recentre_source_xy: tuple[float, float] | None = None
+    resume_timestamp_s: float | None = None
+    reason: str | None = None
+
+
+@dataclass
+class _PreReferenceResult:
+    """How ``ZahnCupDetector._process_pre_reference_span`` ended."""
+
+    status: str  # "ready" | "finished" | "failed"
+    tracker: OutletTracker | None = None
+    last_state: TrackState | None = None
+    last_timestamp: float = 0.0
+    reason: str | None = None
+
+
 class ZahnCupDetector(BaseDetector):
     """Measures Zahn cup efflux time from a side-on recording."""
 
@@ -845,33 +885,283 @@ class ZahnCupDetector(BaseDetector):
             track_outlet=self.config.zahn_track_outlet,
         )
 
-    def _build_capture_roi(self) -> ROI:
-        """The fixed window the tracker searches within for the whole run.
+    def _build_capture_roi(self, center_xy: tuple[float, float] | None = None) -> ROI:
+        """A guard-sized window, padded by ``track_search_margin_px``, that
+        the tracker searches within for one contiguous run.
 
-        Sized as the guard region plus ``track_search_margin_px`` on every
-        side: the hard bound on cumulative drift the tracker can follow this
-        run (see the field's docstring in ZahnConfig).
+        Centred on ``center_xy`` (source coordinates) when given - used to
+        *recentre* the decode/search window on the tracker's last credible
+        estimate when the outlet has drifted toward the edge of the current
+        window (see ``_run_segment``'s recentre trigger). A window pinned
+        forever to the original click cannot see the outlet at all once real
+        camera motion carries it further than this margin away - the pixels
+        are simply never decoded, however good the tracker or its
+        reacquisition search is (Codex review, against real footage). With
+        no ``center_xy``, this reproduces the original click-anchored window
+        exactly - the guard region's own centre.
         """
         margin = self.config.track_search_margin_px
-        x = self.guard_roi.x - margin
-        y = self.guard_roi.y - margin
-        x2 = self.guard_roi.x2 + margin
-        y2 = self.guard_roi.y2 + margin
-        return ROI(x=x, y=y, width=x2 - x, height=y2 - y).clipped_to(
+        if center_xy is None:
+            center_xy = (
+                self.guard_roi.x + self.guard_roi.width / 2.0,
+                self.guard_roi.y + self.guard_roi.height / 2.0,
+            )
+        half_w = self.guard_roi.width / 2.0 + margin
+        half_h = self.guard_roi.height / 2.0 + margin
+        x = int(round(center_xy[0] - half_w))
+        y = int(round(center_xy[1] - half_h))
+        x2 = int(round(center_xy[0] + half_w))
+        y2 = int(round(center_xy[1] + half_h))
+        return ROI(x=x, y=y, width=max(1, x2 - x), height=max(1, y2 - y)).clipped_to(
             self.video.width, self.video.height
         )
 
-    def _read_reference_frame_gray(self, reader: VideoReader, capture_roi: ROI) -> np.ndarray:
-        """The single frame at ``outlet_reference_s``, prepared like every
-        frame the main tracked pass decodes (the wide-capture contract is
-        always scale=1.0, no blur - see ``run()``), for pre-arming the
-        tracker before the main pass starts. One out-of-band read via
-        ``VideoReader.frame_at`` - not part of the main streaming loop, so
-        it does not change how many frames that loop itself decodes.
+    def _read_capture_frame_gray(
+        self, reader: VideoReader, timestamp_s: float, capture_roi: ROI
+    ) -> np.ndarray:
+        """The single frame at ``timestamp_s``, cropped to ``capture_roi`` and
+        greyed - the wide-capture contract (scale=1.0, no blur - see
+        ``run()``). One out-of-band read via ``VideoReader.frame_at``, used
+        only *between* streaming passes, never while an ``iter_samples()``
+        generator is still active: both share the reader's read position,
+        and seeking mid-generator would corrupt it. Used to seed a fresh
+        reference frame at the reference-frame span's boundary and at each
+        recentre of the search window.
         """
-        frame = reader.frame_at(self.outlet_reference_s)
+        frame = reader.frame_at(timestamp_s)
         frame = frame[capture_roi.y : capture_roi.y2, capture_roi.x : capture_roi.x2]
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def _process_tracked_frame(
+        self,
+        *,
+        capture_gray: np.ndarray,
+        sample_index: int,
+        timestamp_s: float,
+        state: TrackState,
+        local_outlet_x: float,
+        local_outlet_y: float,
+        reacquired: bool,
+        capture_roi: ROI,
+        scale: float,
+        scorer: StreamActivityScorer,
+        machine: FlowStateMachine,
+        trace: ActivityTrace,
+        frames_log: TextIO | None,
+    ) -> tuple[bool, float, float]:
+        """Score one tracked frame and feed it into the shared scorer/state
+        machine/trace/diagnostics log - the wide-capture (tracking-on) path.
+
+        ``local_outlet_x/y`` is the tracker's outlet position local to
+        whichever ``capture_roi`` is currently in effect - which can change
+        mid-run (a recentre re-anchors the search window - see
+        ``_run_segment``). The returned ``offset_x/offset_y`` is therefore
+        always recomputed from ``capture_roi`` and ``self.outlet_xy`` (the
+        *original* click) fresh here, never carried over from an earlier
+        window's own coordinate space: it is drift in source pixels since
+        the original click, not since whichever window last produced this
+        frame, which is what lets the guard/ROI cut below - and every
+        diagnostic derived from ``offset_x/offset_y`` - use one formula
+        regardless of how many recentres have happened.
+        """
+        offset_x = capture_roi.x + local_outlet_x - self.outlet_xy[0]
+        offset_y = capture_roi.y + local_outlet_y - self.outlet_xy[1]
+        trusted = state == TrackState.TRACKED
+        scored: ScoreSample | None = None
+        if state != TrackState.LOST:
+            local_x = int(round((self.guard_roi.x - capture_roi.x) + offset_x))
+            local_y = int(round((self.guard_roi.y - capture_roi.y) + offset_y))
+            sub = _safe_slice(
+                capture_gray, local_x, local_y, self.guard_roi.width, self.guard_roi.height
+            )
+            if sub is not None:
+                prepared = _prepare_for_scoring(sub, scale)
+                scored = scorer.score(
+                    FrameSample(
+                        index=sample_index, timestamp_s=timestamp_s, image=prepared, scale=scale
+                    )
+                )
+            else:
+                trusted = False
+
+        if scored is None:
+            scored = ScoreSample(value=0.0, extras={"outlet_score": 0.0, "noise_sigma": 0.0})
+
+        trace.add(timestamp_s, scored.value, scored.disturbed or not trusted)
+        machine.update(timestamp_s, scored, trusted=trusted)
+
+        if frames_log is not None:
+            self._write_tracking_frame_log(
+                frames_log, timestamp_s, state, offset_x, offset_y, reacquired, trusted, capture_roi
+            )
+        return trusted, offset_x, offset_y
+
+    def _process_pre_reference_span(
+        self,
+        *,
+        reader: VideoReader,
+        capture_roi: ROI,
+        reference_outlet_local: tuple[float, float],
+        patch_half_px: int,
+        cup_half_width_px: int,
+        cup_height_above_px: int,
+        scale: float,
+        scorer: StreamActivityScorer,
+        machine: FlowStateMachine,
+        trace: ActivityTrace,
+        transitions: list[dict[str, Any]],
+        frames_log: TextIO | None,
+    ) -> _PreReferenceResult:
+        """Score every frame from ``self.start_s`` to ``self.outlet_reference_s``
+        and hand back a tracker anchored at the reference frame, ready to
+        continue forward.
+
+        The user's outlet mark is only trustworthy on the frame it was made
+        on (``self.outlet_reference_s``), which can sit well after
+        ``self.start_s`` on a real hand-held clip - a large early reframing
+        before the outlet becomes markable at all (Codex review). The
+        *previous* round pre-armed a tracker at the reference frame but then
+        searched for it *chronologically forward from ``self.start_s``* by
+        template match alone: a blind, cold search with no motion continuity
+        between consecutive frames, which a supervisor review against real
+        footage found could falsely "reacquire" on an unrelated patch of the
+        scene right at frame zero (diagnostics/stage1/STAGE1_REPORT.md).
+        This replaces that with genuine optical-flow continuity in *both*
+        directions from a single trusted anchor: the reference frame is the
+        only frame this run ever treats as trustworthy without
+        verification; every other frame's position is reached from it by
+        tracking frame-to-frame, never by guessing where in the frame a
+        stored patch might match.
+
+        Method: decode every frame from ``self.start_s`` to
+        ``self.outlet_reference_s`` once, forward - an ordinary, cheap
+        sequential read, no seeking - then track *backward* through that
+        buffer, from the reference frame to the first one, with the same
+        Lucas-Kanade tracker used going forward (optical flow does not care
+        which way time runs, only that consecutive frames are close in
+        content - see ``OutletTracker``). Every one of those frames is then
+        scored in the true, forward chronological order
+        ``StreamActivityScorer``'s background model and ``FlowStateMachine``
+        require, using the backward pass's per-frame positions. Bounded in
+        memory by ``self.outlet_reference_s - self.start_s`` - the gap
+        between where a real clip's outlet first becomes markable and where
+        analysis should start, which is inherently small in the workflow
+        this exists for (the user marks the outlet as soon as they can after
+        the recording begins), not the length of the whole recording.
+
+        The capture/search window does not recentre during this span (see
+        ``_run_segment`` for that, forward of the reference frame only) - a
+        known, deliberately scoped limit: this span is inherently short, and
+        the bidirectional redesign above already resolves the specific
+        false-reacquisition failure a supervisor review found on real
+        footage. See diagnostics/stage1/STAGE1_REPORT.md.
+        """
+        plan = build_sampling_plan(
+            fps=self.video.fps,
+            duration_s=self.end_s or (self.video.duration_s or 0.0),
+            interval_s=1.0 / self.video.fps,
+            scale=1.0,
+            start_s=self.start_s,
+            end_s=self.outlet_reference_s,
+        )
+        samples = list(reader.iter_samples(plan, roi=capture_roi, grayscale=True, blur_kernel=0))
+        if not samples:
+            return _PreReferenceResult(
+                status="failed", reason="No frames could be decoded up to the reference frame."
+            )
+
+        reference_sample = samples[-1]
+        try:
+            backward_tracker = OutletTracker(
+                self.config,
+                reference_sample.image,
+                reference_outlet_local,
+                patch_half_px=patch_half_px,
+                cup_half_width_px=cup_half_width_px,
+                cup_height_above_px=cup_height_above_px,
+                reference_timestamp_s=reference_sample.timestamp_s,
+            )
+        except TrackerInitError as exc:
+            return _PreReferenceResult(status="failed", reason=str(exc))
+
+        backward_results: dict[int, TrackResult] = {
+            sample.index: backward_tracker.update(sample.image, sample.timestamp_s)
+            for sample in reversed(samples[:-1])
+        }
+
+        last_state: TrackState | None = None
+        last_timestamp = self.start_s
+        for sample in samples:
+            if sample is reference_sample:
+                state, local_x, local_y, reacquired = (
+                    TrackState.TRACKED,
+                    reference_outlet_local[0],
+                    reference_outlet_local[1],
+                    False,
+                )
+            else:
+                result = backward_results[sample.index]
+                state, local_x, local_y, reacquired = (
+                    result.state,
+                    result.outlet_x,
+                    result.outlet_y,
+                    result.reacquired,
+                )
+
+            _trusted, offset_x, offset_y = self._process_tracked_frame(
+                capture_gray=sample.image,
+                sample_index=sample.index,
+                timestamp_s=sample.timestamp_s,
+                state=state,
+                local_outlet_x=local_x,
+                local_outlet_y=local_y,
+                reacquired=reacquired,
+                capture_roi=capture_roi,
+                scale=scale,
+                scorer=scorer,
+                machine=machine,
+                trace=trace,
+                frames_log=frames_log,
+            )
+            last_timestamp = sample.timestamp_s
+
+            if (
+                self.keep_diagnostics
+                and (state != last_state or reacquired)
+                and len(transitions) < MAX_DIAGNOSTIC_TRANSITIONS
+            ):
+                last_state = state
+                entry = self._diagnostic_transition(
+                    sample.timestamp_s, state, offset_x, offset_y, reacquired, capture_roi
+                )
+                if entry is not None:
+                    transitions.append(entry)
+
+            if machine.finished:
+                machine.measurement.stopped_early = True
+                return _PreReferenceResult(
+                    status="finished", last_state=state, last_timestamp=last_timestamp
+                )
+
+        try:
+            forward_tracker = OutletTracker(
+                self.config,
+                reference_sample.image,
+                reference_outlet_local,
+                patch_half_px=patch_half_px,
+                cup_half_width_px=cup_half_width_px,
+                cup_height_above_px=cup_height_above_px,
+                reference_timestamp_s=reference_sample.timestamp_s,
+            )
+        except TrackerInitError as exc:
+            return _PreReferenceResult(status="failed", reason=str(exc))
+
+        return _PreReferenceResult(
+            status="ready",
+            tracker=forward_tracker,
+            last_state=last_state,
+            last_timestamp=last_timestamp,
+        )
 
     # -- execution --------------------------------------------------------- #
 
@@ -880,14 +1170,22 @@ class ZahnCupDetector(BaseDetector):
     ) -> DetectorResult:
         """Analyse every frame and time the efflux, tracking the outlet if enabled.
 
-        With tracking on, one crop - the fixed *capture window* around the
-        guard region - is decoded per frame at source resolution. The tracker
-        estimates the outlet's drift within it; the guard/ROI sub-window used
-        for scoring is then re-cut from that same crop at the tracked
+        With tracking on, one crop - the *capture window* around the guard
+        region - is decoded per frame at source resolution. The tracker
+        estimates the outlet's drift within it; the guard/ROI sub-window
+        used for scoring is then re-cut from that same crop at the tracked
         position, resized and blurred to match the scale scoring has always
-        run at. Tracking off (or unable to start - see TrackerInitError)
-        behaves exactly as before: the guard region is decoded directly at
-        analysis scale, fixed for the whole run.
+        run at. The capture window is not fixed for the whole run: it
+        recentres on the tracker's last credible estimate when the outlet
+        drifts toward its edge (see ``_run_segment``), so real camera motion
+        carrying the outlet well away from where it was clicked does not
+        simply run the tracker out of decoded pixels. When the outlet was
+        marked on a later reference frame than analysis should start from,
+        the span in between is tracked *backward* from that reference before
+        the main forward pass begins (see ``_process_pre_reference_span``).
+        Tracking off (or unable to start - see TrackerInitError) behaves
+        exactly as before: the guard region is decoded directly at analysis
+        scale, fixed for the whole run.
         """
         scale = scale_factor_for_width(self.guard_roi.width, ANALYSIS_WIDTH_PX)
         inner = self._inner_rect(scale)
@@ -895,15 +1193,6 @@ class ZahnCupDetector(BaseDetector):
         machine = FlowStateMachine(self.config)
         trace = ActivityTrace()
 
-        # Fixed for the whole run: whether tracking was *requested* decides the
-        # shape of what gets decoded (a wide, unscaled, unblurred capture
-        # window vs. the guard region decoded directly at analysis scale, as
-        # before). `_run_loop`'s own `use_tracking` is mutable - it also
-        # tracks whether a tracker is actually *in effect*, which can turn
-        # False mid-run if initialisation fails - but the decode shape itself
-        # cannot change once the sampling plan and reader iteration have
-        # started, so every per-frame scoring decision keys off
-        # `wide_capture`, not that mutable flag.
         wide_capture = self.config.zahn_track_outlet
         capture_roi = self._build_capture_roi() if wide_capture else self.guard_roi
         capture_scale = 1.0 if wide_capture else scale
@@ -917,12 +1206,6 @@ class ZahnCupDetector(BaseDetector):
         )
         blur_kernel = 0 if wide_capture else 3  # tracking blurs only the scored sub-crop
 
-        base_guard_x = self.guard_roi.x - capture_roi.x
-        base_guard_y = self.guard_roi.y - capture_roi.y
-        reference_outlet_local = (
-            self.outlet_xy[0] - capture_roi.x,
-            self.outlet_xy[1] - capture_roi.y,
-        )
         patch_half_px = max(12, int(round(0.4 * self.roi.width)))
         # Feature detection is bounded to a cup-sized box near/above the
         # outlet - the guard region's own scale, not the wider capture
@@ -942,59 +1225,76 @@ class ZahnCupDetector(BaseDetector):
             plan.describe(),
         )
 
-        tracker: OutletTracker | None = None
         transitions: list[dict[str, Any]] = []
         last_state: TrackState | None = None
+        tracker: OutletTracker | None = None
         first_frame = True
 
         started = time.monotonic()
         last_report = 0.0
         last_timestamp = self.start_s
         total_span = max(plan.end_s - plan.start_s, 1e-6)
+        segment_start_s = self.start_s
 
         frames_log = self._open_tracking_frames_log() if wide_capture else None
         try:
             if wide_capture and self.outlet_reference_s > self.start_s:
-                # The outlet was marked on a frame after analysis_start_s -
-                # a real hand-held clip can require this when the outlet
-                # only becomes markable once the camera has already panned
-                # well past the first frame (Codex review). Pre-read just
-                # that one frame to build the tracker's reference patch,
-                # then let the main pass search for it chronologically from
-                # analysis_start_s - see OutletTracker's start_in_search.
-                # This never runs an extra frame through the main decode
-                # loop itself: frame_at() is a single out-of-band read.
-                try:
-                    reference_gray = self._read_reference_frame_gray(reader, capture_roi)
-                    tracker = OutletTracker(
-                        self.config,
-                        reference_gray,
-                        reference_outlet_local,
-                        patch_half_px=patch_half_px,
-                        cup_half_width_px=cup_half_width_px,
-                        cup_height_above_px=cup_height_above_px,
-                        reference_timestamp_s=self.outlet_reference_s,
-                        start_in_search=True,
-                    )
-                except TrackerInitError as exc:
+                reference_outlet_local = (
+                    self.outlet_xy[0] - capture_roi.x,
+                    self.outlet_xy[1] - capture_roi.y,
+                )
+                pre = self._process_pre_reference_span(
+                    reader=reader,
+                    capture_roi=capture_roi,
+                    reference_outlet_local=reference_outlet_local,
+                    patch_half_px=patch_half_px,
+                    cup_half_width_px=cup_half_width_px,
+                    cup_height_above_px=cup_height_above_px,
+                    scale=scale,
+                    scorer=scorer,
+                    machine=machine,
+                    trace=trace,
+                    transitions=transitions,
+                    frames_log=frames_log,
+                )
+                if pre.status == "failed":
                     logger.warning(
                         "Zahn outlet tracking could not start for %s: %s",
                         self.video.path.name,
-                        exc,
+                        pre.reason,
                     )
-                    return self._tracking_unavailable_result(str(exc))
+                    return self._tracking_unavailable_result(
+                        pre.reason or "Tracking could not be started at the reference frame."
+                    )
+                last_state = pre.last_state
+                last_timestamp = pre.last_timestamp
+                if pre.status == "finished":
+                    measurement = machine.finalize(last_timestamp)
+                    elapsed = time.monotonic() - started
+                    return self._build_result(
+                        measurement, trace, elapsed, plan.effective_interval_s, transitions, True
+                    )
+                tracker = pre.tracker
                 first_frame = False
+                segment_start_s = last_timestamp + plan.effective_interval_s
+
+            if wide_capture and segment_start_s > (self.end_s or last_timestamp):
+                # The reference frame was the last frame in the analysed
+                # range - nothing forward to track.
+                measurement = machine.finalize(last_timestamp)
+                elapsed = time.monotonic() - started
+                return self._build_result(
+                    measurement, trace, elapsed, plan.effective_interval_s, transitions, True
+                )
+
             return self._run_loop(
                 reader=reader,
                 progress=progress,
-                plan=plan,
                 capture_roi=capture_roi,
                 wide_capture=wide_capture,
                 scale=scale,
+                capture_scale=capture_scale,
                 blur_kernel=blur_kernel,
-                base_guard_x=base_guard_x,
-                base_guard_y=base_guard_y,
-                reference_outlet_local=reference_outlet_local,
                 patch_half_px=patch_half_px,
                 cup_half_width_px=cup_half_width_px,
                 cup_height_above_px=cup_height_above_px,
@@ -1007,8 +1307,10 @@ class ZahnCupDetector(BaseDetector):
                 first_frame=first_frame,
                 started=started,
                 last_report=last_report,
-                last_timestamp=last_timestamp,
+                segment_start_s=segment_start_s,
+                progress_start_s=plan.start_s,
                 total_span=total_span,
+                sample_interval_s=plan.effective_interval_s,
                 frames_log=frames_log,
             )
         finally:
@@ -1020,14 +1322,11 @@ class ZahnCupDetector(BaseDetector):
         *,
         reader: VideoReader,
         progress: ProgressReporter,
-        plan: Any,
         capture_roi: ROI,
         wide_capture: bool,
         scale: float,
+        capture_scale: float,
         blur_kernel: int,
-        base_guard_x: int,
-        base_guard_y: int,
-        reference_outlet_local: tuple[float, float],
         patch_half_px: int,
         cup_half_width_px: int,
         cup_height_above_px: int,
@@ -1040,11 +1339,253 @@ class ZahnCupDetector(BaseDetector):
         first_frame: bool,
         started: float,
         last_report: float,
-        last_timestamp: float,
+        segment_start_s: float,
+        progress_start_s: float,
         total_span: float,
+        sample_interval_s: float,
         frames_log: TextIO | None,
     ) -> DetectorResult:
-        use_tracking = wide_capture
+        """Drive one or more decode segments to the end of the analysed range.
+
+        Almost always one segment. A second (or third, ...) begins only when
+        a segment ends by requesting a *recentre*: the tracked outlet
+        drifted near the edge of the current capture window and was then
+        lost (see ``_run_segment``), so the window is rebuilt around the
+        last credible estimate rather than staying pinned to the original
+        click, and decoding resumes from the next frame. Bounded by
+        ``MAX_TRACKING_RECENTRES`` so a pathological run cannot recentre
+        without limit; once exhausted, remaining frames fall back to the
+        tracker's own in-window reacquisition, exactly as before this
+        capability existed.
+        """
+        last_timestamp = segment_start_s
+        recentre_budget = MAX_TRACKING_RECENTRES if wide_capture else 0
+        recentre_events: list[dict[str, Any]] = []
+
+        while True:
+            segment_plan = build_sampling_plan(
+                fps=self.video.fps,
+                duration_s=self.end_s or (self.video.duration_s or 0.0),
+                interval_s=1.0 / self.video.fps,
+                scale=capture_scale,
+                start_s=segment_start_s,
+                end_s=self.end_s or None,
+            )
+            segment = self._run_segment(
+                reader=reader,
+                progress=progress,
+                plan=segment_plan,
+                capture_roi=capture_roi,
+                wide_capture=wide_capture,
+                allow_recentre=recentre_budget > 0,
+                scale=scale,
+                blur_kernel=blur_kernel,
+                patch_half_px=patch_half_px,
+                cup_half_width_px=cup_half_width_px,
+                cup_height_above_px=cup_height_above_px,
+                scorer=scorer,
+                machine=machine,
+                trace=trace,
+                tracker=tracker,
+                transitions=transitions,
+                last_state=last_state,
+                first_frame=first_frame,
+                started=started,
+                last_report=last_report,
+                progress_start_s=progress_start_s,
+                total_span=total_span,
+                frames_log=frames_log,
+            )
+            last_timestamp = segment.last_timestamp
+            last_state = segment.last_state
+            last_report = segment.last_report
+            tracker = segment.tracker
+
+            if segment.status == "init_failed":
+                return self._tracking_unavailable_result(
+                    segment.reason or "Outlet tracking could not be started."
+                )
+            if segment.status in ("finished", "exhausted"):
+                break
+
+            # status == "recentre": rebuild the search window on the last
+            # credible estimate and keep going from the next frame. Failing
+            # to re-anchor there (too little texture at the new position) is
+            # not fatal - fall back to a cold start at the *original*
+            # window, the same recovery a fresh loss has always had.
+            recentre_budget -= 1
+            assert segment.recentre_source_xy is not None
+            assert segment.resume_timestamp_s is not None
+            assert tracker is not None  # recentre only ever follows a fresh loss
+            # _build_capture_roi centres its window on the *guard region's*
+            # own centre, not on the outlet - the guard region is not
+            # symmetric around the outlet (it reaches much further down,
+            # for the stream, than up, for the cup body), so recentring on
+            # the raw outlet position directly would size/place the window
+            # off-centre from where the (fixed-size, fixed-shape-relative-
+            # to-outlet) guard region actually needs to sit, and a video-
+            # edge clip could then leave it too short to contain the guard
+            # region at all - every frame's guard-cut silently failing
+            # (Codex review; caught by TestConfidenceReflectsMotion's
+            # steady-video regression test, which this recentring feature
+            # was breaking even on a *static* cup with no drift at all).
+            # Shift the candidate outlet position by the same fixed offset
+            # the guard region already sits at relative to the original
+            # click, to get where the guard region's centre would be if it
+            # had moved rigidly with the outlet.
+            guard_center_offset = (
+                self.guard_roi.x + self.guard_roi.width / 2.0 - self.outlet_xy[0],
+                self.guard_roi.y + self.guard_roi.height / 2.0 - self.outlet_xy[1],
+            )
+            new_capture_roi = self._build_capture_roi(
+                (
+                    segment.recentre_source_xy[0] + guard_center_offset[0],
+                    segment.recentre_source_xy[1] + guard_center_offset[1],
+                )
+            )
+            local_outlet = (
+                segment.recentre_source_xy[0] - new_capture_roi.x,
+                segment.recentre_source_xy[1] - new_capture_roi.y,
+            )
+            verified = False
+            try:
+                reference_gray = self._read_capture_frame_gray(
+                    reader, segment.resume_timestamp_s, new_capture_roi
+                )
+                # A recentre candidate must be *verified* against this
+                # tracker's own stored reference patch before it is
+                # trusted - the same bar a cold reacquisition search
+                # already holds a candidate to. Skipping this would let
+                # the fresh tracker construction below "confirm" whatever
+                # happens to sit at an extrapolated position - a real,
+                # prolonged occlusion included - as `tracked`, with no
+                # evidence it is the cup at all (Codex review; caught by
+                # tests/test_zahn_tracking_integration.py's occlusion-gap
+                # regression tests, which this recentring feature was
+                # briefly breaking before this check was added).
+                correlation = tracker.reference_patch_correlation(reference_gray, local_outlet)
+                if correlation >= self.config.track_reacquire_min_correlation:
+                    tracker = OutletTracker(
+                        self.config,
+                        reference_gray,
+                        local_outlet,
+                        patch_half_px=patch_half_px,
+                        cup_half_width_px=cup_half_width_px,
+                        cup_height_above_px=cup_height_above_px,
+                        reference_timestamp_s=segment.resume_timestamp_s,
+                    )
+                    verified = True
+            except TrackerInitError:
+                verified = False
+
+            if verified:
+                recentre_events.append(
+                    {
+                        "timestamp_s": round(segment.resume_timestamp_s, 3),
+                        "source_xy": [
+                            round(segment.recentre_source_xy[0], 1),
+                            round(segment.recentre_source_xy[1], 1),
+                        ],
+                        "from_capture_roi": capture_roi.to_dict(),
+                        "to_capture_roi": new_capture_roi.to_dict(),
+                        "reanchored": True,
+                    }
+                )
+                capture_roi = new_capture_roi
+                first_frame = False
+            else:
+                # Verification refused the candidate - do not touch
+                # `tracker` or `capture_roi` at all. The still-LOST tracker
+                # keeps trying its own verified in-window reacquisition
+                # every frame from here, exactly as it did before this
+                # capability existed (Codex review: an earlier version of
+                # this fallback cold-started a *fresh* tracker instead,
+                # which has no correlation check of its own - reopening,
+                # one level deeper, the exact false-positive hole
+                # verification here exists to close. A real, prolonged
+                # occlusion must stay honestly `lost`, not get "confirmed"
+                # by a fresh init that happened to find >=4 corners in
+                # plain background noise).
+                recentre_events.append(
+                    {
+                        "timestamp_s": round(segment.resume_timestamp_s, 3),
+                        "source_xy": [
+                            round(segment.recentre_source_xy[0], 1),
+                            round(segment.recentre_source_xy[1], 1),
+                        ],
+                        "from_capture_roi": capture_roi.to_dict(),
+                        "to_capture_roi": None,
+                        "reanchored": False,
+                    }
+                )
+                first_frame = False
+            segment_start_s = segment.resume_timestamp_s
+
+        measurement = machine.finalize(last_timestamp)
+        elapsed = time.monotonic() - started
+        return self._build_result(
+            measurement,
+            trace,
+            elapsed,
+            sample_interval_s,
+            transitions,
+            wide_capture,
+            recentre_events=recentre_events,
+        )
+
+    def _run_segment(  # noqa: PLR0913 - internal; keeps _run_loop's own signature manageable
+        self,
+        *,
+        reader: VideoReader,
+        progress: ProgressReporter,
+        plan: Any,
+        capture_roi: ROI,
+        wide_capture: bool,
+        allow_recentre: bool,
+        scale: float,
+        blur_kernel: int,
+        patch_half_px: int,
+        cup_half_width_px: int,
+        cup_height_above_px: int,
+        scorer: StreamActivityScorer,
+        machine: FlowStateMachine,
+        trace: ActivityTrace,
+        tracker: OutletTracker | None,
+        transitions: list[dict[str, Any]],
+        last_state: TrackState | None,
+        first_frame: bool,
+        started: float,
+        last_report: float,
+        progress_start_s: float,
+        total_span: float,
+        frames_log: TextIO | None,
+    ) -> _SegmentResult:
+        """Decode and process one contiguous run of frames from ``plan``.
+
+        Ends normally when the plan's frames are exhausted (``exhausted``)
+        or the flow's end is confirmed (``finished``); ends early
+        (``recentre``) on a *fresh* loss - not a bad-frame blip, but the
+        first frame of a genuinely new `lost` run - so the search window can
+        be rebuilt around the last credible estimate rather than staying
+        pinned to the original click.
+
+        Deliberately not gated on how close to the edge of ``capture_roi``
+        that loss happened: a first attempt at this gated only on
+        edge-proximity missed the dominant real failure mode on a fast,
+        sustained swing - a `predicted` bridge timing out
+        (``track_max_bridge_s``) while still comfortably in-bounds, well
+        before the extrapolated position ever nears the window edge (see
+        diagnostics/stage1/STAGE1_REPORT.md and
+        tests/test_zahn_tracking_integration.py's
+        ``TestSearchWindowRecentres``). Every fresh loss is a signal the
+        tracker no longer knows where the outlet is *right now*, which is
+        reason enough to re-anchor - ``previous_state is not TrackState.LOST``
+        below already stops this from repeating every frame while stuck
+        lost, and ``MAX_TRACKING_RECENTRES`` bounds the total cost.
+        """
+        last_timestamp = plan.start_s
+        previous_state: TrackState | None = None
+
         for sample in reader.iter_samples(
             plan, roi=capture_roi, grayscale=True, blur_kernel=blur_kernel
         ):
@@ -1052,12 +1593,12 @@ class ZahnCupDetector(BaseDetector):
 
             if first_frame:
                 first_frame = False
-                if use_tracking:
+                if wide_capture and tracker is None:
                     try:
                         tracker = OutletTracker(
                             self.config,
                             capture_gray,
-                            reference_outlet_local,
+                            (self.outlet_xy[0] - capture_roi.x, self.outlet_xy[1] - capture_roi.y),
                             patch_half_px=patch_half_px,
                             cup_half_width_px=cup_half_width_px,
                             cup_height_above_px=cup_height_above_px,
@@ -1079,61 +1620,49 @@ class ZahnCupDetector(BaseDetector):
                             self.video.path.name,
                             exc,
                         )
-                        return self._tracking_unavailable_result(str(exc))
+                        return _SegmentResult(
+                            status="init_failed",
+                            last_timestamp=last_timestamp,
+                            last_state=last_state,
+                            last_report=last_report,
+                            tracker=None,
+                            reason=str(exc),
+                        )
 
             state = TrackState.TRACKED
+            local_outlet_x = local_outlet_y = 0.0
             offset_x = offset_y = 0.0
             reacquired = False
             if tracker is not None:
                 result = tracker.update(capture_gray, sample.timestamp_s)
                 state = result.state
-                offset_x, offset_y = result.offset_x, result.offset_y
+                local_outlet_x, local_outlet_y = result.outlet_x, result.outlet_y
                 reacquired = result.reacquired
 
-            trusted = state == TrackState.TRACKED
-            scored: ScoreSample | None = None
-            if state != TrackState.LOST:
-                if wide_capture:
-                    local_x = int(round(base_guard_x + offset_x))
-                    local_y = int(round(base_guard_y + offset_y))
-                    sub = _safe_slice(
-                        capture_gray, local_x, local_y, self.guard_roi.width, self.guard_roi.height
-                    )
-                    if sub is not None:
-                        prepared = _prepare_for_scoring(sub, scale)
-                        scored = scorer.score(
-                            FrameSample(
-                                index=sample.index,
-                                timestamp_s=sample.timestamp_s,
-                                image=prepared,
-                                scale=scale,
-                            )
-                        )
-                    else:
-                        trusted = False
-                else:
-                    # capture_gray is already the guard region, decoded
-                    # directly at analysis scale - the pre-tracking path.
-                    scored = scorer.score(sample)
-
-            if scored is None:
-                scored = ScoreSample(value=0.0, extras={"outlet_score": 0.0, "noise_sigma": 0.0})
-
-            trace.add(sample.timestamp_s, scored.value, scored.disturbed or not trusted)
-            machine.update(sample.timestamp_s, scored, trusted=trusted)
-            last_timestamp = sample.timestamp_s
-
-            if frames_log is not None:
-                self._write_tracking_frame_log(
-                    frames_log,
-                    sample.timestamp_s,
-                    state,
-                    offset_x,
-                    offset_y,
-                    reacquired,
-                    trusted,
-                    capture_roi,
+            if wide_capture:
+                _trusted, offset_x, offset_y = self._process_tracked_frame(
+                    capture_gray=capture_gray,
+                    sample_index=sample.index,
+                    timestamp_s=sample.timestamp_s,
+                    state=state,
+                    local_outlet_x=local_outlet_x,
+                    local_outlet_y=local_outlet_y,
+                    reacquired=reacquired,
+                    capture_roi=capture_roi,
+                    scale=scale,
+                    scorer=scorer,
+                    machine=machine,
+                    trace=trace,
+                    frames_log=frames_log,
                 )
+            else:
+                # capture_gray is already the guard region, decoded directly
+                # at analysis scale - the pre-tracking path.
+                scored = scorer.score(sample)
+                trace.add(sample.timestamp_s, scored.value, scored.disturbed)
+                machine.update(sample.timestamp_s, scored, trusted=True)
+
+            last_timestamp = sample.timestamp_s
 
             if (
                 self.keep_diagnostics
@@ -1151,7 +1680,7 @@ class ZahnCupDetector(BaseDetector):
             now = time.monotonic()
             if now - last_report >= PROGRESS_UPDATE_INTERVAL_S:
                 last_report = now
-                fraction = clamp((sample.timestamp_s - plan.start_s) / total_span, 0.0, 1.0)
+                fraction = clamp((sample.timestamp_s - progress_start_s) / total_span, 0.0, 1.0)
                 progress(
                     stage="analysing",
                     fraction=fraction,
@@ -1166,12 +1695,43 @@ class ZahnCupDetector(BaseDetector):
                 # The end of flow is confirmed; decoding the rest of the file
                 # would tell us nothing.
                 machine.measurement.stopped_early = True
-                break
+                return _SegmentResult(
+                    status="finished",
+                    last_timestamp=last_timestamp,
+                    last_state=state,
+                    last_report=last_report,
+                    tracker=tracker,
+                )
 
-        measurement = machine.finalize(last_timestamp)
-        elapsed = time.monotonic() - started
-        return self._build_result(
-            measurement, trace, elapsed, plan.effective_interval_s, transitions, use_tracking
+            if (
+                allow_recentre
+                and wide_capture
+                and tracker is not None
+                and state is TrackState.LOST
+                and previous_state is not None
+                and previous_state is not TrackState.LOST
+            ):
+                return _SegmentResult(
+                    status="recentre",
+                    last_timestamp=last_timestamp,
+                    last_state=state,
+                    last_report=last_report,
+                    tracker=tracker,
+                    recentre_source_xy=(
+                        capture_roi.x + local_outlet_x,
+                        capture_roi.y + local_outlet_y,
+                    ),
+                    resume_timestamp_s=sample.timestamp_s + plan.effective_interval_s,
+                )
+
+            previous_state = state
+
+        return _SegmentResult(
+            status="exhausted",
+            last_timestamp=last_timestamp,
+            last_state=last_state,
+            last_report=last_report,
+            tracker=tracker,
         )
 
     def _tracked_geometry(self, offset_x: float, offset_y: float) -> tuple[ROI, ROI] | None:
@@ -1314,6 +1874,7 @@ class ZahnCupDetector(BaseDetector):
                 "config": _zahn_config_to_dict(self.config),
                 "track_outlet": False,
                 "tracking_transitions": [],
+                "recentre_events": [],
                 "tracking_init_failed": True,
                 "tracking_frames_log": (
                     str(self._tracking_frames_log_path)
@@ -1359,6 +1920,7 @@ class ZahnCupDetector(BaseDetector):
         sample_interval_s: float,
         transitions: list[dict[str, Any]] | None = None,
         tracking_used: bool = False,
+        recentre_events: list[dict[str, Any]] | None = None,
     ) -> DetectorResult:
         confidence, reasons = score_confidence(measurement, self.config)
         status = self._status_for(measurement, confidence)
@@ -1526,6 +2088,7 @@ class ZahnCupDetector(BaseDetector):
                 "stopped_early": measurement.stopped_early,
                 "track_outlet": tracking_used,
                 "tracking_transitions": transitions or [],
+                "recentre_events": recentre_events or [],
                 "tracking_frames_log": (
                     str(self._tracking_frames_log_path)
                     if self._tracking_frames_log_path is not None

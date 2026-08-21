@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 import pytest
 
-from app.analysis.zahn_detector import ZahnCupDetector
+from app.analysis.zahn_detector import MAX_TRACKING_RECENTRES, ZahnCupDetector
 from app.services.event_log import build_event_log, summarise
 from app.video.metadata import probe_video
 from app.video.reader import VideoReader
@@ -248,6 +248,45 @@ class TestTrackingRefusesAStrongNearbyDistractor:
         # must not happen - either the run stays honestly uncertain
         # (review/failed, capped confidence), or a genuinely correct
         # measurement is reported; never a confident, wrong one.
+        if summary["status"] == "confirmed":
+            assert summary["efflux_seconds"] is not None
+            assert abs(summary["efflux_seconds"] - clip.efflux_s) <= SYNTHETIC_TOLERANCE_S
+        else:
+            assert summary["confidence"] <= 0.5
+
+
+class TestSearchWindowRecentres:
+    """Third Codex review round, against real footage: "the real cup later
+    moves outside the current x=460..760 search window" - a fixed
+    click-anchored capture/search window cannot decode pixels the outlet
+    has actually drifted beyond, no matter how good the tracker or its
+    reacquisition search is. ``wide_pan_zahn_video``'s outlet pans well
+    outside that fixed budget; only a search window that recentres on the
+    tracker's last credible estimate (``ZahnCupDetector._run_segment``) can
+    keep up.
+    """
+
+    def test_recentring_keeps_the_outlet_trackable_through_a_wide_pan(self, wide_pan_zahn_video):
+        clip = wide_pan_zahn_video
+        result = _run(clip.path, clip.outlet_at_reference)
+        summary = result.summary
+
+        # The mechanism under test actually engaged - not just "the result
+        # happens to be fine regardless." Bounded by MAX_TRACKING_RECENTRES
+        # so a pathological run cannot recentre without limit.
+        recentre_events = result.diagnostics["recentre_events"]
+        assert recentre_events, "expected at least one recentre on this wide a swing"
+        assert len(recentre_events) <= MAX_TRACKING_RECENTRES
+        for event in recentre_events:
+            assert event["timestamp_s"] > 0.0
+
+        # A fixed window would have left the tracker `lost` for the entire
+        # remainder of the run once the outlet first left it - most frames
+        # untracked, not a handful. Recentring must keep that a small
+        # minority.
+        untracked_ratio = summary["frames_untracked"] / max(1, summary["frames_analysed"])
+        assert untracked_ratio < 0.3
+
         if summary["status"] == "confirmed":
             assert summary["efflux_seconds"] is not None
             assert abs(summary["efflux_seconds"] - clip.efflux_s) <= SYNTHETIC_TOLERANCE_S

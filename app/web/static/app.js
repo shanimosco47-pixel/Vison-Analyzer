@@ -489,24 +489,43 @@ function updateRunButton() {
   el("run-analysis").disabled = !ready;
 }
 
-function collectParams() {
+/**
+ * Build the `params` payload sent to POST /api/analyses.
+ *
+ * Takes `currentState` and a `getValue` field-reader explicitly (both
+ * default to the real page's `state`/`el(...).value`) so this can run - and
+ * be asserted on - outside a browser: see tests_js/analysis-params.test.js.
+ * The one field that mattered enough for a supervisor review against real
+ * footage to call out by name is `outlet_reference_s`: without it, a click
+ * made on a frame other than the one analysis starts from silently gets
+ * applied as if it were on frame zero (see collectParams's zahn branch
+ * below, and app/analysis/zahn_detector.py's outlet_reference_s handling).
+ */
+function collectParams(currentState = state, getValue = (id) => Number(el(id).value)) {
   const params = {};
-  if (isZahn()) {
-    if (state.roi) params.roi = state.roi;
-    else params.outlet = state.outlet;
-    params.flow_end_persistence_s = Number(el("zahn-end-persistence").value);
-    params.flow_start_persistence_s = Number(el("zahn-start-persistence").value);
-    params.activity_threshold = Number(el("zahn-sensitivity").value);
+  if (currentState.mode === "zahn_cup") {
+    if (currentState.roi) {
+      params.roi = currentState.roi;
+    } else {
+      params.outlet = currentState.outlet;
+      // The outlet is only trustworthy on the frame it was actually marked
+      // on (state.frameTime, set by loadFrameFromPreview when the frame was
+      // grabbed) - not necessarily the frame analysis starts from.
+      params.outlet_reference_s = currentState.frameTime;
+    }
+    params.flow_end_persistence_s = getValue("zahn-end-persistence");
+    params.flow_start_persistence_s = getValue("zahn-start-persistence");
+    params.activity_threshold = getValue("zahn-sensitivity");
   } else {
-    if (state.roi) params.roi = state.roi;
-    params.shortest_event_s = Number(el("shortest-event").value);
-    params.min_event_duration_s = Number(el("min-event").value);
-    params.sensitivity = Number(el("scan-sensitivity").value);
-    const roll = Number(el("roll-seconds").value);
+    if (currentState.roi) params.roi = currentState.roi;
+    params.shortest_event_s = getValue("shortest-event");
+    params.min_event_duration_s = getValue("min-event");
+    params.sensitivity = getValue("scan-sensitivity");
+    const roll = getValue("roll-seconds");
     params.pre_roll_s = roll;
     params.post_roll_s = roll;
-    if (state.mode === "robot_activity") {
-      params.idle_pause_s = Number(el("idle-pause").value);
+    if (currentState.mode === "robot_activity") {
+      params.idle_pause_s = getValue("idle-pause");
     }
   }
   return params;
@@ -1047,5 +1066,6 @@ if (typeof module !== "undefined" && module.exports) {
     computeReviewCanvasSize,
     timelinePercent,
     shouldShowZahnReview,
+    collectParams,
   };
 }

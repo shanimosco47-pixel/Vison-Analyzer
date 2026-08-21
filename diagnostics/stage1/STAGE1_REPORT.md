@@ -15,8 +15,15 @@ addressed and re-validated (§15). A fifth, independent verification round
 found and closed two reproducibility gaps (§16). A real hand-held clip was
 then supplied for the first time and **fails the real-footage acceptance
 criterion** at the current head; §17 is the diagnosis and a proposed
-design, stopped here for review before any implementation, per instruction.
-Sections 1–5 are the original Stage 1
+design. §18's four-point implementation of that design was re-validated
+only on synthetic fixtures (§19–§20), since the real clip was not
+available in this environment. A supervisor review then ran that exact
+head against the real clip directly and found two further, concrete
+blockers (§21): the frontend never actually sent `outlet_reference_s`,
+and the reference-frame search could falsely lock onto the wrong part of
+the frame. Both are addressed and re-validated (§22–§23), including a
+runtime bug the new fixtures used to prove it caught in themselves before
+this round was done (§21.4). Sections 1–5 are the original Stage 1
 submission, left as-is as the historical record of the first round;
 §6–§8 cover the first round's fixes; §9–§10 cover the second; §12–§13
 cover the third; §14–§15 cover the fourth.
@@ -1302,6 +1309,235 @@ linear scaling in frame area rather than a regression.
   **not performed** — no access to the real clip from this environment.
   Synthetic-only evidence is reported in §18.4/§18.1, explicitly caveated
   as not a substitute for running the actual file.
+
+PR #4 stays **draft and unmerged**. Stages 2 and 3 are **not started**.
+Stopping here for review, per instruction.
+
+## 21. Real-clip validation found two further blockers — addressed
+
+A supervisor comment ran `eabe29a` (§18–§20's head) against the real clip
+(`20260820_184144.mp4`) with the UI-equivalent click `(610,1025)` and
+`outlet_reference_s=4.5`. Result: `status=failed`, no start/end/efflux,
+761/811 frames untracked, only 46 liquid frames. Two concrete blockers:
+
+1. `app/web/static/app.js::collectParams()` never sent `state.frameTime`
+   as `outlet_reference_s` — `git grep` found no frontend occurrence at
+   all. Every outlet mark was silently applied as if made on frame zero,
+   regardless of what §18.1's backend wiring supported.
+2. The reference-frame search ran chronologically from `analysis_start_s`
+   and falsely reacquired at t=0, moving the ROI to `(593,1619)` — nowhere
+   near the true outlet. The fixed capture/search window, pinned to the
+   original click for the whole run, also could not follow the cup once it
+   drifted outside it later in the clip.
+
+### 21.1 Frontend wiring
+
+`collectParams()` never read `state.frameTime` at all (§18's backend
+support for `outlet_reference_s` had no caller). Fixed by sending it
+whenever an outlet click (not a drawn region) is submitted:
+
+```js
+params.outlet = currentState.outlet;
+params.outlet_reference_s = currentState.frameTime;
+```
+
+Refactored to take `currentState`/`getValue` explicitly (both default to
+the real page's `state`/`el(...).value`) so this is directly assertable
+outside a browser, matching this repo's existing pattern for
+DOM-independent unit tests (`tests_js/review.test.js`'s
+`module.exports` guard). New `tests_js/analysis-params.test.js` asserts
+the actual submitted payload: `outlet_reference_s` present and correct
+for a click (including the `frameTime: 0` case a falsy-value bug would
+drop), absent for a drawn region or a non-Zahn mode.
+
+### 21.2 Anchor-centric bidirectional tracking, replacing the blind
+     chronological search
+
+§18.1's fix pre-armed a tracker at the reference frame but then searched
+for it *chronologically forward from `analysis_start_s`* by template match
+alone — a cold search with no motion continuity between consecutive
+frames. That is exactly what a supervisor review against real footage
+found could falsely "reacquire" on an unrelated patch of the scene right
+at frame zero.
+
+Replaced with genuine optical-flow continuity in both directions from a
+single trusted anchor (`ZahnCupDetector._process_pre_reference_span`):
+decode every frame from `analysis_start_s` to `outlet_reference_s` once,
+forward (an ordinary, cheap sequential read); track *backward* through
+that buffer, from the reference frame to the first one, with the same
+Lucas-Kanade tracker used going forward — optical flow does not care
+which way time runs, only that consecutive frames are close in content.
+Score every one of those frames in the true, forward chronological order
+`StreamActivityScorer`'s background model and `FlowStateMachine` require,
+using the backward pass's per-frame positions. The reference frame is the
+only frame this run ever treats as trustworthy without verification;
+every other frame's position is reached from it by tracking, never by
+guessing where a stored patch might match. `OutletTracker`'s now-unused
+`start_in_search` parameter (last round's pre-arm mechanism) was removed
+rather than left as dead code.
+
+Bounded in memory by `outlet_reference_s - analysis_start_s` — the gap
+between where a real clip's outlet first becomes markable and where
+analysis should start, inherently small in the workflow this exists for,
+not the length of the whole recording. The search window does not
+recentre during this backward span (see §21.3) — a deliberately scoped
+limit, since the span is inherently short and this fix already resolves
+the specific false-reacquisition failure mode found on real footage.
+
+### 21.3 Search window recentring on the last credible estimate
+
+The capture/search window was fixed for the whole run once built
+(`_build_capture_roi()`, called once in `run()`): a guard-sized box padded
+by `track_search_margin_px` (80px default), centred on the original
+click and never moved. Once the true outlet drifted further than that
+from where it was clicked — exactly what the supervisor's diagnostic
+showed ("the real cup later moves outside the current x=460..760 search
+window") — the pixels it drifted to were simply never decoded. No
+tracker or reacquisition search, however good, can find something that
+was never in the crop.
+
+`ZahnCupDetector._run_loop` now drives one or more decode *segments*
+(`_run_segment`), almost always just one. A segment ends early and
+requests a *recentre* when the tracked outlet is lost on a frame right
+after having genuinely been tracked or predicted (a fresh loss, not a
+repeat of one already given up on) — bounded by `MAX_TRACKING_RECENTRES`
+(8) so a pathological run cannot recentre without limit. `_build_capture_roi`
+now accepts an optional centre (source coordinates), defaulting to the
+guard region's own centre — reproducing the original click-anchored
+window exactly when omitted.
+
+A recentre candidate is *verified*, not assumed: before accepting it, the
+still-existing tracker's own stored reference patch must correlate with
+the candidate position above `track_reacquire_min_correlation` — the same
+bar a cold reacquisition search already holds a candidate to
+(`OutletTracker.reference_patch_correlation`, a new public entry point
+onto the existing `_patch_correlation_at` machinery). A failed
+verification touches neither the tracker nor the window: the still-`lost`
+tracker keeps trying its own verified in-window reacquisition every frame
+from there, exactly as it did before this capability existed.
+
+### 21.4 Three bugs this design caught in its own test suite before reaching review
+
+None of these reached a passing state undetected — each was found by a
+dedicated regression test failing, not by later inspection. Documented
+because catching them here, rather than on the next real clip, is the
+point of writing the tests first.
+
+* **Recentring on any fresh loss, not just a loss near the window's
+  edge.** The first version only recentred when the loss coincided with
+  the tracked position sitting near the current window's edge. A new
+  synthetic fixture with a steady, one-directional outlet pan (see below)
+  showed the *dominant* real failure mode is a `predicted` bridge timing
+  out (`track_max_bridge_s`) while still comfortably in-bounds — the
+  extrapolated position never gets near the edge before the bridge simply
+  runs out. Dropped the edge-proximity condition entirely: any fresh loss
+  now triggers a recentre attempt (still verified — see below — and still
+  budget-bounded).
+* **A verification gate was needed, and its absence broke the occlusion
+  tests.** Recentring on every fresh loss, unconditionally accepting a
+  freshly-constructed tracker at the extrapolated position, immediately
+  regressed four existing tests
+  (`TestBreakDuringATrackingGap*`/`TestUnresolvedGapInTheMiddleOfFlow`):
+  during a genuine, prolonged occlusion (the outlet swung out of frame
+  entirely), the extrapolated "last credible estimate" was still treated
+  as a confident re-anchor, "recovering" tracking on plain background
+  noise mid-gap and corrupting the endpoint-uncertainty machinery those
+  tests exist to check. Fixed by §21.3's correlation-verification gate.
+  The *first* attempt at that fix still cold-started a brand-new tracker
+  as the fallback when verification failed — which has no correlation
+  check of its own, reopening the same hole one level deeper. Fixed by
+  making a failed verification a genuine no-op (§21.3's final paragraph).
+* **A recentred window sized around the wrong point.** `_build_capture_roi`
+  centres its window on the *guard region's* own centre; the first
+  recentre implementation passed the raw *outlet* position instead. The
+  guard region is not symmetric around the outlet (it reaches much
+  further down, for the stream, than up, for the cup body), so this
+  under-sized/mis-positioned the recentred window - on one synthetic
+  fixture with a perfectly *static* cup and zero drift, a single early,
+  spurious recentre event left the window too short to ever contain the
+  guard region again, and every subsequent frame silently failed the
+  guard-cut (`frames_untracked` = 100%, despite the tracker itself
+  reporting `tracked` throughout - state and trustedness are logged from
+  different sources here, which is precisely why the discrepancy was
+  visible in the diagnostics rather than just a wrong final number).
+  Fixed by shifting the candidate outlet position by the guard region's
+  fixed offset from the original click before building the window, so it
+  is always sized around where the guard region would actually be.
+
+New synthetic regression coverage (`TestSearchWindowRecentres`,
+`tests/conftest.py`'s `wide_pan_zahn_video`): a *steady, one-directional*
+outlet pan — not the existing fixtures' oscillating hand/camera drift,
+whose sinusoidal reversals stress velocity extrapolation in a way a real
+single reframe usually does not — of 380px, well beyond the ~150px a
+fixed window bounds. A flat (untextured) background, deliberately unlike
+most other fixtures: with the camera held still and only the cup panning,
+a textured background's spatial pattern sliding past the tracked window
+as it follows the cup reads as spurious activity to
+`StreamActivityScorer`'s own background model - a real, separate
+scoring-side limitation worth its own coverage another time, not
+conflated here with the one thing this fixture exists to test. The test
+asserts recentring actually engaged (`diagnostics["recentre_events"]`
+non-empty, bounded by `MAX_TRACKING_RECENTRES`), that untracked frames
+stay a small minority (a fixed window would have gone `lost` for the rest
+of the run once first exceeded), and that the reported result is either
+accurate and confirmed or honestly capped in confidence — never
+confidently wrong.
+
+## 22. Re-validation after this round's fixes
+
+```
+python -m pytest          349 passed        (pre-round: 348 passed, 0 failed)
+python -m ruff check .    All checks passed
+python -m ruff format --check .   55 files already formatted
+python -m mypy app        Success: no issues found in 29 source files
+                           (this environment's mypy run is clean this
+                           round - the 3 "unused type: ignore" errors
+                           noted last round as pre-existing/unrelated did
+                           not reappear; consistent with that finding,
+                           since they were already attributed to
+                           environment/stub-version drift rather than any
+                           code in this repo)
+node --test tests_js/*.test.js   51 pass, 0 fail (pre-round: 44 pass)
+```
+
+1 new Python test this round (§21.4's `TestSearchWindowRecentres`; the
+edge-proximity/verification/guard-centring bugs it and the pre-existing
+occlusion tests caught were fixed in place, not worked around); 4 new
+JavaScript tests (§21.1).
+
+**Runtime**: `TestPerformance` (`tests/test_zahn_tracking_integration.py`)
+already asserts elapsed time stays comfortably under the clip's own
+duration and peak RSS growth stays bounded, and passed unchanged this
+round on the same `handheld_zahn_video` fixture used for that check in
+every prior round - the added machinery (segment/recentre bookkeeping,
+the backward-tracking pass) does not change that on a clip whose drift
+never actually triggers a recentre, which is the common case this
+property needs to hold for. A clip that *does* recentre pays one extra
+out-of-band frame read (`_read_capture_frame_gray`) per recentre attempt,
+bounded by `MAX_TRACKING_RECENTRES` (8) - a fixed, small cost independent
+of clip length, not re-measured separately here since it is bounded by
+construction rather than by empirical variance the way the rest of this
+report's runtime figures are.
+
+## 23. Status and what remains
+
+* **Requirement 1** (reference-frame timeline recovery): done, and now
+  additionally hardened against the specific false-reacquisition failure
+  a real clip exposed (§21.2), with the frontend wiring that made it
+  reachable at all now actually in place (§21.1).
+* **Requirement 2** (portrait scoring-geometry fix): done, unchanged this
+  round.
+* **Requirement 3** (translucent-cup distractor lock): unchanged this
+  round - still partially done, per §20's status, with the untractable
+  sub-case still requiring Stage 3.
+* **Requirement 4** (validation against the real clip's ~16.6s target):
+  **still not performed** — no access to the real clip from this
+  environment. This round's fixes were built and validated entirely
+  against the supervisor's *description* of the real clip's failure
+  (the exact click, `outlet_reference_s`, and the reported diagnostic
+  counts) and new synthetic fixtures constructed to reproduce that class
+  of failure, never against the file itself. That remains the one
+  criterion this report cannot honestly claim to have met.
 
 PR #4 stays **draft and unmerged**. Stages 2 and 3 are **not started**.
 Stopping here for review, per instruction.
