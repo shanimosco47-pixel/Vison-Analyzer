@@ -9,10 +9,12 @@ changes (§6). All five were implemented, tested, and re-validated (§7).
 A second review round of that revision found three remaining blocking
 gaps plus two minor issues (§9); all were addressed and re-validated
 (§10). A third review round found one remaining blocking gap in that
-fix's own semantics (§12); it is addressed and re-validated (§13).
-Sections 1–5 are the original Stage 1 submission, left as-is as the
-historical record of the first round; §6–§8 cover the first round's
-fixes; §9–§10 cover the second; §12–§13 cover the third.
+fix's own semantics (§12); it was addressed and re-validated (§13). A
+fourth review round found a state-timing bug in *that* fix (§14); it is
+addressed and re-validated (§15). Sections 1–5 are the original Stage 1
+submission, left as-is as the historical record of the first round;
+§6–§8 cover the first round's fixes; §9–§10 cover the second; §12–§13
+cover the third; §14–§15 cover the fourth.
 
 Product decision in force (final, per the approval comment): single Zahn
 mode, outlet tracking on by default, `zahn_track_outlet` as a config-only
@@ -682,3 +684,81 @@ Runtime, same `handheld_zahn_video` fixture, 3 trials, no `diagnostics_dir`:
 0.838 / 0.865 / 0.875 s, mean 0.859 s - consistent with every prior
 round's measurements (§7, §10); this round changed only how bounds are
 computed at end-confirmation, not what gets decoded or how often.
+
+## 14. Fourth Codex review round — a state-timing bug in the third round's own fix
+
+Codex re-reviewed `34e0391` (§12–§13's revision): the bounds fix was
+confirmed directionally correct, but flagged one remaining state-semantics
+bug in exactly the code that fix touched.
+
+### 14.1 — `end_gap_unresolved` was promoted at gap-close time, before knowing what followed
+
+**Finding:** `update()`'s gap-close handling set `_unresolved_flow_gap =
+True` the moment a qualifying gap closed while flowing - *before* the
+first trusted sample after it had even been classified as liquid or
+absence. That meant the *ordinary* adjacent-to-the-end case (a gap closes,
+then only trusted absence follows, confirming the end - liquid never
+resumes) was also being labelled `end_gap_unresolved`, even though nothing
+demonstrated resumption. Such a measurement then got the mid-flow warning
+("liquid was seen again afterward"), which is simply false for that case -
+exactly the wording §12.1 introduced specifically to avoid saying when
+liquid genuinely never returned.
+
+A second, related gap: when a *real* mid-flow gap and a separate,
+genuinely adjacent end gap coexisted in the same run, the `if/elif` chains
+in both `score_confidence` and `_build_result`'s warnings reported only
+whichever check ran first, silently dropping the other's genuine reason.
+
+**Fix:**
+* The promotion of `_unresolved_flow_gap` moved out of `update()`'s
+  gap-close block entirely, into `_update_flowing`'s liquid-present
+  branch - the one point that actually demonstrates resumption. A gap
+  closing now only ever populates `_gap_after_activity` (a *candidate*);
+  whether it becomes an honest adjacent bound (absence follows, never
+  promoted) or `end_gap_unresolved` (liquid resumes, promoted right there
+  before `_gap_after_activity` is cleared) is decided by what happens
+  next, never by the gap closing alone.
+* `score_confidence`'s `not end_confirmed` block and `_build_result`'s
+  `REVIEW`-status warnings block were both changed from `if/elif` chains
+  to independent `if`s (with a `has_adjacent_end_bound` guard requiring
+  genuine bounds, not just `end_uncertain`), so a mid-flow reason and an
+  adjacent-gap reason are both reported when both genuinely apply, instead
+  of one masking the other.
+
+**Evidence:**
+* `tests/test_zahn_state_machine.py::TestUntrackedGapsDuringFlow::test_a_gap_immediately_adjacent_to_the_end_is_not_mislabelled_mid_flow` -
+  the case the bug actually manifested in: one qualifying gap, trusted
+  absence only afterward, asserts `end_gap_unresolved is False`.
+* `tests/test_zahn_tracking_integration.py::TestBreakDuringATrackingGap::test_this_adjacent_gap_is_not_mislabelled_as_a_resumed_mid_flow_gap` -
+  the same case over real synthetic video (the existing
+  `handheld_gap_zahn_video` fixture, occlusion spanning both the true
+  break and the true end - liquid never returns), asserting
+  `summary["end_gap_unresolved"] is False` and that the warning text
+  contains "could have occurred earlier" but neither "seen again" nor
+  "resumed".
+* `tests/test_zahn_state_machine.py::TestConfidence::test_a_mid_flow_gap_and_a_separate_adjacent_gap_both_get_a_reason` -
+  two distinct gaps in one run (one genuinely mid-flow, one genuinely
+  adjacent), asserting `score_confidence`'s `reasons` contains *both* the
+  mid-flow phrase and the adjacent-gap phrase, not just one.
+* The existing two-gap test from §12
+  (`test_a_mid_flow_gap_plus_a_separate_adjacent_end_gap_keeps_the_adjacent_bounds`)
+  still passes unchanged - it happened not to distinguish the buggy and
+  fixed promotion timing (both set `end_gap_unresolved=True` there, since
+  a genuine mid-flow gap was already present), which is exactly why the
+  dedicated adjacent-only test above was needed to actually catch this.
+
+## 15. Re-validation after the fourth round's fix
+
+```
+python -m pytest          342 passed        (previous: 339 passed, 0 failed)
+python -m ruff check .    All checks passed
+python -m ruff format --check .   all files already formatted
+python -m mypy app        Success: no issues found in 29 source files
+node --test tests_js/*.test.js   44 pass, 0 fail
+```
+
+3 new tests this round, all described above. Runtime, same
+`handheld_zahn_video` fixture, 3 trials, no `diagnostics_dir`: 0.808 /
+0.824 / 0.900 s, mean 0.844 s - consistent with every prior round; this
+was purely a state-timing and reason-composition fix, no change to what
+gets decoded.

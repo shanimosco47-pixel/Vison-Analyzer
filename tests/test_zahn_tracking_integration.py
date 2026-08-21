@@ -157,6 +157,30 @@ class TestBreakDuringATrackingGap:
         result = _run(clip.path, clip.outlet_at_reference)
         _assert_no_precise_duration_leaks(result)
 
+    def test_this_adjacent_gap_is_not_mislabelled_as_a_resumed_mid_flow_gap(
+        self, handheld_gap_zahn_video
+    ):
+        """Third Codex review round: a promotion-timing regression.
+
+        Liquid never returns after this gap - the occlusion covers both the
+        true break and the true end, so trusted observation resumes
+        straight into absence, confirming the end via the ordinary
+        adjacent-gap path. A gap being wide enough must not, on its own,
+        mark the measurement end_gap_unresolved: that flag is reserved for
+        a gap trusted liquid was actually seen to resume *after*, which
+        this case is not.
+        """
+        clip = handheld_gap_zahn_video
+        result = _run(clip.path, clip.outlet_at_reference)
+        summary = result.summary
+
+        assert summary["end_gap_unresolved"] is False
+        assert result.warnings
+        warning_text = " ".join(result.warnings).lower()
+        assert "could have occurred earlier" in warning_text
+        assert "seen again" not in warning_text
+        assert "resumed" not in warning_text
+
     def test_fixed_roi_cannot_see_through_the_same_gap_either(self, handheld_gap_zahn_video):
         """Sanity check: the gap is real footage, not a tracking-only artefact."""
         clip = handheld_gap_zahn_video

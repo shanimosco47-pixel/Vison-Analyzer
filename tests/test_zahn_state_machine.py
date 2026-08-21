@@ -308,6 +308,33 @@ class TestUntrackedGapsDuringFlow:
         assert machine.measurement.end_uncertainty_bounds is None
         assert machine.measurement.end_gap_unresolved is False
 
+    def test_a_gap_immediately_adjacent_to_the_end_is_not_mislabelled_mid_flow(self):
+        """Third Codex review round: a promotion-timing regression.
+
+        A first fix for this class set end_gap_unresolved the instant a
+        qualifying gap *closed*, before knowing whether liquid or absence
+        followed - so this ordinary adjacent-to-the-end case (liquid never
+        resumes; trusted absence follows straight through to a confirmed
+        end) was wrongly labelled the same as genuine mid-flow resumption.
+        Promotion must wait for liquid to actually be observed again.
+        """
+        machine = FlowStateMachine(config(flow_start_persistence_s=0.2, flow_end_persistence_s=0.5))
+        entries: list[tuple[ScoreSample, bool]] = []
+        entries += [(liquid(), True)] * 30  # clean, trusted flow
+        entries += [(empty(), False)] * 15  # untracked gap (> the 0.5 s default)...
+        entries += [(empty(), True)] * 20  # ...followed only by trusted absence: ends cleanly
+
+        feed_trust(machine, entries)
+
+        assert machine.finished
+        assert machine.measurement.end_confirmed is False
+        assert machine.measurement.end_uncertain is True
+        assert machine.measurement.end_uncertainty_bounds is not None
+        # The bug: this must stay False. Liquid was never seen again after
+        # the gap, so nothing here demonstrates resumption - it is solely
+        # the ordinary adjacent-gap case end_uncertainty_bounds exists for.
+        assert machine.measurement.end_gap_unresolved is False
+
 
 class TestBreaksAndContinuity:
     def test_long_breaks_are_recorded(self):
@@ -353,6 +380,32 @@ class TestConfidence:
         confidence, reasons = score_confidence(measurement, config())
         assert confidence <= 0.5
         assert any("lower bound" in reason for reason in reasons)
+
+    def test_a_mid_flow_gap_and_a_separate_adjacent_gap_both_get_a_reason(self):
+        """Third Codex review round: compose, don't mask, distinct concerns.
+
+        Two different gaps in the same run - one genuinely mid-flow (liquid
+        resumes after it), one genuinely adjacent to the end (liquid never
+        resumes) - are two independent reasons a viewer should see, not one
+        hiding the other.
+        """
+        machine = FlowStateMachine(config(flow_start_persistence_s=0.2, flow_end_persistence_s=0.5))
+        entries: list[tuple[ScoreSample, bool]] = []
+        entries += [(liquid(), True)] * 30  # clean, trusted flow
+        entries += [(empty(), False)] * 15  # mid-flow gap: liquid resumes after it
+        entries += [(liquid(), True)] * 50
+        entries += [(empty(), False)] * 15  # a second, separate gap...
+        entries += [(empty(), True)] * 20  # ...adjacent to the end: liquid never resumes
+
+        feed_trust(machine, entries)
+        measurement = machine.measurement
+        assert measurement.end_gap_unresolved is True
+        assert measurement.end_uncertainty_bounds is not None
+
+        _, reasons = score_confidence(measurement, config())
+        joined = " ".join(reasons).lower()
+        assert "seen again afterward" in joined  # the mid-flow reason
+        assert "could have occurred anywhere in that span" in joined  # the adjacent reason
 
     def test_disturbance_reduces_confidence(self):
         settings = config(flow_start_persistence_s=0.2, flow_end_persistence_s=0.5)

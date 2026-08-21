@@ -467,6 +467,15 @@ class FlowStateMachine:
         # entirely. All this flag may honestly claim is that continuity
         # through that span could not be verified - see
         # FlowMeasurement.end_gap_unresolved.
+        #
+        # Set only once liquid *actually resumes* after a qualifying gap -
+        # in _update_flowing's liquid-present branch, not when the gap
+        # itself closes (Codex review, third round). A gap closing proves
+        # nothing yet about what follows: setting this at close time also
+        # mislabelled the ordinary case where trusted absence follows
+        # straight through to a confirmed end (liquid never resumed) as
+        # "mid-flow", when that case is genuinely just the adjacent-gap
+        # one _gap_after_activity already exists for.
         self._unresolved_flow_gap = False
         # Symmetric bookkeeping for the start side: the timestamp of the
         # last trusted frame seen at all (regardless of content - "flow
@@ -550,11 +559,12 @@ class FlowStateMachine:
                     # first trusted frame - not just during the untrusted
                     # span itself, since ordinary quiet-but-trusted frames
                     # right before it are equally unable to prove flow had
-                    # already ended.
-                    gap = (self._last_activity_s, timestamp_s)
-                    self._gap_after_activity = gap
-                    if (gap[1] - gap[0]) > self.config.zahn_max_endpoint_uncertainty_s:
-                        self._unresolved_flow_gap = True
+                    # already ended. Only a candidate here: whether this
+                    # becomes an honest end-adjacent bound or gets promoted
+                    # to end_gap_unresolved is decided by what happens next,
+                    # not by the gap closing alone (Codex review, third
+                    # round - see _update_flowing's liquid-present branch).
+                    self._gap_after_activity = (self._last_activity_s, timestamp_s)
             elif self._gap_start_ts is not None:
                 # Symmetric case, still waiting for flow to start: the last
                 # trusted frame before the gap - whatever it showed - is
@@ -646,10 +656,16 @@ class FlowStateMachine:
             # Fresh, trusted liquid supersedes the *adjacency* signal: flow
             # demonstrably continued past it, so this particular gap is no
             # longer immediately next to whatever end eventually gets
-            # reported. _unresolved_flow_gap is deliberately NOT cleared
-            # here - see its docstring: a gap seen anywhere while flowing
-            # must keep poisoning the eventual end confirmation, however
-            # long afterward flow actually stops (Codex review).
+            # reported - it is promoted here, at the moment liquid actually
+            # proves resumption, to _unresolved_flow_gap instead (Codex
+            # review, third round: promoting this at gap-close time instead
+            # - before knowing whether liquid or absence follows - wrongly
+            # relabelled the ordinary adjacent-to-end case too, since that
+            # case never reaches this liquid-present branch at all).
+            if self._gap_after_activity is not None:
+                gap_start, gap_end = self._gap_after_activity
+                if (gap_end - gap_start) > self.config.zahn_max_endpoint_uncertainty_s:
+                    self._unresolved_flow_gap = True
             self._gap_after_activity = None
             return
 
@@ -1373,6 +1389,13 @@ class ZahnCupDetector(BaseDetector):
                 "background."
             )
         elif status is EventStatus.REVIEW:
+            # Independent ifs, not if/elif (Codex review, third round): a
+            # mid-flow gap (end_gap_unresolved), a separate genuinely
+            # adjacent end gap, and start uncertainty can each independently
+            # apply to the same measurement (e.g. two different gaps in one
+            # run) - every concern that actually applies gets its own
+            # warning, rather than the first check found masking the rest.
+            warned = False
             if measurement.end_gap_unresolved:
                 # Deliberately does not say the true end "could have
                 # occurred earlier" - trusted liquid seen again after the
@@ -1384,18 +1407,25 @@ class ZahnCupDetector(BaseDetector):
                     "reported end may not reflect a single continuous stream - please "
                     "review the footage directly before using this measurement."
                 )
-            elif measurement.end_uncertain and measurement.start_uncertain:
+                warned = True
+
+            has_adjacent_end_bound = (
+                measurement.end_uncertain and measurement.end_uncertainty_bounds is not None
+            )
+            if has_adjacent_end_bound and measurement.start_uncertain:
                 warnings.append(
                     "The outlet was not confidently tracked around the reported start "
                     "or the reported end - the true efflux time could be shorter or "
                     "longer than shown. Please review before using this number."
                 )
-            elif measurement.end_uncertain:
+                warned = True
+            elif has_adjacent_end_bound:
                 warnings.append(
                     "The outlet was not confidently tracked around the reported end - "
                     "the true end could have occurred earlier. Please review before "
                     "using this number."
                 )
+                warned = True
             elif measurement.start_uncertain:
                 warnings.append(
                     "The outlet was not confidently tracked around the reported start "
@@ -1403,7 +1433,9 @@ class ZahnCupDetector(BaseDetector):
                     "time reported here too short. Please review before using this "
                     "number."
                 )
-            else:
+                warned = True
+
+            if not warned:
                 warnings.append(
                     "The measurement is uncertain - please review the marked start and "
                     "end before using this number."
@@ -1538,6 +1570,14 @@ def score_confidence(measurement: FlowMeasurement, config: ZahnConfig) -> tuple[
 
     if not measurement.end_confirmed:
         confidence = min(confidence, 0.50)
+        # Independent ifs, not if/elif (Codex review, third round): a
+        # mid-flow gap and a separate, genuinely adjacent end gap can
+        # coexist in the same run (two different gaps) - each is a real,
+        # distinct concern and both reasons must be reported, not just
+        # whichever is checked first.
+        has_adjacent_end_bound = (
+            measurement.end_uncertain and measurement.end_uncertainty_bounds is not None
+        )
         if measurement.end_gap_unresolved:
             # Deliberately does NOT say the true end "could have occurred
             # earlier" (Codex review, second round): trusted liquid was
@@ -1551,7 +1591,7 @@ def score_confidence(measurement: FlowMeasurement, config: ZahnConfig) -> tuple[
                 "reported end may not reflect a single continuous stream, so the "
                 "efflux time is not reported as precise."
             )
-        elif measurement.end_uncertain and measurement.end_uncertainty_bounds is not None:
+        if has_adjacent_end_bound and measurement.end_uncertainty_bounds is not None:
             gap_start, gap_end = measurement.end_uncertainty_bounds
             reasons.append(
                 f"The outlet was not confidently tracked for {gap_end - gap_start:.2f}s "
@@ -1559,7 +1599,7 @@ def score_confidence(measurement: FlowMeasurement, config: ZahnConfig) -> tuple[
                 "could have occurred anywhere in that span, so the efflux time is not "
                 "reported as precise."
             )
-        else:
+        if not measurement.end_gap_unresolved and not has_adjacent_end_bound:
             reasons.append(
                 "The video ended while liquid was still visible, so the efflux time is a "
                 "lower bound rather than a measurement."
