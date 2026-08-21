@@ -762,3 +762,95 @@ node --test tests_js/*.test.js   44 pass, 0 fail
 0.824 / 0.900 s, mean 0.844 s - consistent with every prior round; this
 was purely a state-timing and reason-composition fix, no change to what
 gets decoded.
+
+## 16. Independent verification round — Windows reproducibility and evidence accuracy
+
+After acceptance at `7181500`, the supervisor independently verified from a
+fresh Python 3.12 virtualenv built from `requirements-dev.txt`, including on
+Windows, and reopened acceptance with three findings. None touch the
+tracking/timing logic itself; all three are about reproducibility and
+evidence accuracy.
+
+### 16.1 — `tests/test_zahn_tracking_integration.py` could not be collected on Windows
+
+**Finding:** the module imported the POSIX-only `resource` module at module
+scope (used by exactly one test, for peak-RSS measurement), so importing it
+at all raised `ModuleNotFoundError` on Windows before pytest could collect
+any test in the file - not just the one test that actually needs it.
+
+**Fix:** the import is now wrapped in `try`/`except ImportError`, falling
+back to `resource = None`. `test_runtime_and_memory_are_bounded` (the one
+test that reads `resource.getrusage`) is now decorated
+`@pytest.mark.skipif(resource is None, ...)`, so it - and only it - is
+skipped on Windows; every other test in the module, including the rest of
+`TestPerformance`, collects and runs normally. A new
+`test_runtime_is_bounded_without_the_platform_specific_rss_check` keeps the
+portable half of the check (elapsed time under the clip's own duration)
+running unconditionally on every platform, so Windows still gets a runtime
+sanity check even without the RSS measurement.
+
+**Verified** (no Windows machine available here) by simulating the failure
+mode directly: monkeypatching `builtins.__import__` to raise `ImportError`
+for `resource` and re-importing the module fresh confirms it now imports
+cleanly with `resource is None`, and running `TestPerformance` under that
+same simulated condition collects both tests, skips exactly the RSS one,
+and passes the portable one.
+
+### 16.2 — A clean install could resolve a NumPy version mypy cannot check under this project's Python target
+
+**Finding:** `numpy>=1.26,<3` let a clean install resolve NumPy 2.5.2,
+whose own `.pyi` stubs (`numpy/__init__.pyi`) use PEP 695 `type` statement
+syntax - syntax mypy only accepts under `python_version >= "3.12"`. This
+project's mypy config targets `python_version = "3.10"` (the project's own
+minimum supported Python), so `mypy app` fails while merely *parsing*
+NumPy's stub file, with no code of this project's own involved at all. This
+is a known, currently-unresolved mypy limitation
+([python/mypy#21178](https://github.com/python/mypy/issues/21178)): syntax
+gating by `python_version` is applied even inside third-party stub files.
+
+**Fix:** `numpy` is now bounded `>=1.26,<2.5` in both `pyproject.toml` and
+`requirements.txt`, with a comment explaining why. Verified directly in
+this environment: the installed NumPy 2.4.6 (the newest release satisfying
+the new bound) contains no `type` statements anywhere in its stub tree
+(`grep` came back empty), and `mypy app` passes cleanly against it. The
+exact 2.5.2 reproduction could not be re-run here (this environment's
+package index does not offer a version past 2.4.6), so the fix is verified
+by confirming the newest *allowed* version is clean, not by reproducing the
+failing version - noted explicitly rather than claimed as directly
+reproduced.
+
+### 16.3 — The report's `ruff format --check .` claims were not accurate at full-repo scope
+
+**Finding:** every round's evidence block in this report claims
+`ruff format --check .` (or equivalent) passed, but that was only ever
+actually run against the files touched in that round - five pre-existing
+`diagnostics/stage0/*.py` scratch scripts (committed before Stage 1, never
+touched by any of this stage's changes) would be reformatted, so the
+repo-wide claim was false as written.
+
+**Fix:** formatted those five files (`ablate.py`, `make_handheld_clip.py`,
+`save_frames.py`, `track_probe.py`, `widen_roi.py`) - a pure, deterministic
+whitespace/line-wrap operation with no behavioural change, confirmed by
+`git diff` showing only reformatting. One additional line
+`ruff format` could not auto-wrap (an f-string past the 100-column limit in
+`save_frames.py`) was split by hand. This makes every prior round's
+`ruff format --check .` claim retroactively true at full-repo scope, rather
+than requiring every evidence line in six sections of report history to be
+rewritten to a narrower, previously-undocumented scope.
+
+### 16.4 — Re-validation
+
+```
+python -m pytest          343 passed        (previous: 342 passed, 0 failed)
+python -m ruff check .    All checks passed
+python -m ruff format --check .   55 files already formatted (repo-wide, no exclusions)
+python -m mypy app        Success: no issues found in 29 source files
+node --test tests_js/*.test.js   44 pass, 0 fail
+```
+
+1 new test this round (§16.1's portable runtime check). Windows collection
+and the skip behaviour were verified by simulation, per §16.1, since no
+Windows machine is available in this environment - **exact clean-environment
+Windows pass/skip counts, and confirmation of the NumPy bound against the
+originally-reported 2.5.2, remain to be run by the supervisor** on their
+own Windows/clean-venv setup, as neither is reproducible from here.

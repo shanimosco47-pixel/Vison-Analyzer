@@ -29,7 +29,11 @@ from app.video.sampling import frames_to_seconds, scale_factor_for_width
 
 HERE = Path(__file__).parent
 GREEN, RED, BLUE, YELLOW, MAGENTA = (
-    (0, 200, 0), (0, 0, 255), (255, 120, 0), (0, 200, 255), (255, 0, 255)
+    (0, 200, 0),
+    (0, 0, 255),
+    (255, 120, 0),
+    (0, 200, 255),
+    (255, 0, 255),
 )
 
 
@@ -65,8 +69,9 @@ def analyse(clip: Path, out_dir: Path) -> dict[str, Any]:
         "true_end": truth["flow_end_s"],
     }
     # A false positive after the true end, and the frame of biggest displacement.
-    fps_after = [t for t, r in sorted(trace.items())
-                 if t > truth["flow_end_s"] + 0.05 and r["liquid"] >= 0.5]
+    fps_after = [
+        t for t, r in sorted(trace.items()) if t > truth["flow_end_s"] + 0.05 and r["liquid"] >= 0.5
+    ]
     if fps_after:
         wanted["false_positive_after_break"] = fps_after[len(fps_after) // 2]
         wanted["last_false_positive"] = fps_after[-1]
@@ -102,15 +107,34 @@ def analyse(clip: Path, out_dir: Path) -> dict[str, Any]:
             # exactly at the moment a diagnostic frame is written.
             crop = frame[guard.y : guard.y2, guard.x : guard.x2]
             h, w = crop.shape[:2]
-            small = cv2.resize(crop, (max(1, round(w * scale)), max(1, round(h * scale))),
-                               interpolation=cv2.INTER_AREA)
+            small = cv2.resize(
+                crop,
+                (max(1, round(w * scale)), max(1, round(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
             small = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (3, 3), 0)
             scored = scorer.score(FrameSample(index=index, timestamp_s=t, image=small, scale=scale))
 
             label = targets.get(t)
             if label:
-                written.append(_write(out_dir, clip.stem, label, t, index, frame, roi, guard,
-                                      band_px, gx, gy, hidden, scored, trace.get(t, {})))
+                written.append(
+                    _write(
+                        out_dir,
+                        clip.stem,
+                        label,
+                        t,
+                        index,
+                        frame,
+                        roi,
+                        guard,
+                        band_px,
+                        gx,
+                        gy,
+                        hidden,
+                        scored,
+                        trace.get(t, {}),
+                    )
+                )
             index += 1
     finally:
         capture.release()
@@ -140,8 +164,9 @@ def _write(out_dir, stem, label, t, index, frame, roi, guard, band_px, gx, gy, h
     cv2.drawMarker(canvas, (roi.x + roi.width // 2, roi.y), MAGENTA, cv2.MARKER_TILTED_CROSS, 14, 1)
 
     if scored.mask is not None and scored.mask.any():
-        mask = cv2.resize(scored.mask * 255, (roi.width, roi.height),
-                          interpolation=cv2.INTER_NEAREST)
+        mask = cv2.resize(
+            scored.mask * 255, (roi.width, roi.height), interpolation=cv2.INTER_NEAREST
+        )
         patch = canvas[roi.y : roi.y2, roi.x : roi.x2]
         patch[mask > 0] = (0, 0, 255)
 
@@ -150,7 +175,8 @@ def _write(out_dir, stem, label, t, index, frame, roi, guard, band_px, gx, gy, h
         f"t={t:.3f}s  frame={index}",
         "green=fixed ROI  yellow=outlet band  blue=guard",
         "red cross=true outlet  magenta=marked outlet",
-        f"outlet drift={0.0 if hidden else np.hypot(gx-(roi.x+roi.width/2), gy-roi.y):.1f}px"
+        f"outlet drift="
+        f"{0.0 if hidden else np.hypot(gx - (roi.x + roi.width / 2), gy - roi.y):.1f}px"
         + ("  OUTLET OUT OF FRAME" if hidden else ""),
         f"activity={row.get('activity', float('nan')):.3f}"
         f" outlet={row.get('outlet', float('nan')):.3f}"
@@ -178,9 +204,11 @@ def main() -> int:
     for clip in sorted(args.clips.glob("*.mp4")):
         stats = analyse(clip, args.out)
         report.append(stats)
-        print(f"{stats['clip']:24s} {stats['max_outlet_offset_px']:7.1f} "
-              f"{stats['mean_outlet_offset_px']:8.1f} {stats['pct_outlet_outside_roi']:8.1f} "
-              f"{stats['pct_outlet_below_outlet_band']:11.1f}")
+        print(
+            f"{stats['clip']:24s} {stats['max_outlet_offset_px']:7.1f} "
+            f"{stats['mean_outlet_offset_px']:8.1f} {stats['pct_outlet_outside_roi']:8.1f} "
+            f"{stats['pct_outlet_below_outlet_band']:11.1f}"
+        )
     (HERE / "geometry.json").write_text(json.dumps(report, indent=2))
     return 0
 

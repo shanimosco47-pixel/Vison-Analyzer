@@ -77,7 +77,7 @@ def probe(clip: Path, min_features: int = 24) -> dict:
             nxt, status, err = cv2.calcOpticalFlowPyrLK(prev, gray, pts, None, **LK)
             back, status2, _ = cv2.calcOpticalFlowPyrLK(gray, prev, nxt, None, **LK)
             good = (status.ravel() == 1) & (status2.ravel() == 1)
-            good &= np.linalg.norm(back - pts, axis=2).ravel() < 1.0   # forward-backward check
+            good &= np.linalg.norm(back - pts, axis=2).ravel() < 1.0  # forward-backward check
             a, b = pts[good], nxt[good]
             if len(a) >= 6:
                 matrix, inliers = cv2.estimateAffinePartial2D(
@@ -115,13 +115,17 @@ def main() -> int:
     parser.add_argument("--clips", type=Path, default=HERE / "clips")
     args = parser.parse_args()
     rows = []
-    print(f"{'clip':24s} {'frames':>7s} {'tracked%':>9s} {'redet':>6s} "
-          f"{'mean_px':>8s} {'p95_px':>7s} {'max_px':>7s}")
+    print(
+        f"{'clip':24s} {'frames':>7s} {'tracked%':>9s} {'redet':>6s} "
+        f"{'mean_px':>8s} {'p95_px':>7s} {'max_px':>7s}"
+    )
     for clip in sorted(args.clips.glob("*.mp4")):
         r = probe(clip)
         rows.append(r)
-        print(f"{r['clip']:24s} {r['frames']:7d} {r['tracked_pct']:9.1f} {r['redetections']:6d} "
-              f"{r['err_mean_px']:8.2f} {r['err_p95_px']:7.2f} {r['err_max_px']:7.2f}")
+        print(
+            f"{r['clip']:24s} {r['frames']:7d} {r['tracked_pct']:9.1f} {r['redetections']:6d} "
+            f"{r['err_mean_px']:8.2f} {r['err_p95_px']:7.2f} {r['err_max_px']:7.2f}"
+        )
     (HERE / "track_probe.json").write_text(json.dumps(rows, indent=2))
     return 0
 

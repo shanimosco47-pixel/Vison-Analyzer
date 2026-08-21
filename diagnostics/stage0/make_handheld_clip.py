@@ -40,8 +40,8 @@ class ClipSpec:
 
     # Timeline (seconds).  These four numbers *are* the ground truth.
     flow_start_s: float = 3.0
-    stream_break_s: float = 19.0   # continuous stream ends, drops begin
-    last_drop_s: float = 20.5      # final drop leaves the outlet
+    stream_break_s: float = 19.0  # continuous stream ends, drops begin
+    last_drop_s: float = 20.5  # final drop leaves the outlet
     drop_period_s: float = 0.3
 
     # Appearance.  Background is near-white; the deltas are how much darker
@@ -77,8 +77,8 @@ def _world_background(spec: ClipSpec, rng: np.random.Generator) -> np.ndarray:
     h, w = spec.height + 2 * MARGIN, spec.width + 2 * MARGIN
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     field = np.full((h, w), float(spec.background_level), dtype=np.float32)
-    field -= spec.texture_strength * (yy / h)                       # top-lit wall
-    field += 0.5 * spec.texture_strength * np.sin(xx / 47.0)        # faint banding
+    field -= spec.texture_strength * (yy / h)  # top-lit wall
+    field += 0.5 * spec.texture_strength * np.sin(xx / 47.0)  # faint banding
     field += 0.4 * spec.texture_strength * np.sin((xx + yy) / 91.0)
     # A couple of very faint marks so translation is locally observable.
     cv2.circle(field, (int(0.22 * w), int(0.30 * h)), 26, float(spec.background_level - 9), -1)
@@ -222,21 +222,26 @@ CLIPS: dict[str, ClipSpec] = {
     # The reported field condition: everything moves, everything is white.
     "handheld_white": ClipSpec(name="handheld_white"),
     # One variable removed at a time, against the same timeline.
-    "static_white": ClipSpec(name="static_white", camera_drift_px=0.0, hand_drift_px=0.0,
-                             tremor_px=0.0),
+    "static_white": ClipSpec(
+        name="static_white", camera_drift_px=0.0, hand_drift_px=0.0, tremor_px=0.0
+    ),
     "handheld_contrast": ClipSpec(name="handheld_contrast", cup_delta=90, stream_delta=110),
-    "static_contrast": ClipSpec(name="static_contrast", camera_drift_px=0.0, hand_drift_px=0.0,
-                                tremor_px=0.0, cup_delta=90, stream_delta=110),
+    "static_contrast": ClipSpec(
+        name="static_contrast",
+        camera_drift_px=0.0,
+        hand_drift_px=0.0,
+        tremor_px=0.0,
+        cup_delta=90,
+        stream_delta=110,
+    ),
     # Camera moves but the cup is on a stand: isolates global motion.
     "camera_only_white": ClipSpec(name="camera_only_white", hand_drift_px=0.0),
     # Cup moves but the camera is on a tripod: isolates ROI drift.
     "hand_only_white": ClipSpec(name="hand_only_white", camera_drift_px=0.0, tremor_px=0.0),
     # No tail drops at all: the stream simply stops.  Isolates the tail rule.
-    "handheld_no_drops": ClipSpec(name="handheld_no_drops", stream_break_s=19.0,
-                                  last_drop_s=19.0),
+    "handheld_no_drops": ClipSpec(name="handheld_no_drops", stream_break_s=19.0, last_drop_s=19.0),
     # The true break happens while the outlet is out of frame (Stage 1 case).
-    "handheld_gap_at_break": ClipSpec(name="handheld_gap_at_break",
-                                      occlusion_s=(18.4, 21.2)),
+    "handheld_gap_at_break": ClipSpec(name="handheld_gap_at_break", occlusion_s=(18.4, 21.2)),
 }
 
 

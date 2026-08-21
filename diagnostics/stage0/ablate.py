@@ -95,8 +95,10 @@ def run_variant(clip: Path, variant: str) -> dict[str, Any]:
                 continue
 
             guard = ROI(
-                x=int(round(guard0.x + dx)), y=int(round(guard0.y + dy)),
-                width=guard0.width, height=guard0.height,
+                x=int(round(guard0.x + dx)),
+                y=int(round(guard0.y + dy)),
+                width=guard0.width,
+                height=guard0.height,
             ).clipped_to(info.width, info.height)
             if guard.width != guard0.width or guard.height != guard0.height:
                 lost_frames += 1
@@ -146,16 +148,20 @@ def main() -> int:
     args = parser.parse_args()
 
     results = []
-    print(f"{'clip':24s} {'variant':11s} {'start':>7s} {'end':>7s} {'efflux':>7s} "
-          f"{'error':>7s}  conf  lost  maxoff")
+    print(
+        f"{'clip':24s} {'variant':11s} {'start':>7s} {'end':>7s} {'efflux':>7s} "
+        f"{'error':>7s}  conf  lost  maxoff"
+    )
     for clip in sorted(args.clips.glob("*.mp4")):
         for variant in ("fixed", "tracked", "tracked+bg"):
             row = run_variant(clip, variant)
             results.append(row)
-            print(f"{row['clip']:24s} {variant:11s} {_fmt(row['start_s'])} {_fmt(row['end_s'])} "
-                  f"{_fmt(row['efflux_s'])} {_fmt(row['error_s'])}  "
-                  f"{str(row['end_confirmed'])[:5]:5s} {row['frames_skipped_lost']:4d} "
-                  f"{row['max_outlet_offset_px']:6.1f}")
+            print(
+                f"{row['clip']:24s} {variant:11s} {_fmt(row['start_s'])} {_fmt(row['end_s'])} "
+                f"{_fmt(row['efflux_s'])} {_fmt(row['error_s'])}  "
+                f"{str(row['end_confirmed'])[:5]:5s} {row['frames_skipped_lost']:4d} "
+                f"{row['max_outlet_offset_px']:6.1f}"
+            )
     args.out.write_text(json.dumps(results, indent=2))
     return 0
 

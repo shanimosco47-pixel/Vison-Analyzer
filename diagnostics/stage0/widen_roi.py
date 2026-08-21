@@ -40,15 +40,18 @@ def main() -> int:
         ox, oy = truth["outlet_at_reference"]
         base = ZahnCupDetector(info, {"outlet": {"x": round(ox), "y": round(oy)}}).roi
         wide = ROI(
-            x=base.x - args.pad, y=base.y - args.pad,
-            width=base.width + 2 * args.pad, height=base.height + args.pad,
+            x=base.x - args.pad,
+            y=base.y - args.pad,
+            width=base.width + 2 * args.pad,
+            height=base.height + args.pad,
         ).clipped_to(info.width, info.height)
 
         detector = ZahnCupDetector(info, {"roi": wide.to_dict()})
         with VideoReader(clip, info) as reader:
             summary = detector.run(reader).summary
         err = (
-            None if summary["efflux_seconds"] is None
+            None
+            if summary["efflux_seconds"] is None
             else round(summary["efflux_seconds"] - truth["efflux_s"], 3)
         )
         out.append({"clip": clip.stem, "roi": wide.to_dict(), **summary, "error_s": err})

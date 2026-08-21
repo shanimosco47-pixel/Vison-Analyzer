@@ -18,9 +18,13 @@ the same reproduction and the ablation that isolated the cause.
 
 from __future__ import annotations
 
-import resource
 import time
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is POSIX-only (no Windows build)
+    resource = None  # type: ignore[assignment]
 
 import cv2
 import numpy as np
@@ -328,6 +332,9 @@ class TestTrackingInitFailure:
 class TestPerformance:
     """Streaming and memory-bounded: tracking must not change that."""
 
+    @pytest.mark.skipif(
+        resource is None, reason="resource (RSS measurement) is POSIX-only; unavailable on Windows"
+    )
     def test_runtime_and_memory_are_bounded(self, handheld_zahn_video):
         clip = handheld_zahn_video
         before_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -340,6 +347,22 @@ class TestPerformance:
         # Peak RSS growth for one short clip's worth of small crops must stay
         # in the tens of MB, not scale with the video - one frame at a time.
         assert (after_kb - before_kb) < 200_000  # KB on Linux
+        assert result.summary["frames_analysed"] > 0
+
+    def test_runtime_is_bounded_without_the_platform_specific_rss_check(self, handheld_zahn_video):
+        """The runtime half of the check above, portable to Windows.
+
+        Only the peak-RSS assertion needs ``resource`` (POSIX-only); elapsed
+        time comfortably under the clip's own duration is checkable
+        everywhere, so it must not be skipped along with that platform-
+        specific measurement.
+        """
+        clip = handheld_zahn_video
+        started = time.perf_counter()
+        result = _run(clip.path, clip.outlet_at_reference)
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < clip.duration_s  # comfortably faster than real time
         assert result.summary["frames_analysed"] > 0
 
 
