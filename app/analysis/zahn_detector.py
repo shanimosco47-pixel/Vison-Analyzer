@@ -49,7 +49,12 @@ from ..errors import ConfigurationError, InvalidROIError
 from ..logging_setup import get_logger
 from ..video.metadata import VideoInfo
 from ..video.reader import FrameSample, VideoReader
-from ..video.sampling import build_sampling_plan, scale_factor_for_width
+from ..video.sampling import (
+    build_sampling_plan,
+    frame_index_at,
+    frames_to_seconds,
+    scale_factor_for_width,
+)
 from .base_detector import (
     ActivityScorer,
     ActivityTrace,
@@ -808,25 +813,68 @@ class ZahnCupDetector(BaseDetector):
 
         roi_param = self.params.get("roi")
         outlet = self.params.get("outlet")
+        outlet_end = self.params.get("outlet_end")
         if roi_param:
             roi = ROI.from_dict(roi_param)
             # A manually drawn region has no click to track; the horizontal
             # centre of its top edge is the closest thing to "the outlet" and
-            # matches where build_roi_from_click positions a clicked one.
+            # matches where build_roi_from_click positions a clicked one. A
+            # drawn region also has no *second* anchor - the two-anchor
+            # contract below only applies to the outlet-click flow, where
+            # there is an actual point to track drift from.
             self.outlet_xy: tuple[float, float] = (roi.x + roi.width / 2.0, float(roi.y))
-        elif outlet:
-            try:
-                roi = build_roi_from_click(
-                    int(outlet["x"]), int(outlet["y"]), self.video, self.config
+            self.outlet_end_xy: tuple[float, float] | None = None
+        elif outlet or outlet_end:
+            # Product decision (Codex review, fourth round): a single click
+            # is not enough to bound how far unsupervised tracking has to
+            # run without a human-verified checkpoint over a whole clip -
+            # both an early and a late outlet mark are required together
+            # *while tracking is actually on*. zahn_track_outlet=False is
+            # still the full, sanctioned rollback to the original
+            # single-click, fixed-ROI path (self.outlet_end_xy simply stays
+            # unused there - see run()) - it must not also gain a new UI
+            # requirement an operator explicitly opting out of tracking has
+            # no reason to satisfy.
+            if self.config.zahn_track_outlet and (not outlet or not outlet_end):
+                raise InvalidROIError(
+                    "Mark the outlet on two frames before analysing: an early "
+                    "one where it is clearly visible, and a late one near the "
+                    "expected end of the stream. Only one of the two marks "
+                    "was given."
                 )
-                self.outlet_xy = (float(outlet["x"]), float(outlet["y"]))
+            if not outlet:
+                raise InvalidROIError(
+                    "Mark the outlet hole of the cup (or draw a region below it) before analysing."
+                )
+            try:
+                early_x, early_y = int(outlet["x"]), int(outlet["y"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise InvalidROIError(
                     "The marked outlet point is not valid.", detail=str(exc)
                 ) from exc
+            try:
+                roi = build_roi_from_click(early_x, early_y, self.video, self.config)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise InvalidROIError(
+                    "The marked outlet point is not valid.", detail=str(exc)
+                ) from exc
+            self.outlet_xy = (float(early_x), float(early_y))
+            if outlet_end:
+                try:
+                    late_x, late_y = int(outlet_end["x"]), int(outlet_end["y"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise InvalidROIError(
+                        "The late outlet mark is not valid.", detail=str(exc)
+                    ) from exc
+                if not (0 <= late_x < self.video.width and 0 <= late_y < self.video.height):
+                    raise InvalidROIError("The late outlet mark is outside the video frame.")
+                self.outlet_end_xy = (float(late_x), float(late_y))
+            else:
+                self.outlet_end_xy = None
         else:
             raise InvalidROIError(
-                "Mark the outlet hole of the cup (or draw a region below it) before analysing."
+                "Mark the outlet hole of the cup on two frames (or draw a region "
+                "below it) before analysing."
             )
 
         roi.validate(self.video.width, self.video.height)
@@ -842,22 +890,60 @@ class ZahnCupDetector(BaseDetector):
         if self.end_s and self.end_s <= self.start_s:
             raise ConfigurationError("The analysis end time must be after the start time.")
 
-        # The timestamp of the frame the outlet/ROI coordinates above were
-        # actually marked on - distinct from analysis_start_s, where
-        # scoring/decoding begins (Codex review: a real hand-held clip's
-        # outlet can become markable only after the camera has already
-        # panned well past frame 0, e.g. a large early reframing). Only a
-        # click carries a meaningful reference frame; a manually drawn ROI
-        # has none, so it defaults to analysis_start_s like an unsupplied
-        # value. Clamped into [start_s, end_s] defensively - a stale or
-        # out-of-range value from a caller should degrade to "no reference
-        # frame given" rather than fail the whole analysis.
-        reference_param = self.params.get("outlet_reference_s") if outlet else None
-        self.outlet_reference_s = (
-            clamp(float(reference_param), self.start_s, self.end_s or self.start_s)
-            if reference_param is not None
-            else self.start_s
-        )
+        if self.outlet_end_xy is not None:
+            # Two-anchor contract: both timestamps are required, not
+            # defaulted - unlike the old single-reference design, there is
+            # no sane default for "when was the late anchor marked."
+            early_ref_param = self.params.get("outlet_reference_s")
+            late_ref_param = self.params.get("outlet_end_reference_s")
+            if early_ref_param is None or late_ref_param is None:
+                raise InvalidROIError(
+                    "Both outlet marks need the timestamp of the frame they "
+                    "were made on (outlet_reference_s and "
+                    "outlet_end_reference_s)."
+                )
+            try:
+                early_ref = float(early_ref_param)
+                late_ref = float(late_ref_param)
+            except (TypeError, ValueError) as exc:
+                raise InvalidROIError(
+                    "The outlet marks' timestamps are not valid.", detail=str(exc)
+                ) from exc
+            bounds_hi = self.end_s or self.start_s
+            if not self.start_s <= early_ref <= bounds_hi:
+                raise InvalidROIError(
+                    "The early outlet mark's timestamp falls outside the analysed range."
+                )
+            if not self.start_s <= late_ref <= bounds_hi:
+                raise InvalidROIError(
+                    "The late outlet mark's timestamp falls outside the analysed range."
+                )
+            if late_ref <= early_ref:
+                raise InvalidROIError(
+                    "The late outlet mark must be on a later frame than the "
+                    "early one (they cannot share, or invert, a timestamp)."
+                )
+            self.outlet_reference_s = early_ref
+            self.outlet_end_reference_s: float | None = late_ref
+        else:
+            # The timestamp of the frame the outlet/ROI coordinates above
+            # were actually marked on - distinct from analysis_start_s,
+            # where scoring/decoding begins (Codex review: a real
+            # hand-held clip's outlet can become markable only after the
+            # camera has already panned well past frame 0, e.g. a large
+            # early reframing). Only a click carries a meaningful
+            # reference frame; a manually drawn ROI has none, so it
+            # defaults to analysis_start_s like an unsupplied value.
+            # Clamped into [start_s, end_s] defensively - a stale or
+            # out-of-range value from a caller should degrade to "no
+            # reference frame given" rather than fail the whole analysis.
+            reference_param = self.params.get("outlet_reference_s") if outlet else None
+            self.outlet_reference_s = (
+                clamp(float(reference_param), self.start_s, self.end_s or self.start_s)
+                if reference_param is not None
+                else self.start_s
+            )
+            self.outlet_end_reference_s = None
 
         self.keep_diagnostics = bool(self.params.get("save_diagnostics", False))
         # Set by the service layer (job.job_id under config.diagnostics_dir),
@@ -1163,6 +1249,245 @@ class ZahnCupDetector(BaseDetector):
             last_timestamp=last_timestamp,
         )
 
+    def _build_capture_roi_for_anchors(
+        self, early_xy: tuple[float, float], late_xy: tuple[float, float]
+    ) -> ROI:
+        """A window sized and positioned to contain the guard region at
+        *either* anchor's position, for the span between them.
+
+        Same margin as ``_build_capture_roi``, but that method centres on a
+        single point; here the window must comfortably hold both anchors'
+        guard regions at once, however far apart they are, since either one
+        may need to be decoded before the tracker has established which
+        direction (forward or backward) is providing which frame. Shifting
+        each anchor by the guard region's own fixed offset from the
+        original click - not just each anchor's raw click point - before
+        taking the bounding box is what keeps this correct for the same
+        reason ``_run_loop``'s recentring does (Codex review): the guard
+        region is not symmetric around the outlet.
+        """
+        margin = self.config.track_search_margin_px
+        half_w = self.guard_roi.width / 2.0 + margin
+        half_h = self.guard_roi.height / 2.0 + margin
+        guard_dx = self.guard_roi.x + self.guard_roi.width / 2.0 - self.outlet_xy[0]
+        guard_dy = self.guard_roi.y + self.guard_roi.height / 2.0 - self.outlet_xy[1]
+        centers_x = [early_xy[0] + guard_dx, late_xy[0] + guard_dx]
+        centers_y = [early_xy[1] + guard_dy, late_xy[1] + guard_dy]
+        x0 = min(centers_x) - half_w
+        x1 = max(centers_x) + half_w
+        y0 = min(centers_y) - half_h
+        y1 = max(centers_y) + half_h
+        return ROI(
+            x=int(round(x0)),
+            y=int(round(y0)),
+            width=max(1, int(round(x1 - x0))),
+            height=max(1, int(round(y1 - y0))),
+        ).clipped_to(self.video.width, self.video.height)
+
+    def _reconcile_between_anchors(
+        self, forward: TrackResult, backward: TrackResult
+    ) -> tuple[TrackState, float, float, bool]:
+        """Trust an interior frame between two anchors only when *both*
+        directions independently agree it is tracked, and on where.
+
+        The two-anchor contract (Codex review, fourth round): a candidate
+        position is never trusted merely for lying between two human-
+        verified anchors. Either direction alone reporting anything but
+        `tracked` (a bridge, a loss, an unconfirmed reacquisition candidate)
+        or the two directions disagreeing on the position by more than
+        ``track_reconciliation_max_disagreement_px`` both fall back to
+        `lost` here, feeding the same untracked/uncertainty machinery a
+        genuine loss already does - not a special "probably fine, it's
+        between two anchors" exemption.
+        """
+        if forward.state is not TrackState.TRACKED or backward.state is not TrackState.TRACKED:
+            return TrackState.LOST, 0.0, 0.0, False
+        displacement = float(
+            np.hypot(forward.outlet_x - backward.outlet_x, forward.outlet_y - backward.outlet_y)
+        )
+        if displacement > self.config.track_reconciliation_max_disagreement_px:
+            return TrackState.LOST, 0.0, 0.0, False
+        x = (forward.outlet_x + backward.outlet_x) / 2.0
+        y = (forward.outlet_y + backward.outlet_y) / 2.0
+        return TrackState.TRACKED, x, y, forward.reacquired or backward.reacquired
+
+    def _process_between_anchors_span(
+        self,
+        *,
+        reader: VideoReader,
+        capture_roi: ROI,
+        early_local: tuple[float, float],
+        late_local: tuple[float, float],
+        include_early_frame: bool,
+        patch_half_px: int,
+        cup_half_width_px: int,
+        cup_height_above_px: int,
+        scale: float,
+        scorer: StreamActivityScorer,
+        machine: FlowStateMachine,
+        trace: ActivityTrace,
+        transitions: list[dict[str, Any]],
+        frames_log: TextIO | None,
+    ) -> _PreReferenceResult:
+        """Score every frame from the early anchor to the late anchor,
+        trusting an interior frame only when independent forward and
+        backward tracks agree (see ``_reconcile_between_anchors``), and
+        hand back a tracker anchored at the late anchor, ready to continue
+        forward.
+
+        ``include_early_frame`` is False when ``_process_pre_reference_span``
+        already scored the early anchor's own frame as the last frame of its
+        own span - this method must not score it a second time (that
+        produced an extra, duplicate analysed row - the frame-boundary bug
+        a supervisor review's real-clip diagnostics caught: an 811-frame
+        clip should never produce 812 analysed rows). It is True only when
+        the early anchor coincides with ``self.start_s`` itself, so nothing
+        upstream has scored it yet.
+
+        Method: decode every frame from the early to the late anchor once,
+        forward; track forward from the early anchor and, separately,
+        backward from the late anchor through the same buffer (optical flow
+        does not care which way time runs - see ``OutletTracker``); score
+        every frame in true chronological order using whichever of the two
+        tracks agree, or `lost` when they do not. Bounded in memory by the
+        gap between the two anchors, which for a typical Zahn run is most
+        of the clip's own (short) duration, not an unboundedly long one.
+        """
+        plan = build_sampling_plan(
+            fps=self.video.fps,
+            duration_s=self.end_s or (self.video.duration_s or 0.0),
+            interval_s=1.0 / self.video.fps,
+            scale=1.0,
+            start_s=self.outlet_reference_s,
+            end_s=self.outlet_end_reference_s,
+        )
+        samples = list(reader.iter_samples(plan, roi=capture_roi, grayscale=True, blur_kernel=0))
+        if not samples:
+            return _PreReferenceResult(
+                status="failed", reason="No frames could be decoded between the two anchors."
+            )
+        early_sample = samples[0]
+        late_sample = samples[-1]
+        if early_sample is late_sample:
+            return _PreReferenceResult(
+                status="failed",
+                reason=(
+                    "The two outlet marks resolve to the same frame; they must be further apart."
+                ),
+            )
+
+        try:
+            forward_tracker = OutletTracker(
+                self.config,
+                early_sample.image,
+                early_local,
+                patch_half_px=patch_half_px,
+                cup_half_width_px=cup_half_width_px,
+                cup_height_above_px=cup_height_above_px,
+                reference_timestamp_s=early_sample.timestamp_s,
+            )
+        except TrackerInitError as exc:
+            return _PreReferenceResult(status="failed", reason=str(exc))
+        forward_results: dict[int, TrackResult] = {
+            sample.index: forward_tracker.update(sample.image, sample.timestamp_s)
+            for sample in samples[1:]
+        }
+
+        try:
+            backward_tracker = OutletTracker(
+                self.config,
+                late_sample.image,
+                late_local,
+                patch_half_px=patch_half_px,
+                cup_half_width_px=cup_half_width_px,
+                cup_height_above_px=cup_height_above_px,
+                reference_timestamp_s=late_sample.timestamp_s,
+            )
+        except TrackerInitError as exc:
+            return _PreReferenceResult(status="failed", reason=str(exc))
+        backward_results: dict[int, TrackResult] = {
+            sample.index: backward_tracker.update(sample.image, sample.timestamp_s)
+            for sample in reversed(samples[:-1])
+        }
+
+        last_state: TrackState | None = None
+        last_timestamp = self.outlet_reference_s
+        frames_to_score = samples if include_early_frame else samples[1:]
+        for sample in frames_to_score:
+            if sample is early_sample:
+                state, local_x, local_y, reacquired = (
+                    TrackState.TRACKED,
+                    early_local[0],
+                    early_local[1],
+                    False,
+                )
+            elif sample is late_sample:
+                state, local_x, local_y, reacquired = (
+                    TrackState.TRACKED,
+                    late_local[0],
+                    late_local[1],
+                    False,
+                )
+            else:
+                state, local_x, local_y, reacquired = self._reconcile_between_anchors(
+                    forward_results[sample.index], backward_results[sample.index]
+                )
+
+            _trusted, offset_x, offset_y = self._process_tracked_frame(
+                capture_gray=sample.image,
+                sample_index=sample.index,
+                timestamp_s=sample.timestamp_s,
+                state=state,
+                local_outlet_x=local_x,
+                local_outlet_y=local_y,
+                reacquired=reacquired,
+                capture_roi=capture_roi,
+                scale=scale,
+                scorer=scorer,
+                machine=machine,
+                trace=trace,
+                frames_log=frames_log,
+            )
+            last_timestamp = sample.timestamp_s
+
+            if (
+                self.keep_diagnostics
+                and (state != last_state or reacquired)
+                and len(transitions) < MAX_DIAGNOSTIC_TRANSITIONS
+            ):
+                last_state = state
+                entry = self._diagnostic_transition(
+                    sample.timestamp_s, state, offset_x, offset_y, reacquired, capture_roi
+                )
+                if entry is not None:
+                    transitions.append(entry)
+
+            if machine.finished:
+                machine.measurement.stopped_early = True
+                return _PreReferenceResult(
+                    status="finished", last_state=state, last_timestamp=last_timestamp
+                )
+
+        try:
+            continuation_tracker = OutletTracker(
+                self.config,
+                late_sample.image,
+                late_local,
+                patch_half_px=patch_half_px,
+                cup_half_width_px=cup_half_width_px,
+                cup_height_above_px=cup_height_above_px,
+                reference_timestamp_s=late_sample.timestamp_s,
+            )
+        except TrackerInitError as exc:
+            return _PreReferenceResult(status="failed", reason=str(exc))
+
+        return _PreReferenceResult(
+            status="ready",
+            tracker=continuation_tracker,
+            last_state=last_state,
+            last_timestamp=last_timestamp,
+        )
+
     # -- execution --------------------------------------------------------- #
 
     def run(
@@ -1179,10 +1504,20 @@ class ZahnCupDetector(BaseDetector):
         recentres on the tracker's last credible estimate when the outlet
         drifts toward its edge (see ``_run_segment``), so real camera motion
         carrying the outlet well away from where it was clicked does not
-        simply run the tracker out of decoded pixels. When the outlet was
-        marked on a later reference frame than analysis should start from,
-        the span in between is tracked *backward* from that reference before
-        the main forward pass begins (see ``_process_pre_reference_span``).
+        simply run the tracker out of decoded pixels.
+
+        When both outlet anchors are given (``self.outlet_end_xy`` is not
+        None - the two-anchor contract, required for every outlet-click
+        configuration), tracking runs in three segments: backward from the
+        early anchor to analysis start if needed
+        (``_process_pre_reference_span``), forward-from-early reconciled
+        against backward-from-late between the two anchors
+        (``_process_between_anchors_span`` - an interior frame is trusted
+        only when both directions agree), then forward from the late anchor
+        to analysis end via the ordinary recentring path
+        (``_run_two_anchor``). A manually drawn region has no second anchor
+        and keeps the single-reference behaviour below.
+
         Tracking off (or unable to start - see TrackerInitError) behaves
         exactly as before: the guard region is decoded directly at analysis
         scale, fixed for the whole run.
@@ -1238,6 +1573,27 @@ class ZahnCupDetector(BaseDetector):
 
         frames_log = self._open_tracking_frames_log() if wide_capture else None
         try:
+            if wide_capture and self.outlet_end_xy is not None:
+                return self._run_two_anchor(
+                    reader=reader,
+                    progress=progress,
+                    capture_roi=capture_roi,
+                    scale=scale,
+                    capture_scale=capture_scale,
+                    blur_kernel=blur_kernel,
+                    patch_half_px=patch_half_px,
+                    cup_half_width_px=cup_half_width_px,
+                    cup_height_above_px=cup_height_above_px,
+                    scorer=scorer,
+                    machine=machine,
+                    trace=trace,
+                    transitions=transitions,
+                    started=started,
+                    plan=plan,
+                    total_span=total_span,
+                    frames_log=frames_log,
+                )
+
             if wide_capture and self.outlet_reference_s > self.start_s:
                 reference_outlet_local = (
                     self.outlet_xy[0] - capture_roi.x,
@@ -1316,6 +1672,184 @@ class ZahnCupDetector(BaseDetector):
         finally:
             if frames_log is not None:
                 frames_log.close()
+
+    def _run_two_anchor(  # noqa: PLR0913 - internal, keeps run() readable
+        self,
+        *,
+        reader: VideoReader,
+        progress: ProgressReporter,
+        capture_roi: ROI,
+        scale: float,
+        capture_scale: float,
+        blur_kernel: int,
+        patch_half_px: int,
+        cup_half_width_px: int,
+        cup_height_above_px: int,
+        scorer: StreamActivityScorer,
+        machine: FlowStateMachine,
+        trace: ActivityTrace,
+        transitions: list[dict[str, Any]],
+        started: float,
+        plan: Any,
+        total_span: float,
+        frames_log: TextIO | None,
+    ) -> DetectorResult:
+        """Drive the two-anchor tracking contract end to end.
+
+        Three segments, run in chronological order: backward from the early
+        anchor to analysis start if there is a span to cover
+        (``_process_pre_reference_span``, unchanged from the single-anchor
+        design); forward-from-early reconciled against backward-from-late
+        between the two anchors (``_process_between_anchors_span`` - an
+        interior frame is trusted only when both directions agree); then
+        forward from the late anchor to analysis end via the ordinary
+        recentring-capable path (``_run_loop``, unchanged). The transition
+        into segment C computes its start frame by *integer* index
+        (``frame_index_at``/``frames_to_seconds``), not by adding a
+        floating-point interval to a timestamp and re-deriving an index from
+        the sum - the previous single-anchor design did exactly that and a
+        real clip's diagnostics caught the fencepost it occasionally lands
+        on: 812 analysed rows for an 811-frame clip, the late anchor's own
+        frame re-scored a second time.
+        """
+        assert self.outlet_end_xy is not None
+        assert self.outlet_end_reference_s is not None
+        sample_interval_s = plan.effective_interval_s
+        last_state: TrackState | None = None
+        last_timestamp = self.start_s
+        include_early_frame = True
+
+        if self.outlet_reference_s > self.start_s:
+            early_local = (
+                self.outlet_xy[0] - capture_roi.x,
+                self.outlet_xy[1] - capture_roi.y,
+            )
+            pre = self._process_pre_reference_span(
+                reader=reader,
+                capture_roi=capture_roi,
+                reference_outlet_local=early_local,
+                patch_half_px=patch_half_px,
+                cup_half_width_px=cup_half_width_px,
+                cup_height_above_px=cup_height_above_px,
+                scale=scale,
+                scorer=scorer,
+                machine=machine,
+                trace=trace,
+                transitions=transitions,
+                frames_log=frames_log,
+            )
+            if pre.status == "failed":
+                logger.warning(
+                    "Zahn outlet tracking could not start for %s: %s",
+                    self.video.path.name,
+                    pre.reason,
+                )
+                return self._tracking_unavailable_result(
+                    pre.reason or "Tracking could not be started at the early anchor."
+                )
+            last_state, last_timestamp = pre.last_state, pre.last_timestamp
+            if pre.status == "finished":
+                return self._finalize_two_anchor(
+                    machine, trace, started, sample_interval_s, transitions, last_timestamp
+                )
+            # _process_pre_reference_span already scored the early anchor's
+            # own frame as the last frame of its span - the between-anchors
+            # segment below must not score it a second time.
+            include_early_frame = False
+
+        capture_roi_between = self._build_capture_roi_for_anchors(
+            self.outlet_xy, self.outlet_end_xy
+        )
+        early_local = (
+            self.outlet_xy[0] - capture_roi_between.x,
+            self.outlet_xy[1] - capture_roi_between.y,
+        )
+        late_local = (
+            self.outlet_end_xy[0] - capture_roi_between.x,
+            self.outlet_end_xy[1] - capture_roi_between.y,
+        )
+        between = self._process_between_anchors_span(
+            reader=reader,
+            capture_roi=capture_roi_between,
+            early_local=early_local,
+            late_local=late_local,
+            include_early_frame=include_early_frame,
+            patch_half_px=patch_half_px,
+            cup_half_width_px=cup_half_width_px,
+            cup_height_above_px=cup_height_above_px,
+            scale=scale,
+            scorer=scorer,
+            machine=machine,
+            trace=trace,
+            transitions=transitions,
+            frames_log=frames_log,
+        )
+        if between.status == "failed":
+            logger.warning(
+                "Zahn outlet tracking could not start for %s: %s",
+                self.video.path.name,
+                between.reason,
+            )
+            return self._tracking_unavailable_result(
+                between.reason or "Tracking could not be started between the two anchors."
+            )
+        last_state, last_timestamp = between.last_state, between.last_timestamp
+        if between.status == "finished":
+            return self._finalize_two_anchor(
+                machine, trace, started, sample_interval_s, transitions, last_timestamp
+            )
+        tracker = between.tracker
+
+        late_index = frame_index_at(
+            self.outlet_end_reference_s, self.video.fps, self.video.frame_count
+        )
+        forward_start_s = frames_to_seconds(late_index + 1, self.video.fps)
+        if forward_start_s > (self.end_s or last_timestamp):
+            # The late anchor was the last frame in the analysed range -
+            # nothing forward to track.
+            return self._finalize_two_anchor(
+                machine, trace, started, sample_interval_s, transitions, last_timestamp
+            )
+
+        return self._run_loop(
+            reader=reader,
+            progress=progress,
+            capture_roi=capture_roi_between,
+            wide_capture=True,
+            scale=scale,
+            capture_scale=capture_scale,
+            blur_kernel=blur_kernel,
+            patch_half_px=patch_half_px,
+            cup_half_width_px=cup_half_width_px,
+            cup_height_above_px=cup_height_above_px,
+            scorer=scorer,
+            machine=machine,
+            trace=trace,
+            tracker=tracker,
+            transitions=transitions,
+            last_state=last_state,
+            first_frame=False,
+            started=started,
+            last_report=0.0,
+            segment_start_s=forward_start_s,
+            progress_start_s=plan.start_s,
+            total_span=total_span,
+            sample_interval_s=sample_interval_s,
+            frames_log=frames_log,
+        )
+
+    def _finalize_two_anchor(
+        self,
+        machine: FlowStateMachine,
+        trace: ActivityTrace,
+        started: float,
+        sample_interval_s: float,
+        transitions: list[dict[str, Any]],
+        last_timestamp: float,
+    ) -> DetectorResult:
+        measurement = machine.finalize(last_timestamp)
+        elapsed = time.monotonic() - started
+        return self._build_result(measurement, trace, elapsed, sample_interval_s, transitions, True)
 
     def _run_loop(  # noqa: PLR0913 - internal, keeps run() readable and the log guaranteed to close
         self,
@@ -1465,7 +1999,22 @@ class ZahnCupDetector(BaseDetector):
                 # briefly breaking before this check was added).
                 correlation = tracker.reference_patch_correlation(reference_gray, local_outlet)
                 if correlation >= self.config.track_reacquire_min_correlation:
-                    tracker = OutletTracker(
+                    # Two-frame persistence gate (Codex review, fourth
+                    # round), the same principle as
+                    # OutletTracker._attempt_reacquisition's own: one
+                    # frame's correlation clearing the threshold is not
+                    # enough to commit the whole run to a new search
+                    # window - a disposable probe tracker must also track
+                    # the *next* frame as `tracked` before this candidate
+                    # is trusted. Discarded either way; the run's actual
+                    # continuation tracker (below) is anchored fresh at
+                    # ``resume_timestamp_s`` itself so every frame still
+                    # gets scored, none skipped as "already used for
+                    # verification."
+                    probe_timestamp_s = (
+                        segment.resume_timestamp_s + segment_plan.effective_interval_s
+                    )
+                    probe_tracker = OutletTracker(
                         self.config,
                         reference_gray,
                         local_outlet,
@@ -1474,7 +2023,21 @@ class ZahnCupDetector(BaseDetector):
                         cup_height_above_px=cup_height_above_px,
                         reference_timestamp_s=segment.resume_timestamp_s,
                     )
-                    verified = True
+                    probe_gray = self._read_capture_frame_gray(
+                        reader, probe_timestamp_s, new_capture_roi
+                    )
+                    probe_result = probe_tracker.update(probe_gray, probe_timestamp_s)
+                    if probe_result.state is TrackState.TRACKED:
+                        tracker = OutletTracker(
+                            self.config,
+                            reference_gray,
+                            local_outlet,
+                            patch_half_px=patch_half_px,
+                            cup_half_width_px=cup_half_width_px,
+                            cup_height_above_px=cup_height_above_px,
+                            reference_timestamp_s=segment.resume_timestamp_s,
+                        )
+                        verified = True
             except TrackerInitError:
                 verified = False
 
@@ -2317,6 +2880,7 @@ def _zahn_config_to_dict(config: ZahnConfig) -> dict[str, Any]:
             "track_max_bridge_s",
             "track_reacquire_min_correlation",
             "track_min_patch_correlation",
+            "track_reconciliation_max_disagreement_px",
             "zahn_max_endpoint_uncertainty_s",
         )
     }

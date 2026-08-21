@@ -238,6 +238,9 @@ class OutletTracker:
         self._prev_gray = reference_gray
         self._bridge_start_s: float | None = None
         self._velocity = np.zeros(2, dtype=np.float64)
+        # A reacquisition candidate awaiting a second, consistent frame
+        # before it is trusted - see _attempt_reacquisition.
+        self._pending_reacquisition: np.ndarray | None = None
         self._points: np.ndarray | None = points
         self._state = TrackState.TRACKED
         self._last_confident_outlet = self._outlet.copy()
@@ -247,21 +250,42 @@ class OutletTracker:
         # (zero, until real motion is observed) velocity to bridge from.
         self._last_confident_timestamp: float | None = reference_timestamp_s
 
-        # The reacquisition patch is centred on the *strongest* detected
-        # feature, not the outlet itself and not the centroid of every
-        # feature found: the outlet is a narrow, often near-featureless point
-        # (the same reason a single click there is not enough to track frame
-        # to frame - see the module docstring), and averaging every feature's
-        # position dilutes towards whatever smooth, low-response area most of
-        # them sit in. cv2.goodFeaturesToTrack returns points in decreasing
-        # order of corner response, so points[0] is the single most
-        # distinctive point on the cup (typically the rim or handle) -
-        # exactly what normalised template matching needs to tell "the same
-        # cup, moved" apart from "a differently-smooth patch of wall that
-        # happens to correlate," which is the false-reacquisition failure
-        # mode a low-contrast anchor produces. The outlet's position is still
-        # recovered precisely via the stored offset from that point.
-        anchor_point = points.reshape(-1, 2)[0]
+        # The reacquisition patch is centred on a strong detected feature
+        # near the *top* of the search box, not the single strongest corner
+        # wherever it happens to be, not the outlet itself, and not the
+        # centroid of every feature found: the outlet is a narrow, often
+        # near-featureless point (the same reason a single click there is
+        # not enough to track frame to frame - see the module docstring),
+        # and averaging every feature's position dilutes towards whatever
+        # smooth, low-response area most of them sit in. The top-of-box bias
+        # (Codex review, fourth round) is a rim prior: on a translucent,
+        # low-texture cup the single strongest corner anywhere in the box
+        # can just as easily be background structure showing through the
+        # body lower down, while the rim - nearest the top, farthest from
+        # the outlet - is "the one feature a real translucent cup usually
+        # keeps a visible edge on" (see tests/_synthetic_handheld.py's
+        # _draw_translucent_cup). cv2.goodFeaturesToTrack returns points in
+        # decreasing order of corner response, so restricting the choice to
+        # a small top tier and then taking the highest of those balances
+        # "distinctive enough for template matching" against "likely to
+        # survive translucency" - a shape prior, not a guarantee: it does
+        # nothing for a cup whose rim itself is also low-contrast. The tier
+        # is deliberately the top 3 by response, not the top third: this
+        # patch also anchors the continuous per-frame patch-correlation
+        # gate below (every accepted frame, not just reacquisition), so a
+        # weak corner promoted purely for being higher in the box costs
+        # ordinary opaque-cup tracking precision, not just reacquisition
+        # robustness. Measured on the hand-held regression fixture (Stage 1
+        # two-anchor round): a top-third tier left 41% of frames untracked
+        # and the recovered start 0.8s off; the top-3 tier matches the
+        # unbiased points[0] baseline (single-digit percent untracked, exact
+        # start) while still preferring the highest of a genuinely strong
+        # few over the single strongest wherever it sits. The outlet's
+        # position is still recovered precisely via the stored offset from
+        # whichever point is chosen.
+        flat_points = points.reshape(-1, 2)
+        top_tier = flat_points[: max(1, min(3, len(flat_points) // 3))]
+        anchor_point = top_tier[np.argmin(top_tier[:, 1])]
         self._reference_patch, self._patch_outlet_offset = self._extract_patch(
             reference_gray, anchor_point, self._outlet, patch_half_px
         )
@@ -439,6 +463,7 @@ class OutletTracker:
     def _declare_lost(self, inliers: int, feature_count: int) -> TrackResult:
         self._state = TrackState.LOST
         self._points = None
+        self._pending_reacquisition = None  # a fresh loss starts its own confirmation count
         return self._result(TrackState.LOST, inliers=inliers, feature_count=feature_count)
 
     # -- lost/reacquisition branch ------------------------------------------ #
@@ -452,11 +477,38 @@ class OutletTracker:
         The correlation score is exactly that verification, so a reacquired
         position is never accepted on the strength of "a tracker found
         something" alone - it must resemble the cup that was actually there.
+
+        A single frame's correlation clearing the threshold is still not
+        enough on its own to flip back to `tracked` (Codex review, fourth
+        round): a real clip showed two brief (0.166s, 0.067s) spurious
+        correlations promote straight to a confident, wrong re-lock. This
+        now requires *two consecutive* frames to independently clear the
+        threshold and mutually agree on where (within
+        `track_max_frame_displacement_px`, the same bound a single tracked
+        frame's own displacement is held to) before confirming - a one-off
+        spurious match essentially never survives a second independent
+        frame's worth of scrutiny, while a genuine reacquisition, sitting on
+        the actual cup, keeps matching on the very next frame as a matter of
+        course.
         """
         candidate = self._match_reference_patch(gray)
         if candidate is None:
+            self._pending_reacquisition = None
             return self._result(TrackState.LOST, inliers=0, feature_count=0)
 
+        if self._pending_reacquisition is None:
+            self._pending_reacquisition = candidate
+            return self._result(TrackState.LOST, inliers=0, feature_count=0)
+
+        displacement = float(np.hypot(*(candidate - self._pending_reacquisition)))
+        if displacement > self._config.track_max_frame_displacement_px:
+            # Not a consistent reconfirmation of the pending candidate - but
+            # this frame's own hit is still entitled to its own two-frame
+            # confirmation starting now, the same as any other first hit.
+            self._pending_reacquisition = candidate
+            return self._result(TrackState.LOST, inliers=0, feature_count=0)
+
+        self._pending_reacquisition = None
         self._outlet = candidate
         self._last_confident_outlet = candidate.copy()
         self._last_confident_timestamp = timestamp_s

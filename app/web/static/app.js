@@ -19,9 +19,16 @@ const REVIEW_CANVAS_TARGET_PX = 480;
 const state = {
   video: null,        // metadata of the uploaded video
   mode: null,         // selected analysis mode
-  outlet: null,       // {x, y} in source pixels (Zahn)
-  roi: null,          // {x, y, width, height} in source pixels
-  frameTime: 0,       // timestamp of the frame shown in the picker
+  // Zahn requires two operator-marked anchors, each {x, y, t} in source
+  // pixels / video-relative seconds: an early one where the outlet is
+  // clearly visible, and a late one near the expected end of the stream.
+  // A single click is not enough to bound tracking drift over a whole
+  // clip - see app/analysis/zahn_detector.py's two-anchor contract.
+  outletEarly: null,
+  outletLate: null,
+  markingAnchor: "early",  // which anchor the next Zahn click sets
+  roi: null,           // {x, y, width, height} in source pixels (non-Zahn only)
+  frameTime: 0,        // timestamp of the frame shown in the picker
   jobId: null,
   pollTimer: null,
   dragStart: null,
@@ -286,6 +293,11 @@ function onVideoUploaded(info) {
   enableStep("step-mode", true);
   enableStep("step-configure", true);
   enableStep("step-analyse", true);
+  // A new video invalidates any anchors marked on the previous one - never
+  // silently carry them over onto different footage.
+  resetOutletAnchors();
+  drawRegion();
+  updateRegionSummary();
   updateRunButton();
 }
 
@@ -314,6 +326,29 @@ function isZahn() {
   return state.mode === "zahn_cup";
 }
 
+/**
+ * Clear both Zahn anchors and any drawn region on `currentState` in place.
+ * Pure (no DOM) so it is directly unit-testable - see
+ * tests_js/analysis-params.test.js - separately from resetOutletAnchors's
+ * DOM sync below.
+ */
+function resetOutletAnchorsState(currentState) {
+  currentState.outletEarly = null;
+  currentState.outletLate = null;
+  currentState.roi = null;
+  currentState.markingAnchor = "early";
+}
+
+/**
+ * Clear both Zahn anchors and any drawn region. Called on a mode change and
+ * on a fresh video upload - an anchor marked on one video/mode must never be
+ * silently carried over and applied to another.
+ */
+function resetOutletAnchors() {
+  resetOutletAnchorsState(state);
+  if (el("anchor-target-early")) el("anchor-target-early").checked = true;
+}
+
 function applyModeToSettings() {
   const zahn = isZahn();
   el("settings-zahn").classList.toggle("hidden", !zahn);
@@ -321,17 +356,18 @@ function applyModeToSettings() {
   el("idle-pause-field").classList.toggle("hidden", state.mode !== "robot_activity");
   el("advanced-preroll-field").classList.toggle("hidden", zahn);
   el("advanced-start-persistence-field").classList.toggle("hidden", !zahn);
+  el("anchor-toggle").classList.toggle("hidden", !zahn);
 
   el("picker-instruction").textContent = zahn
-    ? "Play the preview until the cup and the outlet hole are clearly visible, press "
-      + "“Use the frame currently shown”, then click exactly on the outlet hole. "
-      + "You can also drag a box around the area the liquid falls through."
+    ? "Mark the outlet on two frames: an early one where the cup and the outlet "
+      + "hole are clearly visible, and a late one near where the stream is "
+      + "expected to end. Play the preview to each frame, press “Use the frame "
+      + "currently shown”, then click exactly on the outlet hole."
     : "Optional: drag a box around the machine or the area you care about. "
       + "Restricting the region makes the scan faster and ignores activity elsewhere.";
 
   el("frame-picker").classList.remove("hidden");
-  state.outlet = null;
-  state.roi = null;
+  resetOutletAnchors();
   drawRegion();
   updateRegionSummary();
   updateRunButton();
@@ -344,11 +380,15 @@ function applyModeToSettings() {
 function initFramePicker() {
   el("grab-frame").addEventListener("click", loadFrameFromPreview);
   el("clear-region").addEventListener("click", () => {
-    state.outlet = null;
-    state.roi = null;
+    resetOutletAnchors();
     drawRegion();
     updateRegionSummary();
     updateRunButton();
+  });
+  [el("anchor-target-early"), el("anchor-target-late")].forEach((radio) => {
+    radio.addEventListener("change", () => {
+      state.markingAnchor = radio.value;
+    });
   });
 
   const canvas = el("frame-canvas");
@@ -407,12 +447,27 @@ function onPointerUp(event) {
   const rect = rectFrom(state.dragStart, current);
   const isClick = rect.width < 8 || rect.height < 8;
 
-  if (isClick && isZahn()) {
-    state.outlet = { x: current.x, y: current.y };
-    state.roi = null;
+  if (isZahn()) {
+    // Zahn requires two clicked anchors, not a drawn region - a drag is
+    // simply ignored here rather than treated as a region.
+    if (isClick) {
+      const anchor = { x: current.x, y: current.y, t: state.frameTime };
+      if (state.markingAnchor === "late") {
+        state.outletLate = anchor;
+      } else {
+        state.outletEarly = anchor;
+        // Minimal, explicit auto-advance: once the early anchor is set,
+        // the natural next step is the late one - only when it is not
+        // already marked, so re-marking the early anchor never silently
+        // steals focus away from a late anchor the operator is editing.
+        if (!state.outletLate) {
+          state.markingAnchor = "late";
+          el("anchor-target-late").checked = true;
+        }
+      }
+    }
   } else if (!isClick) {
     state.roi = rect;
-    if (isZahn()) state.outlet = null;
   }
   state.dragStart = null;
   drawRegion();
@@ -447,36 +502,45 @@ function drawRegion(pendingRect) {
     context.lineWidth = lineWidth;
     context.strokeRect(state.roi.x, state.roi.y, state.roi.width, state.roi.height);
   }
-  if (state.outlet) {
-    const radius = Math.max(6, Math.round(canvas.width / 90));
-    context.strokeStyle = "#ffaa00";
-    context.lineWidth = lineWidth;
-    context.beginPath();
-    context.arc(state.outlet.x, state.outlet.y, radius, 0, Math.PI * 2);
-    context.stroke();
-    context.beginPath();
-    context.moveTo(state.outlet.x, state.outlet.y);
-    context.lineTo(state.outlet.x, canvas.height);
-    context.setLineDash([10, 8]);
-    context.stroke();
-    context.setLineDash([]);
-  }
+  const radius = Math.max(6, Math.round(canvas.width / 90));
+  [["#ffaa00", state.outletEarly, "E"], ["#1f9d55", state.outletLate, "L"]].forEach(
+    ([color, anchor, label]) => {
+      if (!anchor) return;
+      context.strokeStyle = color;
+      context.fillStyle = color;
+      context.lineWidth = lineWidth;
+      context.beginPath();
+      context.arc(anchor.x, anchor.y, radius, 0, Math.PI * 2);
+      context.stroke();
+      context.beginPath();
+      context.moveTo(anchor.x, anchor.y);
+      context.lineTo(anchor.x, canvas.height);
+      context.setLineDash([10, 8]);
+      context.stroke();
+      context.setLineDash([]);
+      context.font = `${Math.max(12, Math.round(canvas.width / 45))}px sans-serif`;
+      context.fillText(label, anchor.x + radius + 4, anchor.y - radius - 4);
+    }
+  );
+}
+
+function describeAnchor(anchor) {
+  return `x=${anchor.x}, y=${anchor.y} (t=${anchor.t.toFixed(2)}s)`;
 }
 
 function updateRegionSummary() {
   const summary = el("region-summary");
-  if (state.outlet) {
-    summary.textContent =
-      `Outlet marked at x=${state.outlet.x}, y=${state.outlet.y}. `
-      + "The analysis region extends downward from this point.";
+  if (isZahn()) {
+    const early = state.outletEarly ? describeAnchor(state.outletEarly) : "not yet marked";
+    const late = state.outletLate ? describeAnchor(state.outletLate) : "not yet marked";
+    summary.textContent = `Early anchor: ${early}. Late anchor: ${late}. `
+      + "Both are required; select an anchor above and click again to replace it.";
   } else if (state.roi) {
     summary.textContent =
       `Region: ${state.roi.width} x ${state.roi.height} pixels at `
       + `(${state.roi.x}, ${state.roi.y}).`;
   } else {
-    summary.textContent = isZahn()
-      ? "No outlet marked yet - this is required for Zahn cup analysis."
-      : "No region selected - the whole frame will be analysed.";
+    summary.textContent = "No region selected - the whole frame will be analysed.";
   }
 }
 
@@ -485,7 +549,8 @@ function updateRegionSummary() {
 /* ------------------------------------------------------------------ */
 
 function updateRunButton() {
-  const ready = Boolean(state.video && state.mode && (!isZahn() || state.outlet || state.roi));
+  const zahnReady = Boolean(state.outletEarly && state.outletLate);
+  const ready = Boolean(state.video && state.mode && (!isZahn() || zahnReady));
   el("run-analysis").disabled = !ready;
 }
 
@@ -495,23 +560,24 @@ function updateRunButton() {
  * Takes `currentState` and a `getValue` field-reader explicitly (both
  * default to the real page's `state`/`el(...).value`) so this can run - and
  * be asserted on - outside a browser: see tests_js/analysis-params.test.js.
- * The one field that mattered enough for a supervisor review against real
- * footage to call out by name is `outlet_reference_s`: without it, a click
- * made on a frame other than the one analysis starts from silently gets
- * applied as if it were on frame zero (see collectParams's zahn branch
- * below, and app/analysis/zahn_detector.py's outlet_reference_s handling).
+ * Zahn always sends both operator-marked anchors as `(x, y, t)` -
+ * `outlet`/`outlet_reference_s` for the early one, `outlet_end`/
+ * `outlet_end_reference_s` for the late one (a supervisor review found the
+ * single-anchor predecessor of this field was never even wired through at
+ * all - see app/analysis/zahn_detector.py's anchor handling for what the
+ * backend does with these once sent, including the ordering/bounds
+ * validation this payload alone cannot guarantee).
  */
 function collectParams(currentState = state, getValue = (id) => Number(el(id).value)) {
   const params = {};
   if (currentState.mode === "zahn_cup") {
-    if (currentState.roi) {
-      params.roi = currentState.roi;
-    } else {
-      params.outlet = currentState.outlet;
-      // The outlet is only trustworthy on the frame it was actually marked
-      // on (state.frameTime, set by loadFrameFromPreview when the frame was
-      // grabbed) - not necessarily the frame analysis starts from.
-      params.outlet_reference_s = currentState.frameTime;
+    if (currentState.outletEarly) {
+      params.outlet = { x: currentState.outletEarly.x, y: currentState.outletEarly.y };
+      params.outlet_reference_s = currentState.outletEarly.t;
+    }
+    if (currentState.outletLate) {
+      params.outlet_end = { x: currentState.outletLate.x, y: currentState.outletLate.y };
+      params.outlet_end_reference_s = currentState.outletLate.t;
     }
     params.flow_end_persistence_s = getValue("zahn-end-persistence");
     params.flow_start_persistence_s = getValue("zahn-start-persistence");
@@ -1067,5 +1133,6 @@ if (typeof module !== "undefined" && module.exports) {
     timelinePercent,
     shouldShowZahnReview,
     collectParams,
+    resetOutletAnchorsState,
   };
 }

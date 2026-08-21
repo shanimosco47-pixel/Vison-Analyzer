@@ -224,7 +224,17 @@ class TestRobotActivityDetector:
 
 class TestZahnDetector:
     def _detector(self, info, video, **params):
-        base = {"outlet": {"x": int(video.truth["outlet_x"]), "y": int(video.truth["outlet_y"])}}
+        # zahn_track_outlet defaults True, which requires both outlet marks
+        # (Codex review, fourth round) - video.truth's cup never moves, so
+        # the same position, marked again shortly before the clip ends, is
+        # exactly correct as the late anchor for every test using this
+        # helper.
+        base = {
+            "outlet": {"x": int(video.truth["outlet_x"]), "y": int(video.truth["outlet_y"])},
+            "outlet_reference_s": 0.0,
+            "outlet_end": {"x": int(video.truth["outlet_x"]), "y": int(video.truth["outlet_y"])},
+            "outlet_end_reference_s": max(0.0, video.duration_s - 1.0),
+        }
         base.update(params)
         return create_detector("zahn_cup", info, base)
 
@@ -296,7 +306,22 @@ class TestZahnDetector:
     def test_outlet_outside_the_frame_is_rejected(self, zahn_video):
         info = probe_video(zahn_video.path)
         with pytest.raises(InvalidROIError):
-            create_detector("zahn_cup", info, {"outlet": {"x": 5000, "y": 5000}})
+            create_detector(
+                "zahn_cup",
+                info,
+                {
+                    "outlet": {"x": 5000, "y": 5000},
+                    # A valid late anchor, so this actually exercises the
+                    # early anchor's own bounds check rather than being
+                    # masked by the (also InvalidROIError) missing-anchor
+                    # check that would otherwise fire first.
+                    "outlet_end": {
+                        "x": int(zahn_video.truth["outlet_x"]),
+                        "y": int(zahn_video.truth["outlet_y"]),
+                    },
+                    "outlet_end_reference_s": max(0.0, zahn_video.duration_s - 1.0),
+                },
+            )
 
     def test_confidence_and_reasons_are_reported(self, zahn_video):
         info = probe_video(zahn_video.path)
@@ -350,7 +375,16 @@ class TestRegistry:
     def test_every_detector_describes_its_plan(self, motion_video):
         info = probe_video(motion_video.path)
         for mode in available_modes():
-            params = {"outlet": {"x": 100, "y": 100}} if mode["name"] == "zahn_cup" else {}
+            params = (
+                {
+                    "outlet": {"x": 100, "y": 100},
+                    "outlet_reference_s": 0.0,
+                    "outlet_end": {"x": 100, "y": 100},
+                    "outlet_end_reference_s": max(0.0, motion_video.duration_s - 1.0),
+                }
+                if mode["name"] == "zahn_cup"
+                else {}
+            )
             detector = create_detector(mode["name"], info, params)
             description = detector.describe()
             assert description["detector"] == mode["name"]

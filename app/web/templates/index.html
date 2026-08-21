@@ -71,6 +71,16 @@
 
     <div id="frame-picker" class="hidden">
       <p class="instruction" id="picker-instruction"></p>
+      <div class="anchor-toggle hidden" id="anchor-toggle" role="radiogroup" aria-label="Which anchor the next click marks">
+        <label>
+          <input type="radio" name="anchor-target" id="anchor-target-early" value="early" checked>
+          Mark early anchor (outlet clearly visible)
+        </label>
+        <label>
+          <input type="radio" name="anchor-target" id="anchor-target-late" value="late">
+          Mark late anchor (near the expected end of the stream)
+        </label>
+      </div>
       <div class="frame-toolbar">
         <button type="button" class="secondary" id="grab-frame">
           Use the frame currently shown in the preview

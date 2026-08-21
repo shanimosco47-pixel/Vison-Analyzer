@@ -23,7 +23,14 @@ MARGIN = 60  # world padding around the camera window, in pixels
 
 @dataclass(frozen=True)
 class HandheldClip:
-    """A generated clip and the ground truth used to assert against it."""
+    """A generated clip and the ground truth used to assert against it.
+
+    ``outlet_at_reference``/``outlet_at_late_reference`` are the two
+    operator-marked anchors the two-anchor tracking contract requires (see
+    ``app.analysis.zahn_detector``'s ``outlet``/``outlet_end`` handling): an
+    early one (usually the clip's first frame) and a late one near the
+    expected end of the stream.
+    """
 
     path: Path
     fps: float
@@ -35,6 +42,8 @@ class HandheldClip:
     flow_end_s: float
     outlet_at_reference: tuple[float, float]
     occlusion_s: tuple[float, float] | None
+    outlet_at_late_reference: tuple[float, float]
+    late_reference_s: float
 
     @property
     def efflux_s(self) -> float:
@@ -75,6 +84,29 @@ def _hand_offset(t: float, drift_px: float) -> tuple[float, float]:
     dx = drift_px * math.sin(2 * math.pi * t / 13.0 + 0.4)
     dy = 0.5 * drift_px * math.sin(2 * math.pi * t / 9.0 + 2.0)
     return dx, dy
+
+
+def outlet_position_at(
+    t: float,
+    *,
+    base_x: float,
+    base_y: float,
+    camera_drift_px: float,
+    hand_drift_px: float,
+    tremor_px: float,
+) -> tuple[float, float]:
+    """Where the outlet is, in *frame* coordinates, at time ``t``.
+
+    The single source of truth for the cup-placement formula
+    ``build_handheld_clip``/``build_translucent_cup_clip`` render frames
+    with - factored out so a test can compute the true position at an
+    arbitrary timestamp (typically to build a second, *late* anchor for the
+    two-anchor tracking contract) without duplicating the formula and
+    risking it drifting out of sync with what was actually drawn.
+    """
+    cx, cy = _camera_offset(t, camera_drift_px, tremor_px)
+    hx, hy = _hand_offset(t, hand_drift_px)
+    return (base_x + hx) - (MARGIN + cx), (base_y + hy) - (MARGIN + cy)
 
 
 def _draw_cup(frame: np.ndarray, ox: float, oy: float, level: int) -> None:
@@ -132,9 +164,18 @@ def build_handheld_clip(
     hand_drift_px: float = 12.0,
     tremor_px: float = 1.0,
     occlusion_s: tuple[float, float] | None = None,
+    late_reference_s: float | None = None,
     seed: int = 20260820,
 ) -> HandheldClip:
-    """Render one hand-held clip and return its (drawn, not inferred) ground truth."""
+    """Render one hand-held clip and return its (drawn, not inferred) ground truth.
+
+    ``late_reference_s`` defaults to one second before the clip ends - late
+    enough to be "near the expected end of the stream" for every existing
+    fixture's own ``flow_end_s``, while staying clear of every existing
+    fixture's own ``occlusion_s`` window (all of which close well before
+    that point). A fixture with an occlusion window that runs closer to the
+    end than this default should pass an explicit value instead.
+    """
     rng = np.random.default_rng(seed)
     world = _world_background(width, height, background_level, texture_strength)
 
@@ -144,6 +185,7 @@ def build_handheld_clip(
 
     base_x = MARGIN + width / 2.0
     base_y = MARGIN + height * 0.34
+    late_s = late_reference_s if late_reference_s is not None else max(0.0, duration_s - 1.0)
     reference_outlet: tuple[float, float] | None = None
     total_frames = int(round(duration_s * fps))
 
@@ -153,9 +195,14 @@ def build_handheld_clip(
         x0, y0 = int(round(MARGIN + cx)), int(round(MARGIN + cy))
         frame = world[y0 : y0 + height, x0 : x0 + width].copy()
 
-        hx, hy = _hand_offset(t, hand_drift_px)
-        ox = (base_x + hx) - (MARGIN + cx)
-        oy = (base_y + hy) - (MARGIN + cy)
+        ox, oy = outlet_position_at(
+            t,
+            base_x=base_x,
+            base_y=base_y,
+            camera_drift_px=camera_drift_px,
+            hand_drift_px=hand_drift_px,
+            tremor_px=tremor_px,
+        )
         if reference_outlet is None:
             reference_outlet = (ox, oy)
 
@@ -178,6 +225,14 @@ def build_handheld_clip(
     writer.release()
 
     assert reference_outlet is not None
+    late_outlet = outlet_position_at(
+        late_s,
+        base_x=base_x,
+        base_y=base_y,
+        camera_drift_px=camera_drift_px,
+        hand_drift_px=hand_drift_px,
+        tremor_px=tremor_px,
+    )
     return HandheldClip(
         path=path,
         fps=fps,
@@ -189,6 +244,8 @@ def build_handheld_clip(
         flow_end_s=flow_end_s,
         outlet_at_reference=reference_outlet,
         occlusion_s=occlusion_s,
+        outlet_at_late_reference=late_outlet,
+        late_reference_s=late_s,
     )
 
 
@@ -247,6 +304,7 @@ def build_translucent_cup_clip(
     camera_drift_px: float = 30.0,
     hand_drift_px: float = 26.0,
     tremor_px: float = 2.0,
+    late_reference_s: float | None = None,
     seed: int = 20260821,
 ) -> HandheldClip:
     """A hand-held clip whose cup is translucent, low-texture, over a
@@ -271,6 +329,7 @@ def build_translucent_cup_clip(
     if not writer.isOpened():  # pragma: no cover - depends on the OpenCV build
         pytest.skip("This OpenCV build cannot write MP4 files")
 
+    late_s = late_reference_s if late_reference_s is not None else max(0.0, duration_s - 1.0)
     reference_outlet: tuple[float, float] | None = None
     total_frames = int(round(duration_s * fps))
 
@@ -280,9 +339,14 @@ def build_translucent_cup_clip(
         x0, y0 = int(round(MARGIN + cx)), int(round(MARGIN + cy))
         frame = world[y0 : y0 + height, x0 : x0 + width].copy()
 
-        hx, hy = _hand_offset(t, hand_drift_px)
-        ox = (base_x + hx) - (MARGIN + cx)
-        oy = (base_y + hy) - (MARGIN + cy)
+        ox, oy = outlet_position_at(
+            t,
+            base_x=base_x,
+            base_y=base_y,
+            camera_drift_px=camera_drift_px,
+            hand_drift_px=hand_drift_px,
+            tremor_px=tremor_px,
+        )
         if reference_outlet is None:
             reference_outlet = (ox, oy)
 
@@ -303,6 +367,14 @@ def build_translucent_cup_clip(
     writer.release()
 
     assert reference_outlet is not None
+    late_outlet = outlet_position_at(
+        late_s,
+        base_x=base_x,
+        base_y=base_y,
+        camera_drift_px=camera_drift_px,
+        hand_drift_px=hand_drift_px,
+        tremor_px=tremor_px,
+    )
     return HandheldClip(
         path=path,
         fps=fps,
@@ -314,4 +386,6 @@ def build_translucent_cup_clip(
         flow_end_s=flow_end_s,
         outlet_at_reference=reference_outlet,
         occlusion_s=None,
+        outlet_at_late_reference=late_outlet,
+        late_reference_s=late_s,
     )

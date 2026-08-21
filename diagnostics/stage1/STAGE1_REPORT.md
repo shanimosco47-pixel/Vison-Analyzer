@@ -1729,3 +1729,204 @@ criterion): **not met** - `status=review`, no confirmed efflux, per
 
 PR #4 stays **draft and unmerged**. Stages 2 and 3 are **not started**.
 No implementation this round; stopped here for review, per instruction.
+
+## 26. The two-anchor design, implemented per authorisation
+
+Supervisor decision (PR comment, following §25): proceed with §24.3.3's
+Stage-1-scoped two-anchor design, with a specific product/tracking
+contract, evidence requirements, and explicit non-goals (no camera-motion
+compensation, no Stage 2/3). This section is that implementation.
+
+### 26.1 Product and frontend
+
+One Zahn mode, tracking always on - unchanged. The operator now marks the
+outlet on **two** frames: an early one (clearly visible) and a late one
+(near the expected stream end). Each mark is stored as source coordinates
+plus its own frame's exact timestamp - `state.outletEarly` /
+`state.outletLate`, each `{x, y, t}` - replacing the old single
+`state.outlet`. The frame picker gained an explicit early/late radio
+toggle (auto-advancing to "late" once "early" is marked, never silently
+overwriting an already-set anchor), both anchors are drawn with distinct
+labels, and `resetOutletAnchorsState` clears both on video upload / mode
+change / "clear region" - no stale anchor ever survives past a reset.
+`collectParams()` sends `outlet`/`outlet_reference_s` and
+`outlet_end`/`outlet_end_reference_s` independently, only when each anchor
+is actually set. `tests_js/analysis-params.test.js` covers both-set,
+either-alone, replace, and reset-then-collect; `node --test tests_js/*.test.js`:
+58/58 pass.
+
+### 26.2 Backend contract
+
+`ZahnCupDetector.configure()`: while `zahn_track_outlet` (default) is on,
+`outlet` alone is rejected outright - both anchors are required together.
+Each anchor's timestamp is validated independently (must parse, must fall
+inside `[start_s, end_s]`), and the pair is validated together (late must
+be strictly after early - equal or inverted timestamps are rejected the
+same way). `zahn_track_outlet=False` is untouched: the single-click,
+fixed-ROI rollback path has no reason to gain a new UI requirement an
+operator who explicitly opted out of tracking has no reason to satisfy.
+
+Tracking is now three chronological segments, not two:
+
+* **Segment A** (`_process_pre_reference_span`, unchanged from §21.2) -
+  only runs if `outlet_reference_s > start_s`, bidirectional between the
+  early anchor and the analysis start.
+* **Segment B** (`_process_between_anchors_span`, new) - between the two
+  anchors. Both are unconditionally trusted; every interior frame is
+  independently tracked forward-from-early and backward-from-late over
+  the same buffered span, and `_reconcile_between_anchors` only marks a
+  frame trusted when **both** directions report `TRACKED` (not
+  `PREDICTED`, not `LOST`) **and** their positions agree within
+  `track_reconciliation_max_disagreement_px` (new config field, 30px
+  default - deliberately distinct from the single-frame
+  `track_max_frame_displacement_px`, since this bounds disagreement
+  between two independently-accumulated tracks over a potentially long
+  span, not one frame's own motion). Disagreement or loss is never
+  silently interpolated across - it is untrusted, exactly like any other
+  gap, and feeds the same `FlowStateMachine` uncertainty logic segments A
+  and C already used. This is the requirement stated most explicitly in
+  the authorisation: "do not accept a template match or interpolated
+  position as trusted merely because it lies between anchors."
+* **Segment C** (`_run_loop`, unchanged) - from the late anchor to the end
+  of the analysed range, using the existing recentring/reacquisition
+  machinery.
+
+The frame-boundary double-count from §24.4 is fixed as proposed there:
+`_run_two_anchor`'s Segment C start is now `frames_to_seconds(late_index +
+1, fps)` via `frame_index_at`, integer arithmetic on the frame index
+rather than a floating-point `timestamp + interval` round trip re-derived
+through `floor(timestamp * fps)`. An 811-frame clip can no longer produce
+812 analysed rows.
+
+### 26.3 The two bounded safeguards, and one regression they did not cause
+
+Both §24.3.1 mitigations are implemented as bounded safeguards, per the
+authorisation ("with regressions proving brief false correlations do not
+become trusted"):
+
+* **Two-frame reacquisition/recentre persistence.**
+  `OutletTracker._attempt_reacquisition` now requires two consecutive
+  frames' correlation checks to independently agree (within
+  `track_max_frame_displacement_px`) before confirming - a single
+  spurious hit sets `_pending_reacquisition` and stays `lost`; only a
+  second, consistent hit promotes to `tracked`. `TestReacquisitionPersistence`
+  (3 new tests in `test_outlet_tracker.py`) proves a single matching frame
+  never confirms, on its own or followed by nothing, and that two
+  *inconsistent* hits restart the count rather than confirming.
+* **Rim-biased anchor selection.** `OutletTracker.__init__` picks the
+  reacquisition/correlation reference feature from the top-of-box third
+  of `goodFeaturesToTrack`'s ranked corners, not unconditionally the
+  single strongest wherever it sits - a shape prior for translucent cups,
+  where the rim survives translucency better than the body (§24.3.1).
+
+Re-running the full synthetic suite after wiring both safeguards into the
+new three-segment `run()` initially showed 5 of the (then) 25 integration
+tests failing - most strikingly `handheld_zahn_video` (the original field-
+report regression fixture, an ordinary hand-held, *opaque* cup with no
+translucency at all): 41% of frames untracked, recovered start off by
+0.8s, status `review` instead of `confirmed`. This looked at first like it
+could be the two-anchor contract's own new conservatism working as
+designed (independent bidirectional tracking over a long, unaided span
+*should* sometimes disagree) - but the same design explicitly asked for
+"regressions proving" the safeguards themselves are not the cause, so
+before accepting that explanation this round isolated it directly rather
+than assuming it:
+
+* **A/B on the persistence gate**: monkeypatched `_attempt_reacquisition`
+  back to single-frame confirmation and re-ran `handheld_zahn_video`
+  standalone. Untracked frames barely moved (184 → 177 of 447) - the
+  persistence gate was not the cause.
+* **A/B on rim bias**: reverted the anchor-selection tier from "top third"
+  to the original `points[0]` (single strongest corner anywhere) and
+  re-ran the same fixture. Untracked frames dropped from 184 to **11**
+  (2.5%), status flipped back to `confirmed`, recovered start matched
+  exactly (3.0s). Sweeping the tier size (top-third → top-1/6 → top-10 →
+  top-5 → top-3) showed a sharp threshold: top-3 matches the unbiased
+  baseline exactly; anything wider degrades badly. The mechanism: the
+  anchor point does not only seed reacquisition - `_attempt_tracking`'s
+  *continuous* per-frame patch-correlation gate (§21.3) verifies every
+  accepted frame against the same reference patch, so a weaker corner
+  promoted purely for sitting higher in the box was costing ordinary,
+  opaque-cup tracking precision on essentially every frame, not just
+  robustness during reacquisition.
+
+**Fix applied**: the rim-bias tier is now the top 3 corners by response
+(not the top third), still biased toward the highest of those when a
+genuine choice exists, but no longer able to pick a corner meaningfully
+weaker than the strongest available. Re-running the full suite after this
+one-line change: all 5 originally-failing tests pass, including
+`TestSearchWindowRecentres` (fixed separately, §26.4) and
+`TestBreakDuringATrackingGapAtStart` (the `efflux_seconds_bounds is None`
+failure resolved as a side effect - it was downstream of the same
+reconciliation disagreement, not a separate bug). `translucent_cup_near_
+distractor_zahn_video` - the fixture the rim bias exists for - stayed
+green throughout every A/B step above; nothing in this repository's
+synthetic suite currently depends on the wider tier.
+
+### 26.4 `wide_pan_zahn_video`'s late-anchor placement
+
+This fixture's default `late_reference_s` (`duration - 1.0` = 15.0s of a
+16s clip) placed nearly the entire 380px pan inside segment B, which by
+design never recentres - leaving segment C only 1s, too little of the pan
+left for `TestSearchWindowRecentres` to observe a `recentre_events` entry.
+Fixed by moving this fixture's `late_s` to 4.0s specifically (unlike
+every other fixture's "near the end" default) so most of the pan happens
+*after* the late anchor, in segment C, where the recentring machinery
+under test can actually engage.
+
+### 26.5 New evidence required by the authorisation
+
+* **Validation** (`TestTwoAnchorValidation`, 6 new tests): missing late
+  anchor, late anchor outside the frame, a reference timestamp outside
+  the analysed range, a late anchor before the early one, duplicate
+  (equal) anchor timestamps - all rejected with `InvalidROIError`, raised
+  before any frame is decoded. A dedicated positive case confirms
+  duplicate *coordinates* with distinct, validly-ordered timestamps are
+  accepted (a cup that genuinely has not moved is not an error).
+* **False correlation between anchors**
+  (`test_a_false_correlation_between_anchors_is_never_marked_trusted`,
+  new, on `translucent_cup_near_distractor_zahn_video`): reads the
+  per-frame tracking log directly rather than only the summary, and
+  asserts every frame marked `trusted` is closer to the true, per-frame
+  cup position than to the distractor - the frame-level form of "a false
+  lock in one direction cannot promote to trusted just because it lies
+  between the anchors," not just "the final answer happens not to be
+  wrong."
+* **Frame-boundary fix**: covered indirectly by every two-anchor
+  integration test now exercising `_run_two_anchor`'s Segment C start
+  through real fixtures at varied fps/reference-timestamp combinations,
+  none of which reproduce the double-count.
+* **Runtime/memory** (`handheld_zahn_video`, 22s/25fps/447 analysed
+  frames, standalone measurement): 1.34s wall time end-to-end (~16.4x
+  real time, comparable to §22's prior 776→448fps single-anchor
+  measurement), process RSS 82.7MB before the run → 150.2MB peak during
+  it (a ~68MB delta attributable to this run, unchanged order of
+  magnitude from before this round - the three-segment design still
+  buffers only capture-crop-sized frames, bounded by the anchor-to-anchor
+  gap, not the whole clip).
+* **Diagnostic state counts**, same fixture and run: 436/447 frames
+  `tracked` and `trusted`, 11 `lost` (all untrusted, none `predicted`), 0
+  reacquisitions needed - a clean run end to end, matching the `confirmed`
+  status and exact-start-time result now that the rim-bias regression is
+  fixed.
+* **Existing regressions**: full suite, 359 tests (was 324 before this
+  session), all pass - `pytest`, `ruff check`, `ruff format --check`,
+  `mypy` (29 source files) all clean, `node --test tests_js/*.test.js`
+  58/58. `TestTrackingRefusesAStrongNearbyDistractor`,
+  `TestBreakDuringATrackingGap*`, `TestUnresolvedGapInTheMiddleOfFlow`,
+  the event-contract (`_assert_no_precise_duration_leaks`) and security
+  (`diagnostics_dir` stripping) tests all still pass unmodified in
+  substance (only updated to supply the now-mandatory second anchor where
+  they exercise the outlet-click path at all).
+
+### 26.6 Status
+
+Requirements 1-3 (product contract, tracking contract, both bounded
+safeguards) are implemented as specified, with the rim-bias regression
+found and fixed before it could reach review, not after. Requirement 4
+(the ±0.75s real-footage criterion) is still **not independently
+verified against the real clip** - per the authorisation, that claim is
+the supervisor's own local run against this exact head to make, not
+something asserted here.
+
+PR #4 stays **draft and unmerged**. Stages 2 and 3 are **not started**.

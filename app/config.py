@@ -391,6 +391,20 @@ class ZahnConfig:
     # rejections during ordinary tracking.
     track_min_patch_correlation: float = 0.45
 
+    # The two-anchor tracking contract (Codex review, fourth round): an
+    # interior frame between the operator's two marked anchors is trusted
+    # only when tracking forward from the early anchor and tracking
+    # backward from the late anchor *independently* agree, both that the
+    # frame is `tracked` and on where within this many pixels of each
+    # other. Disagreement (or either direction losing the outlet) is not
+    # "close enough because it's between two trusted points" - it is
+    # treated exactly like an ordinary loss, feeding the same untracked/
+    # uncertainty path. Comparable to track_max_frame_displacement_px but a
+    # separate knob: this bounds disagreement between two independently
+    # accumulated tracks over a potentially long span, not one frame's own
+    # step.
+    track_reconciliation_max_disagreement_px: float = 30.0
+
     # If liquid was last confirmed before an untrusted (`lost`/`predicted`)
     # span and no trusted evidence follows it before flow-end would otherwise
     # be confirmed, the true break could have happened anywhere in that span.
@@ -430,6 +444,10 @@ class ZahnConfig:
             raise ConfigurationError("The reacquisition correlation must be between 0 and 1.")
         if not 0.0 < self.track_min_patch_correlation <= 1.0:
             raise ConfigurationError("The tracking patch correlation must be between 0 and 1.")
+        if self.track_reconciliation_max_disagreement_px <= 0:
+            raise ConfigurationError(
+                "The two-anchor reconciliation disagreement bound must be greater than zero."
+            )
         if self.zahn_max_endpoint_uncertainty_s < 0:
             raise ConfigurationError("The endpoint uncertainty bound must not be negative.")
 

@@ -246,7 +246,14 @@ class TestReacquisition:
         assert result.state == TrackState.LOST
 
         new_x, new_y = cup_x + 25, cup_y + 10
-        result = tracker.update(_frame(new_x, new_y, patch), timestamp_s=1.0)
+        # Two-frame persistence gate (Codex review, fourth round): the first
+        # matching frame is only a pending candidate, not yet trusted - see
+        # TestReacquisitionPersistence below for that half of the contract
+        # on its own. A second, consistent frame is what actually confirms
+        # a genuine reacquisition here.
+        pending = tracker.update(_frame(new_x, new_y, patch), timestamp_s=1.0)
+        assert pending.state == TrackState.LOST
+        result = tracker.update(_frame(new_x, new_y, patch), timestamp_s=1.04)
         assert result.state == TrackState.TRACKED
         assert result.reacquired is True
         assert abs(result.outlet_x - new_x) < 3.0
@@ -288,3 +295,66 @@ class TestReacquisition:
         result = tracker.update(_blank(), timestamp_s=2.0)
         assert result.state == TrackState.LOST
         assert result.reacquired is False
+
+
+class TestReacquisitionPersistence:
+    """Codex review, fourth round: a real clip's two brief (0.166s, 0.067s)
+    spurious correlations each promoted straight to a confident, wrong
+    `tracked` on a single matching frame. Regressions proving a one-off hit
+    alone can never do that again.
+    """
+
+    def test_a_single_matching_frame_does_not_confirm(self):
+        patch = _patch(seed=11)
+        cfg = _config(track_max_bridge_s=0.05)
+        cup_x, cup_y = 100, 90
+        tracker = _tracker(cfg, _frame(cup_x, cup_y, patch), _outlet(cup_x, cup_y))
+        for step in range(5):
+            result = tracker.update(_blank(), timestamp_s=(step + 1) * 0.05)
+        assert result.state == TrackState.LOST
+
+        result = tracker.update(_frame(cup_x, cup_y, patch), timestamp_s=1.0)
+        assert result.state == TrackState.LOST
+        assert result.reacquired is False
+
+    def test_a_single_matching_frame_followed_by_nothing_never_confirms(self):
+        """The brittle failure mode a "two matches, ever" (not consecutive)
+        rule would still have: one real hit, then silence, must not later
+        combine with an unrelated future hit to confirm."""
+        patch = _patch(seed=12)
+        other_patch = _patch(seed=13)
+        cfg = _config(track_max_bridge_s=0.05)
+        cup_x, cup_y = 100, 90
+        tracker = _tracker(cfg, _frame(cup_x, cup_y, patch), _outlet(cup_x, cup_y))
+        for step in range(5):
+            result = tracker.update(_blank(), timestamp_s=(step + 1) * 0.05)
+        assert result.state == TrackState.LOST
+
+        pending = tracker.update(_frame(cup_x, cup_y, patch), timestamp_s=1.0)
+        assert pending.state == TrackState.LOST
+        gap = tracker.update(_blank(), timestamp_s=1.04)
+        assert gap.state == TrackState.LOST
+        # A later, unrelated hit must start its own fresh confirmation, not
+        # inherit trust from the earlier one-off match.
+        later = tracker.update(_frame(cup_x, cup_y, other_patch), timestamp_s=1.08)
+        assert later.state == TrackState.LOST
+        assert later.reacquired is False
+
+    def test_two_consecutive_but_inconsistent_hits_do_not_confirm(self):
+        """Two real hits at genuinely different positions are not "the same
+        candidate, confirmed" - each restarts its own confirmation instead
+        of averaging into a position neither frame actually showed."""
+        patch = _patch(seed=14)
+        cfg = _config(track_max_bridge_s=0.05)
+        cup_x, cup_y = 100, 90
+        tracker = _tracker(cfg, _frame(cup_x, cup_y, patch), _outlet(cup_x, cup_y))
+        for step in range(5):
+            result = tracker.update(_blank(), timestamp_s=(step + 1) * 0.05)
+        assert result.state == TrackState.LOST
+
+        first = tracker.update(_frame(cup_x, cup_y, patch), timestamp_s=1.0)
+        assert first.state == TrackState.LOST
+        far_x = cup_x + 60  # well beyond track_max_frame_displacement_px
+        second = tracker.update(_frame(far_x, cup_y, patch), timestamp_s=1.04)
+        assert second.state == TrackState.LOST
+        assert second.reacquired is False

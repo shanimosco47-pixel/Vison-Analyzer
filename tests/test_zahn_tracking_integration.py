@@ -31,6 +31,7 @@ import numpy as np
 import pytest
 
 from app.analysis.zahn_detector import MAX_TRACKING_RECENTRES, ZahnCupDetector
+from app.errors import InvalidROIError
 from app.services.event_log import build_event_log, summarise
 from app.video.metadata import probe_video
 from app.video.reader import VideoReader
@@ -43,11 +44,50 @@ from .conftest import PORTRAIT_TIMELINE
 SYNTHETIC_TOLERANCE_S = 0.5
 
 
-def _run(video_path, outlet_xy, **params):
+def _run(
+    video_path,
+    outlet_xy,
+    *,
+    clip=None,
+    outlet_end_xy=None,
+    outlet_end_reference_s=None,
+    **params,
+):
+    """Run detection, satisfying the two-anchor contract by default.
+
+    Every outlet-click configuration now requires both an early and a late
+    anchor (Codex review, fourth round). Pass ``clip`` - a ``HandheldClip``
+    - to derive the late anchor automatically from its own
+    ``outlet_at_late_reference``/``late_reference_s``: the common case,
+    since most tests only care that a *valid* late anchor exists, not its
+    exact position. ``outlet_end_xy``/``outlet_end_reference_s`` override
+    that explicitly, for tests that need to control the late anchor
+    themselves (a false correlation between anchors, a duplicate/reversed
+    timestamp, a missing anchor, ...) - pass ``outlet_end_xy=None`` with no
+    ``clip`` either to omit ``outlet_end`` entirely and test the
+    missing-anchor validation path.
+    """
     info = probe_video(video_path)
-    detector = ZahnCupDetector(
-        info, {"outlet": {"x": round(outlet_xy[0]), "y": round(outlet_xy[1])}, **params}
-    )
+    outlet_params: dict = {"outlet": {"x": round(outlet_xy[0]), "y": round(outlet_xy[1])}}
+    if outlet_end_xy is not None:
+        outlet_params["outlet_end"] = {
+            "x": round(outlet_end_xy[0]),
+            "y": round(outlet_end_xy[1]),
+        }
+        if outlet_end_reference_s is not None:
+            outlet_params["outlet_end_reference_s"] = outlet_end_reference_s
+    elif clip is not None:
+        outlet_params["outlet_end"] = {
+            "x": round(clip.outlet_at_late_reference[0]),
+            "y": round(clip.outlet_at_late_reference[1]),
+        }
+        outlet_params["outlet_end_reference_s"] = clip.late_reference_s
+    if "outlet_end" in outlet_params:
+        # outlet_at_reference is always captured at t=0 (see
+        # build_handheld_clip) - the natural default early-anchor
+        # timestamp, overridden by an explicit outlet_reference_s param.
+        params.setdefault("outlet_reference_s", 0.0)
+    detector = ZahnCupDetector(info, {**outlet_params, **params})
     with VideoReader(video_path, info) as reader:
         return detector.run(reader)
 
@@ -91,7 +131,7 @@ class TestRegressionOriginalBug:
     def test_fixed_roi_reproduces_the_original_long_timing_bug(self, handheld_zahn_video):
         """With tracking off, the same failure Stage 0 found in the field."""
         clip = handheld_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference, zahn_track_outlet=False)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip, zahn_track_outlet=False)
         summary = result.summary
         assert summary["efflux_seconds"] is not None
         error = summary["efflux_seconds"] - clip.efflux_s
@@ -103,7 +143,9 @@ class TestRegressionOriginalBug:
     def test_tracking_measures_the_same_clip_within_tolerance(self, handheld_zahn_video):
         """The fix: tracking on (the default) recovers the true timing."""
         clip = handheld_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)  # zahn_track_outlet defaults True
+        result = _run(
+            clip.path, clip.outlet_at_reference, clip=clip
+        )  # zahn_track_outlet defaults True
         summary = result.summary
         assert summary["efflux_seconds"] is not None
         error = abs(summary["efflux_seconds"] - clip.efflux_s)
@@ -112,7 +154,7 @@ class TestRegressionOriginalBug:
 
     def test_tracking_start_time_matches_ground_truth(self, handheld_zahn_video):
         clip = handheld_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         assert abs(result.summary["flow_start_s"] - clip.flow_start_s) <= SYNTHETIC_TOLERANCE_S
 
 
@@ -121,8 +163,20 @@ class TestConfidenceReflectsMotion:
         self, zahn_video, handheld_zahn_video
     ):
         """Confidence must be visibly lower/flagged for heavy motion, never higher."""
-        steady = _run(zahn_video.path, (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]))
-        moving = _run(handheld_zahn_video.path, handheld_zahn_video.outlet_at_reference)
+        steady_outlet = (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"])
+        # zahn_video's cup never moves - a late anchor at the same position,
+        # comfortably before the clip ends, is exactly correct here.
+        steady = _run(
+            zahn_video.path,
+            steady_outlet,
+            outlet_end_xy=steady_outlet,
+            outlet_end_reference_s=zahn_video.duration_s - 1.0,
+        )
+        moving = _run(
+            handheld_zahn_video.path,
+            handheld_zahn_video.outlet_at_reference,
+            clip=handheld_zahn_video,
+        )
         assert moving.summary["confidence"] <= steady.summary["confidence"]
 
 
@@ -150,34 +204,40 @@ class TestOutletReferenceFrame:
         base_y = MARGIN + clip.height * 0.34
         return (base_x + hx) - (MARGIN + cx), (base_y + hy) - (MARGIN + cy)
 
-    def test_the_bug_marking_a_later_frame_is_applied_to_frame_zero(
+    def test_marking_a_later_frame_without_its_timestamp_is_rejected(
         self, portrait_reference_frame_zahn_video
     ):
-        """Without outlet_reference_s, the coordinates are silently wrong."""
+        """Fourth Codex review round: the two-anchor contract now refuses
+        this configuration outright, rather than silently misdating the
+        outlet mark to frame zero - a real improvement over the previous
+        round's silent-wrong-answer failure mode this test used to pin
+        down. A valid outlet_end is supplied (required to even reach this
+        check) but its own required timestamp is not, matching the
+        specific gap this test targets: a click made on a later frame,
+        given no timestamp for it at all.
+        """
         clip = portrait_reference_frame_zahn_video
         outlet_at_4_5 = self._outlet_at_reference(clip, 4.5)
-        result = _run(
-            clip.path,
-            outlet_at_4_5,
-            analysis_start_s=4.5,  # the user's natural attempted workaround
-        )
-        summary = result.summary
-        # Starting analysis after flow has already begun corrupts
-        # StreamActivityScorer's background model (it bootstraps from its
-        # first frame unconditionally) - the reported start is nowhere near
-        # the true 3.9s, and not merely imprecise: wrong by a large margin.
-        assert summary["flow_start_s"] is None or (
-            abs(summary["flow_start_s"] - clip.flow_start_s) > SYNTHETIC_TOLERANCE_S
-        )
+        late_at_26 = self._outlet_at_reference(clip, 26.0)
+        with pytest.raises(InvalidROIError):
+            _run(
+                clip.path,
+                outlet_at_4_5,
+                outlet_end_xy=late_at_26,
+                analysis_start_s=4.5,  # the user's natural attempted workaround
+            )
 
     def test_outlet_reference_s_recovers_the_true_start(self, portrait_reference_frame_zahn_video):
         """The fix: mark on a later frame, but tell the detector which one."""
         clip = portrait_reference_frame_zahn_video
         outlet_at_4_5 = self._outlet_at_reference(clip, 4.5)
+        late_at_26 = self._outlet_at_reference(clip, 26.0)
         result = _run(
             clip.path,
             outlet_at_4_5,
             outlet_reference_s=4.5,  # analysis_start_s stays at its default, 0
+            outlet_end_xy=late_at_26,
+            outlet_end_reference_s=26.0,
         )
         summary = result.summary
         assert summary["status"] == "confirmed"
@@ -190,11 +250,87 @@ class TestOutletReferenceFrame:
         """outlet_reference_s == analysis_start_s must behave exactly as before."""
         clip = portrait_reference_frame_zahn_video
         result = _run(
-            clip.path, clip.outlet_at_reference, outlet_reference_s=0.0, analysis_start_s=0.0
+            clip.path,
+            clip.outlet_at_reference,
+            clip=clip,
+            outlet_reference_s=0.0,
+            analysis_start_s=0.0,
         )
         summary = result.summary
         assert summary["status"] == "confirmed"
         assert abs(summary["flow_start_s"] - clip.flow_start_s) <= SYNTHETIC_TOLERANCE_S
+
+
+class TestTwoAnchorValidation:
+    """Fourth Codex review round: the two-anchor contract's own input
+    validation - missing, out-of-bounds, misordered or duplicate anchors -
+    exercised directly, independent of any specific tracking scenario.
+    ``zahn_video``'s static cup is enough here: every case below is
+    rejected (or accepted) in ``configure()``, before a single frame of
+    tracking runs.
+    """
+
+    def test_missing_late_anchor_is_rejected(self, zahn_video):
+        outlet = (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"])
+        with pytest.raises(InvalidROIError):
+            _run(zahn_video.path, outlet)  # no clip, no outlet_end_xy: omits outlet_end entirely
+
+    def test_late_anchor_outside_the_frame_is_rejected(self, zahn_video):
+        outlet = (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"])
+        with pytest.raises(InvalidROIError):
+            _run(
+                zahn_video.path,
+                outlet,
+                outlet_end_xy=(zahn_video.width + 50, outlet[1]),
+                outlet_end_reference_s=10.0,
+            )
+
+    def test_a_reference_timestamp_outside_the_analysed_range_is_rejected(self, zahn_video):
+        outlet = (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"])
+        with pytest.raises(InvalidROIError):
+            _run(
+                zahn_video.path,
+                outlet,
+                outlet_end_xy=outlet,
+                outlet_end_reference_s=zahn_video.duration_s + 5.0,
+            )
+
+    def test_a_late_anchor_before_the_early_one_is_rejected(self, zahn_video):
+        outlet = (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"])
+        with pytest.raises(InvalidROIError):
+            _run(
+                zahn_video.path,
+                outlet,
+                outlet_reference_s=10.0,
+                outlet_end_xy=outlet,
+                outlet_end_reference_s=5.0,
+            )
+
+    def test_duplicate_anchor_timestamps_are_rejected(self, zahn_video):
+        """Sharing a timestamp is exactly as invalid as inverting one - two
+        marks made "at the same instant" carry no independent evidence."""
+        outlet = (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"])
+        with pytest.raises(InvalidROIError):
+            _run(
+                zahn_video.path,
+                outlet,
+                outlet_reference_s=5.0,
+                outlet_end_xy=outlet,
+                outlet_end_reference_s=5.0,
+            )
+
+    def test_anchors_at_the_same_position_with_distinct_timestamps_are_accepted(self, zahn_video):
+        """Duplicate *coordinates* are not duplicate anchors: a cup that
+        genuinely has not moved between two distinct, validly-ordered marks
+        is a legitimate (if uninformative) two-anchor run, not an error."""
+        outlet = (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"])
+        result = _run(
+            zahn_video.path,
+            outlet,
+            outlet_end_xy=outlet,
+            outlet_end_reference_s=zahn_video.duration_s - 1.0,
+        )
+        assert result.summary["status"] in ("confirmed", "review")
 
 
 class TestPortraitGuardGeometry:
@@ -209,7 +345,7 @@ class TestPortraitGuardGeometry:
         self, portrait_reference_frame_zahn_video
     ):
         clip = portrait_reference_frame_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         summary = result.summary
         # Not zero untracked - hand-held motion is still hand-held motion -
         # but nowhere near the near-total failure geometry clipping causes;
@@ -239,7 +375,7 @@ class TestTrackingRefusesAStrongNearbyDistractor:
 
     def test_the_result_is_not_confidently_wrong(self, translucent_cup_near_distractor_zahn_video):
         clip, _distractor_center = translucent_cup_near_distractor_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         summary = result.summary
         # The pre-fix failure mode: RANSAC/inlier/displacement checks alone
         # accept the distractor's own smooth, self-consistent motion,
@@ -253,6 +389,70 @@ class TestTrackingRefusesAStrongNearbyDistractor:
             assert abs(summary["efflux_seconds"] - clip.efflux_s) <= SYNTHETIC_TOLERANCE_S
         else:
             assert summary["confidence"] <= 0.5
+
+    def test_a_false_correlation_between_anchors_is_never_marked_trusted(
+        self, translucent_cup_near_distractor_zahn_video, tmp_path
+    ):
+        """Supervisor decision (two-anchor round): "disagreement/loss
+        remains untrusted and must feed the existing uncertainty logic" -
+        checked directly against per-frame evidence, not just the summary.
+
+        The distractor sits close enough to the cup's drift path that a
+        single direction's independent track could plausibly lock onto it
+        and still clear the correlation/displacement checks on its own.
+        The two-anchor contract's safeguard is that a frame is only ever
+        marked ``trusted`` when forward and backward tracking - accumulated
+        independently, from opposite ends - agree, so a false lock in one
+        direction cannot promote to trusted just because it lies between
+        the anchors. This asserts the stronger, frame-level claim: every
+        ``trusted`` frame's tracked position is close to the true cup, not
+        merely that the final summary happens not to be confidently wrong.
+        """
+        import json
+
+        from ._synthetic_handheld import MARGIN, _camera_offset, outlet_position_at
+
+        clip, distractor_center = translucent_cup_near_distractor_zahn_video
+        diagnostics_dir = tmp_path / "diag"
+        result = _run(
+            clip.path, clip.outlet_at_reference, clip=clip, diagnostics_dir=str(diagnostics_dir)
+        )
+        log_path = Path(result.diagnostics["tracking_frames_log"])
+        records = [json.loads(line) for line in log_path.read_text().splitlines()]
+        trusted = [record for record in records if record["trusted"]]
+        assert trusted, "expected at least some frames to reconcile and be trusted"
+
+        # Same placement the fixture itself used (translucent_cup_near_
+        # distractor_zahn_video, tests/conftest.py): base_x/base_y for the
+        # cup's own motion, and the world-to-frame conversion (subtracting
+        # MARGIN plus the current camera offset) that the distractor's
+        # fixed *world* coordinates need before they are comparable to a
+        # per-frame, source-frame tracked position.
+        camera_drift_px, hand_drift_px, tremor_px = 30.0, 26.0, 2.0
+        base_x = MARGIN + clip.width / 2.0
+        base_y = MARGIN + clip.height * 0.34
+        for record in trusted:
+            timestamp_s = record["timestamp_s"]
+            roi = record["roi"]
+            assert roi is not None
+            tracked_x = roi["x"] + roi["width"] / 2.0
+            tracked_y = roi["y"] + roi["height"] / 2.0
+            true_x, true_y = outlet_position_at(
+                timestamp_s,
+                base_x=base_x,
+                base_y=base_y,
+                camera_drift_px=camera_drift_px,
+                hand_drift_px=hand_drift_px,
+                tremor_px=tremor_px,
+            )
+            cx, cy = _camera_offset(timestamp_s, camera_drift_px, tremor_px)
+            distractor_x = distractor_center[0] - MARGIN - cx
+            distractor_y = distractor_center[1] - MARGIN - cy
+            distance_to_truth = ((tracked_x - true_x) ** 2 + (tracked_y - true_y) ** 2) ** 0.5
+            distance_to_distractor = (
+                (tracked_x - distractor_x) ** 2 + (tracked_y - distractor_y) ** 2
+            ) ** 0.5
+            assert distance_to_truth < distance_to_distractor
 
 
 class TestSearchWindowRecentres:
@@ -268,7 +468,7 @@ class TestSearchWindowRecentres:
 
     def test_recentring_keeps_the_outlet_trackable_through_a_wide_pan(self, wide_pan_zahn_video):
         clip = wide_pan_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         summary = result.summary
 
         # The mechanism under test actually engaged - not just "the result
@@ -299,7 +499,7 @@ class TestBreakDuringATrackingGap:
 
     def test_endpoint_is_unconfirmed_with_bounds_not_falsely_precise(self, handheld_gap_zahn_video):
         clip = handheld_gap_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         summary = result.summary
 
         assert summary["end_confirmed"] is False
@@ -329,7 +529,7 @@ class TestBreakDuringATrackingGap:
         the review-count totals as a precise, confirmed-shaped occurrence.
         """
         clip = handheld_gap_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         _assert_no_precise_duration_leaks(result)
 
     def test_this_adjacent_gap_is_not_mislabelled_as_a_resumed_mid_flow_gap(
@@ -346,7 +546,7 @@ class TestBreakDuringATrackingGap:
         this case is not.
         """
         clip = handheld_gap_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         summary = result.summary
 
         assert summary["end_gap_unresolved"] is False
@@ -359,7 +559,7 @@ class TestBreakDuringATrackingGap:
     def test_fixed_roi_cannot_see_through_the_same_gap_either(self, handheld_gap_zahn_video):
         """Sanity check: the gap is real footage, not a tracking-only artefact."""
         clip = handheld_gap_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference, zahn_track_outlet=False)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip, zahn_track_outlet=False)
         # A fixed ROI has no notion of "untracked" at all - it has nothing to
         # honestly flag the gap with. This is exactly the risk the report's
         # "falsely precise" language describes.
@@ -385,7 +585,7 @@ class TestUnresolvedGapInTheMiddleOfFlow:
         self, handheld_gap_mid_flow_zahn_video
     ):
         clip = handheld_gap_mid_flow_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         summary = result.summary
 
         assert summary["end_confirmed"] is False
@@ -412,7 +612,7 @@ class TestUnresolvedGapInTheMiddleOfFlow:
         self, handheld_gap_mid_flow_zahn_video
     ):
         clip = handheld_gap_mid_flow_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         _assert_no_precise_duration_leaks(result)
 
         assert result.warnings
@@ -434,7 +634,7 @@ class TestBreakDuringATrackingGapAtStart:
         self, handheld_gap_at_start_zahn_video
     ):
         clip = handheld_gap_at_start_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         summary = result.summary
 
         assert summary["start_uncertain"] is True
@@ -465,7 +665,7 @@ class TestBreakDuringATrackingGapAtStart:
         visible in the summary; it must not also reach the events list.
         """
         clip = handheld_gap_at_start_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         _assert_no_precise_duration_leaks(result)
 
 
@@ -479,7 +679,13 @@ class TestTrackingInitFailure:
     """
 
     def test_no_texture_above_outlet_fails_loudly_when_tracking_is_on(self, blank_video_path):
-        result = _run(blank_video_path, (100, 100))  # zahn_track_outlet defaults True
+        # zahn_track_outlet defaults True, so a valid late anchor is
+        # required to even reach the texture-init failure this test
+        # targets - the blank clip has no texture anywhere, so it fails
+        # there regardless of where the late anchor itself is marked.
+        result = _run(
+            blank_video_path, (100, 100), outlet_end_xy=(100, 100), outlet_end_reference_s=2.0
+        )
         summary = result.summary
         assert summary["status"] == "failed"
         assert summary["efflux_seconds"] is None
@@ -510,7 +716,7 @@ class TestPerformance:
         clip = handheld_zahn_video
         before_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         started = time.perf_counter()
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         elapsed = time.perf_counter() - started
         after_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
@@ -530,7 +736,7 @@ class TestPerformance:
         """
         clip = handheld_zahn_video
         started = time.perf_counter()
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         elapsed = time.perf_counter() - started
 
         assert elapsed < clip.duration_s  # comfortably faster than real time
@@ -554,7 +760,9 @@ class TestTrackingFramesLog:
 
         clip = handheld_zahn_video
         diagnostics_dir = tmp_path / "diag"
-        result = _run(clip.path, clip.outlet_at_reference, diagnostics_dir=str(diagnostics_dir))
+        result = _run(
+            clip.path, clip.outlet_at_reference, clip=clip, diagnostics_dir=str(diagnostics_dir)
+        )
 
         log_path = result.diagnostics["tracking_frames_log"]
         assert log_path is not None
@@ -586,5 +794,5 @@ class TestTrackingFramesLog:
     def test_no_file_is_written_without_a_diagnostics_dir(self, handheld_zahn_video):
         """The default: no diagnostics_dir param means nothing hits disk."""
         clip = handheld_zahn_video
-        result = _run(clip.path, clip.outlet_at_reference)
+        result = _run(clip.path, clip.outlet_at_reference, clip=clip)
         assert result.diagnostics["tracking_frames_log"] is None

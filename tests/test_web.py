@@ -195,7 +195,13 @@ class TestAnalysisJobs:
                     "outlet": {
                         "x": int(zahn_video.truth["outlet_x"]),
                         "y": int(zahn_video.truth["outlet_y"]),
-                    }
+                    },
+                    "outlet_reference_s": 0.0,
+                    "outlet_end": {
+                        "x": int(zahn_video.truth["outlet_x"]),
+                        "y": int(zahn_video.truth["outlet_y"]),
+                    },
+                    "outlet_end_reference_s": max(0.0, zahn_video.duration_s - 1.0),
                 },
             },
         ).get_json()
@@ -230,6 +236,12 @@ class TestAnalysisJobs:
                         "x": int(zahn_video.truth["outlet_x"]),
                         "y": int(zahn_video.truth["outlet_y"]),
                     },
+                    "outlet_reference_s": 0.0,
+                    "outlet_end": {
+                        "x": int(zahn_video.truth["outlet_x"]),
+                        "y": int(zahn_video.truth["outlet_y"]),
+                    },
+                    "outlet_end_reference_s": max(0.0, zahn_video.duration_s - 1.0),
                     "diagnostics_dir": str(attacker_target),
                 },
             },
@@ -276,6 +288,12 @@ class TestAnalysisJobs:
                             "x": int(zahn_video.truth["outlet_x"]),
                             "y": int(zahn_video.truth["outlet_y"]),
                         },
+                        "outlet_reference_s": 0.0,
+                        "outlet_end": {
+                            "x": int(zahn_video.truth["outlet_x"]),
+                            "y": int(zahn_video.truth["outlet_y"]),
+                        },
+                        "outlet_end_reference_s": max(0.0, zahn_video.duration_s - 1.0),
                         "diagnostics_dir": str(attacker_target),
                     },
                 },
@@ -402,7 +420,12 @@ class TestAnalysisJobs:
             json={
                 "video_id": video_id,
                 "mode": "zahn_cup",
-                "params": {"outlet": {"x": 240, "y": 180}},
+                "params": {
+                    "outlet": {"x": 240, "y": 180},
+                    "outlet_reference_s": 0.0,
+                    "outlet_end": {"x": 240, "y": 180},
+                    "outlet_end_reference_s": max(0.0, zahn_video.duration_s - 1.0),
+                },
             },
         ).get_json()
         client.post(f"/api/analyses/{started['job_id']}/cancel")

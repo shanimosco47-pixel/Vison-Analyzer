@@ -105,6 +105,8 @@ main { max-width: 1000px; margin: 0 auto; padding: 1.5rem 1rem; }
   border-left: 4px solid var(--accent);
   padding: 0.6rem 0.85rem; margin: 0 0 0.75rem; border-radius: 4px;
 }
+.anchor-toggle { display: flex; flex-wrap: wrap; gap: 1.25rem; align-items: center; margin-bottom: 0.6rem; font-size: 0.9rem; }
+.anchor-toggle label { display: flex; align-items: center; gap: 0.4rem; font-weight: 500; cursor: pointer; }
 .frame-toolbar { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-bottom: 0.6rem; }
 .frame-holder { position: relative; display: inline-block; max-width: 100%; line-height: 0; }
 .frame-holder img { max-width: 100%; border-radius: 8px; display: block; }

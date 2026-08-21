@@ -335,6 +335,13 @@ def wide_pan_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> HandheldCli
     if not writer.isOpened():  # pragma: no cover - depends on the OpenCV build
         pytest.skip("This OpenCV build cannot write MP4 files")
 
+    # Deliberately early, unlike the "near the end" default elsewhere: most
+    # of the 380px pan must fall *after* the late anchor (in segment C, the
+    # continuation past outlet_end_reference_s) for this fixture to still
+    # exercise search-window recentring - a late anchor near duration - 1
+    # would place nearly the whole pan inside segment B (between the two
+    # anchors), which never recentres by design.
+    late_s = 4.0
     reference_outlet: tuple[float, float] | None = None
     total_frames = int(round(duration * fps))
     for index in range(total_frames):
@@ -360,6 +367,7 @@ def wide_pan_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> HandheldCli
     writer.release()
 
     assert reference_outlet is not None
+    late_outlet = (base_x + (total_dx / duration) * late_s, base_y)
     return HandheldClip(
         path=path,
         fps=fps,
@@ -371,6 +379,8 @@ def wide_pan_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> HandheldCli
         flow_end_s=flow_end_s,
         outlet_at_reference=reference_outlet,
         occlusion_s=None,
+        outlet_at_late_reference=late_outlet,
+        late_reference_s=late_s,
     )
 
 
@@ -394,8 +404,8 @@ def translucent_cup_near_distractor_zahn_video(
         _camera_offset,
         _checkerboard_patch,
         _draw_liquid,
-        _hand_offset,
         _world_background,
+        outlet_position_at,
     )
 
     def _draw_cup_with_rim_and_handle(
@@ -426,15 +436,21 @@ def translucent_cup_near_distractor_zahn_video(
     if not writer.isOpened():  # pragma: no cover - depends on the OpenCV build
         pytest.skip("This OpenCV build cannot write MP4 files")
 
+    late_s = max(0.0, duration - 1.0)
     reference_outlet: tuple[float, float] | None = None
     for index in range(int(duration * fps)):
         t = index / fps
         cx, cy = _camera_offset(t, camera_drift_px, tremor_px)
         x0, y0 = int(round(MARGIN + cx)), int(round(MARGIN + cy))
         frame = world[y0 : y0 + height, x0 : x0 + width].copy()
-        hx, hy = _hand_offset(t, hand_drift_px)
-        ox = (base_x + hx) - (MARGIN + cx)
-        oy = (base_y + hy) - (MARGIN + cy)
+        ox, oy = outlet_position_at(
+            t,
+            base_x=base_x,
+            base_y=base_y,
+            camera_drift_px=camera_drift_px,
+            hand_drift_px=hand_drift_px,
+            tremor_px=tremor_px,
+        )
         if reference_outlet is None:
             reference_outlet = (ox, oy)
         _draw_cup_with_rim_and_handle(frame, ox, oy, float(background_level - 14))
@@ -454,6 +470,14 @@ def translucent_cup_near_distractor_zahn_video(
     writer.release()
 
     assert reference_outlet is not None
+    late_outlet = outlet_position_at(
+        late_s,
+        base_x=base_x,
+        base_y=base_y,
+        camera_drift_px=camera_drift_px,
+        hand_drift_px=hand_drift_px,
+        tremor_px=tremor_px,
+    )
     clip = HandheldClip(
         path=path,
         fps=fps,
@@ -465,6 +489,8 @@ def translucent_cup_near_distractor_zahn_video(
         flow_end_s=flow_end_s,
         outlet_at_reference=reference_outlet,
         occlusion_s=None,
+        outlet_at_late_reference=late_outlet,
+        late_reference_s=late_s,
     )
     return clip, distractor_center
 
