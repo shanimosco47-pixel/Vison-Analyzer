@@ -2208,3 +2208,181 @@ retuning in either direction, and this report says so rather than
 implying the synthetic result generalises.
 
 PR #4 stays **draft and unmerged**. Stage 2 is **not started**.
+
+## 29. Stage 3, round two: compensation as feature selection, not just a veto
+
+### 29.1 What the supervisor's run showed
+
+The exact-head real run against `b047ccd` produced the same result as
+`1d04a91`: `status=failed`, no start/end/efflux, 795/811 untrusted, 16
+trusted, 14 liquid frames - §28's veto changed nothing. Diagnostics
+explained why: background motion was available on 800/811 frames, but
+`residual_px` was populated on only 6 of them, and no frame ever set
+`rejection_reason`. A veto can only reject a candidate the base LK/RANSAC
+tracker already found; on the real clip it almost never finds one to
+reject, so an additive-only veto has nothing to act on. The supervisor's
+diagnosis (quoted in full in the PR comment authorising this round):
+compensation has to *find* cup evidence, not just discard it after the
+fact.
+
+### 29.2 Design
+
+Four pieces, in the order the authorisation specified:
+
+* **Warp-stabilised residual mask**
+  (`OutletTracker._foreground_residual_mask`): takes the *previous*
+  frame, warps it forward by the background estimator's own affine
+  transform for the current frame (the same transform §28's veto already
+  computed, now put to a second use), and diffs the warp against the
+  actual current frame. What's left after the diff is motion the
+  background model does not explain - candidate foreground, not "whatever
+  changed frame to frame" (which includes the background's own texture
+  sliding under camera motion).
+* **Detect-then-filter, not mask-then-detect**
+  (`OutletTracker._detect_cup_features`): the first implementation of
+  this masked the cup search region by the residual mask *before* calling
+  `cv2.goodFeaturesToTrack`, which starved it of texture - a translucent
+  cup's own corners are weak signal to begin with, and pre-masking threw
+  most of them away before detection ever ran. Fixed by detecting corners
+  over the *whole* cup box first, then keeping only the ones whose own
+  pixel - dilated by a 5x5 kernel, to tolerate warp and sub-pixel
+  registration slack - falls on residual-motion evidence. Detect
+  unrestricted, filter by residual: the same evidence, applied after
+  detection instead of before it, is what actually finds cup features
+  rather than losing them.
+* **Every-frame redetection when compensation is available**: the
+  original acceptance path (`_accept_tracked`) only redetected features
+  when the tracked point count ran thin (a handful of times across 811
+  frames on the real clip, per the supervisor's own count). That meant
+  compensated evidence was consulted almost never. Now, whenever a
+  background transform is available for the current frame,
+  `_accept_tracked` redetects every frame - compensation participates at
+  the scale the failure mode actually requires, not opportunistically.
+* **One-time reference-patch refinement**
+  (`OutletTracker._maybe_refine_reference_patch`): the correlation gate's
+  reference patch is necessarily built once, from uncompensated evidence,
+  at construction - before compensation has ever run. Even after feature
+  selection started using residual evidence, that frozen patch stayed the
+  bottleneck: correctly-relocated compensated candidates kept failing the
+  correlation check against a patch extracted from the wrong, pre-
+  compensation location. Fixed with a bounded, one-time refinement: the
+  first frame whose own detection drew on compensated evidence rebuilds
+  the reference patch from that frame. Bounded to once, not continuous,
+  to avoid the drift a repeatedly-refreshed reference patch would
+  reintroduce (the same circularity concern §18.3/§24.2 raised about
+  patch correlation generally).
+
+A new `used_residual` diagnostic - `False` unless *this* frame's own
+active point set was actually (re)selected from residual evidence, as
+opposed to merely surviving the veto - is threaded end to end:
+`OutletTracker.TrackResult` to `zahn_detector._FrameEvidence` (including
+through `_reconcile_between_anchors`, where it is the OR of the forward
+and backward passes' own values) to the streamed tracking-frames log.
+Combined with the five fields §28 already streamed
+(`background_available`, `background_dx`, `background_dy`,
+`residual_px`, `rejection_reason`), a real run can now be audited for
+whether compensation actually *participated* in a frame's own trajectory,
+not only whether it had the opportunity to.
+
+### 29.3 New evidence
+
+Calibrating a fixture to exercise this at all was itself informative: the
+existing `translucent_cup_overlapping_distractor_zahn_video` fixture uses
+`cup_opacity=0.22` (§28.3), faint enough that no feature-selection
+strategy - residual-filtered or not - finds reliable corner signal in it.
+A new build of the same `build_translucent_cup_clip` helper at
+`cup_opacity=0.5` is what the new test actually exercises; the fainter
+existing fixture and its tests are untouched and still pass.
+
+* **`test_compensation_recovers_trust_and_trackability_through_the_flow_
+  window`** (new, `TestCameraMotionCompensation`): the integration
+  assertion the authorisation asked for, checked directly by A/B rather
+  than trusted from a single run -
+  `OutletTracker._foreground_residual_mask` monkeypatched to a no-op for
+  the "disabled" arm, left real for the "enabled" arm, same clip both
+  times. Results on the calibrated fixture:
+  - `frames_untracked`: compensation-enabled is asserted strictly lower
+    than disabled (the direct "increases trusted cup frames" claim).
+  - Trackability through the clip's *true* flow window - the interval
+    that determines the measured efflux, and the metric this round can
+    honestly claim to control (§29.4) - rises from 8.6% of window frames
+    `state == "tracked"` (15/175, disabled) to 78.9% (138/175, enabled).
+    The test asserts the enabled run exceeds double the disabled
+    coverage and reaches at least 50%, not the exact measured numbers, so
+    it isn't brittle to run-to-run fixture noise.
+  - Position accuracy for the window-tracked frames stays bounded
+    (median error asserted `< 60px`; measured ~25px both arms) against
+    ground truth computed from the fixture's own construction parameters
+    - tight enough that locking onto the distractor (over 200px away)
+    would fail the assertion. A frame reported "tracked" that is
+    confidently in the wrong place is worse than one honestly reported
+    lost, so this is checked, not just coverage.
+* **Diagnostics schema** (`TestTrackingFramesLog`): the streamed record's
+  key set gained `used_residual` alongside §28's five fields, and the
+  schema test now asserts its type. On the calibrated fixture, the
+  compensation-enabled run reports 112/300 frames with
+  `used_residual == true` against 0/300 disabled - the mechanism itself
+  is now visible in a real run's own log, not just inferable from the
+  outcome, which is what let the numbers in this section be reported
+  rather than merely claimed.
+* **The liquid-visibility confound, found and not chased.** The fixture's
+  full derived summary (`flow_start_s`/`efflux_seconds`) does not move
+  between the two arms despite the dramatic trust and trackability
+  difference above. Root cause, isolated with a standalone diagnostic
+  (frames independently classified as liquid-visible: 80/300 disabled,
+  256/300 enabled, ~174/300 true): `ZahnCupDetector`'s liquid-visibility
+  colour classifier - a separate subsystem this round does not touch -
+  is not calibrated for this new fixture's rendering, in either
+  direction. Recalibrating it was out of this round's authorised scope
+  and risked scope creep into work nobody asked for, so the new test
+  deliberately does not assert `flow_start_s`/`efflux_seconds` - only
+  the trackability-through-the-window and position-accuracy claims
+  Stage 3's own mechanism actually controls. This is stated here rather
+  than left implicit, since it is a real gap between "the tracker works"
+  and "the full pipeline's timing output is right" that this round's
+  evidence does not close.
+* **Existing regressions**: full suite green, including every fixture
+  and test §26-28 already listed (static, opaque, occlusion/gap,
+  portrait, near- and overlapping-distractor, search-window recentring,
+  result-contract/security) plus §28's own two new compensation tests -
+  none of this round's changes (detect-then-filter, every-frame
+  redetection, one-time patch refinement) regressed any of them.
+* **Runtime/memory** (`handheld_zahn_video`, same measurement as
+  §26.5/§28.3, standalone, repeated twice for stability): 3.54s wall time
+  (was 2.51s - every-frame redetection plus the warp/diff/dilate pass
+  now runs on effectively every frame instead of opportunistically),
+  6.2x real time (was 8.8x). Peak RSS delta 68.2-68.6MB above baseline
+  (was ~68MB before this round too) - the added work is per-frame CPU,
+  not additional buffering.
+* **Gates**: `pytest` - 362 tests (361 before this round + 1 net new),
+  all pass; `ruff check`, `ruff format --check`, `mypy` (29 source files)
+  all clean. `node --test tests_js/*.test.js` 58/58 (unchanged - no
+  frontend surface this round).
+
+### 29.4 Status
+
+Compensation now participates in feature selection itself - detecting
+cup evidence from warp-stabilised residual motion and redetecting on
+essentially every frame a background transform is available for - rather
+than only vetoing candidates the base tracker happened to find on its
+own. On the calibrated synthetic fixture built to exercise exactly the
+failure mode the supervisor's real-clip diagnostics identified
+(background available but almost no residual ever computed, no
+rejection ever fired), this round's A/B test shows compensation
+increasing trusted frames overall and raising true-flow-window
+trackability from 8.6% to 78.9%, with bounded position accuracy and a
+`used_residual` diagnostic that lets a real run's own log show whether
+the mechanism actually fired, frame by frame - not just whether the
+opportunity to fire existed.
+
+**Not independently verified against the real clip**, per the same
+discipline as every prior round: the ±0.75s real-footage criterion, and
+whether this round's redetection/refinement design actually recovers a
+trajectory on the exact clip whose diagnostics motivated it, are the
+supervisor's own run against this head to make. The fixture's own
+liquid-visibility rendering is separately uncalibrated (§29.3) and that
+gap is not closed here - a real run's full summary may still depend on
+that subsystem being fixed even if this round's tracking mechanism
+itself works as intended.
+
+PR #4 stays **draft and unmerged**. Stage 2 is **not started**.
