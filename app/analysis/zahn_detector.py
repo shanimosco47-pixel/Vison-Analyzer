@@ -34,10 +34,12 @@ Every threshold lives in :class:`app.config.ZahnConfig`.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from pathlib import Path
+from typing import Any, ClassVar, TextIO
 
 import cv2
 import numpy as np
@@ -383,6 +385,14 @@ class FlowMeasurement:
     # precise duration.
     end_uncertain: bool = False
     end_uncertainty_bounds: tuple[float, float] | None = None
+    # Symmetric case: the persistence run that confirmed the start began
+    # immediately after an untrusted span wider than
+    # zahn_max_endpoint_uncertainty_s. Flow could have started anywhere in
+    # start_uncertainty_bounds - a late-but-precise start still reports a
+    # falsely precise (shortened) duration, which is exactly as dishonest as
+    # a falsely precise end.
+    start_uncertain: bool = False
+    start_uncertainty_bounds: tuple[float, float] | None = None
 
     @property
     def efflux_s(self) -> float | None:
@@ -425,6 +435,17 @@ class FlowStateMachine:
         # timing could actually fall within. See update()'s `trusted` param.
         self._gap_open = False
         self._gap_after_activity: tuple[float, float] | None = None
+        # Symmetric bookkeeping for the start side: the timestamp of the
+        # last trusted frame seen at all (regardless of content - "flow
+        # hadn't started as of here" is valid negative evidence even from a
+        # trusted, quiet frame), and the most recent gap that closed while
+        # still waiting for flow to start. A late-but-precise start is just
+        # as falsely precise as a late end: the *duration* comes out short,
+        # reported with full confidence, on an interval that could not
+        # actually have been observed from the beginning.
+        self._last_trusted_timestamp: float | None = None
+        self._gap_start_ts: float | None = None
+        self._pending_start_gap: tuple[float, float] | None = None
 
     @property
     def finished(self) -> bool:
@@ -468,6 +489,12 @@ class FlowStateMachine:
                 # different, wider uncertainty - that is what
                 # zahn_max_endpoint_uncertainty_s bounds, and it is why only
                 # `not trusted` (lost/predicted tracking) opens a gap here.
+                if not self._gap_open:
+                    self._gap_start_ts = (
+                        self._last_trusted_timestamp
+                        if self._last_trusted_timestamp is not None
+                        else timestamp_s
+                    )
                 self._gap_open = True
             # An untrusted frame proves nothing: it may neither start the
             # clock nor contribute to the "liquid has stopped" evidence. Both
@@ -483,13 +510,24 @@ class FlowStateMachine:
 
         if self._gap_open:
             self._gap_open = False
-            if self._last_activity_s is not None:
-                # The true transition could have happened any time from the
-                # last confirmed liquid sighting through to this first
-                # trusted frame - not just during the untrusted span itself,
-                # since ordinary quiet-but-trusted frames right before it are
-                # equally unable to prove flow had already ended.
-                self._gap_after_activity = (self._last_activity_s, timestamp_s)
+            if self._flowing:
+                if self._last_activity_s is not None:
+                    # The true transition could have happened any time from
+                    # the last confirmed liquid sighting through to this
+                    # first trusted frame - not just during the untrusted
+                    # span itself, since ordinary quiet-but-trusted frames
+                    # right before it are equally unable to prove flow had
+                    # already ended.
+                    self._gap_after_activity = (self._last_activity_s, timestamp_s)
+            elif self._gap_start_ts is not None:
+                # Symmetric case, still waiting for flow to start: the last
+                # trusted frame before the gap - whatever it showed - is
+                # valid negative evidence flow had not started yet. Only
+                # relevant if a persistence run beginning exactly here goes
+                # on to confirm a start; overwritten by any later gap that
+                # closes before that happens.
+                self._pending_start_gap = (self._gap_start_ts, timestamp_s)
+        self._last_trusted_timestamp = timestamp_s
 
         activity_score = sample.value
         outlet_score = float(sample.extras.get("outlet_score", 0.0))
@@ -534,6 +572,21 @@ class FlowStateMachine:
                 sum(self._start_margins) / len(self._start_margins) if self._start_margins else 0.0
             )
             self._last_activity_s = timestamp_s
+            if (
+                self._pending_start_gap is not None
+                and self._pending_start_gap[1] == self.measurement.start_s
+            ):
+                gap_start, gap_end = self._pending_start_gap
+                if (gap_end - gap_start) > self.config.zahn_max_endpoint_uncertainty_s:
+                    # This persistence run began immediately after an
+                    # untrusted span: flow could genuinely have started
+                    # anywhere in it, not at the first frame we happened to
+                    # trust again. Reporting a confirmed, precise start (and
+                    # therefore a precise duration) here would invent
+                    # certainty the evidence does not support.
+                    self.measurement.start_uncertain = True
+                    self.measurement.start_uncertainty_bounds = (gap_start, gap_end)
+            self._pending_start_gap = None
             logger.info(
                 "Zahn flow start detected at %.3fs (persistence %.2fs satisfied at %.3fs)",
                 self.measurement.start_s,
@@ -660,6 +713,16 @@ class ZahnCupDetector(BaseDetector):
             raise ConfigurationError("The analysis end time must be after the start time.")
 
         self.keep_diagnostics = bool(self.params.get("save_diagnostics", False))
+        # Set by the service layer (job.job_id under config.diagnostics_dir),
+        # not by a user-facing parameter. When present and save_diagnostics is
+        # on, per-frame tracking evidence is *streamed* to a file here rather
+        # than accumulated in memory - the transitions-only summary in
+        # DetectorResult.diagnostics is enough to see the shape of a run, but
+        # not enough to inspect a specific frame's tracked outlet, search
+        # window, scoring ROI and state, which is what this file is for.
+        diagnostics_dir_param = self.params.get("diagnostics_dir")
+        self._diagnostics_dir = Path(diagnostics_dir_param) if diagnostics_dir_param else None
+        self._tracking_frames_log_path: Path | None = None
 
     # -- planning ---------------------------------------------------------- #
 
@@ -716,14 +779,13 @@ class ZahnCupDetector(BaseDetector):
         # Fixed for the whole run: whether tracking was *requested* decides the
         # shape of what gets decoded (a wide, unscaled, unblurred capture
         # window vs. the guard region decoded directly at analysis scale, as
-        # before). `use_tracking` below is mutable - it also tracks whether a
-        # tracker is actually *in effect*, which can turn False mid-run if
-        # initialisation fails - but the decode shape itself cannot change
-        # once the sampling plan and reader iteration have started, so every
-        # per-frame scoring decision keys off `wide_capture`, not the mutable
-        # flag.
+        # before). `_run_loop`'s own `use_tracking` is mutable - it also
+        # tracks whether a tracker is actually *in effect*, which can turn
+        # False mid-run if initialisation fails - but the decode shape itself
+        # cannot change once the sampling plan and reader iteration have
+        # started, so every per-frame scoring decision keys off
+        # `wide_capture`, not that mutable flag.
         wide_capture = self.config.zahn_track_outlet
-        use_tracking = wide_capture
         capture_roi = self._build_capture_roi() if wide_capture else self.guard_roi
         capture_scale = 1.0 if wide_capture else scale
         plan = build_sampling_plan(
@@ -743,6 +805,13 @@ class ZahnCupDetector(BaseDetector):
             self.outlet_xy[1] - capture_roi.y,
         )
         patch_half_px = max(12, int(round(0.4 * self.roi.width)))
+        # Feature detection is bounded to a cup-sized box near/above the
+        # outlet - the guard region's own scale, not the wider capture
+        # window - so an independently moving, strongly textured background
+        # cannot out-compete the cup for the similarity fit or the
+        # reacquisition anchor. See OutletTracker._detect_cup_features.
+        cup_half_width_px = max(1, self.guard_roi.width // 2)
+        cup_height_above_px = max(1, self.guard_roi.height)
 
         logger.info(
             "Zahn analysis of %s: roi=%s guard=%s capture=%s track_outlet_requested=%s %s",
@@ -764,6 +833,69 @@ class ZahnCupDetector(BaseDetector):
         last_timestamp = self.start_s
         total_span = max(plan.end_s - plan.start_s, 1e-6)
 
+        frames_log = self._open_tracking_frames_log() if wide_capture else None
+        try:
+            return self._run_loop(
+                reader=reader,
+                progress=progress,
+                plan=plan,
+                capture_roi=capture_roi,
+                wide_capture=wide_capture,
+                scale=scale,
+                blur_kernel=blur_kernel,
+                base_guard_x=base_guard_x,
+                base_guard_y=base_guard_y,
+                reference_outlet_local=reference_outlet_local,
+                patch_half_px=patch_half_px,
+                cup_half_width_px=cup_half_width_px,
+                cup_height_above_px=cup_height_above_px,
+                scorer=scorer,
+                machine=machine,
+                trace=trace,
+                tracker=tracker,
+                transitions=transitions,
+                last_state=last_state,
+                first_frame=first_frame,
+                started=started,
+                last_report=last_report,
+                last_timestamp=last_timestamp,
+                total_span=total_span,
+                frames_log=frames_log,
+            )
+        finally:
+            if frames_log is not None:
+                frames_log.close()
+
+    def _run_loop(  # noqa: PLR0913 - internal, keeps run() readable and the log guaranteed to close
+        self,
+        *,
+        reader: VideoReader,
+        progress: ProgressReporter,
+        plan: Any,
+        capture_roi: ROI,
+        wide_capture: bool,
+        scale: float,
+        blur_kernel: int,
+        base_guard_x: int,
+        base_guard_y: int,
+        reference_outlet_local: tuple[float, float],
+        patch_half_px: int,
+        cup_half_width_px: int,
+        cup_height_above_px: int,
+        scorer: StreamActivityScorer,
+        machine: FlowStateMachine,
+        trace: ActivityTrace,
+        tracker: OutletTracker | None,
+        transitions: list[dict[str, Any]],
+        last_state: TrackState | None,
+        first_frame: bool,
+        started: float,
+        last_report: float,
+        last_timestamp: float,
+        total_span: float,
+        frames_log: TextIO | None,
+    ) -> DetectorResult:
+        use_tracking = wide_capture
         for sample in reader.iter_samples(
             plan, roi=capture_roi, grayscale=True, blur_kernel=blur_kernel
         ):
@@ -778,16 +910,27 @@ class ZahnCupDetector(BaseDetector):
                             capture_gray,
                             reference_outlet_local,
                             patch_half_px=patch_half_px,
+                            cup_half_width_px=cup_half_width_px,
+                            cup_height_above_px=cup_height_above_px,
                             reference_timestamp_s=sample.timestamp_s,
                         )
                     except TrackerInitError as exc:
+                        # zahn_track_outlet=True is the product decision:
+                        # tracking is not optional here, and the config flag
+                        # is the *only* sanctioned rollback. Silently falling
+                        # back to the fixed-ROI path would both violate that
+                        # and let a frame that could not even be initialised
+                        # for tracking come back CONFIRMED on stale, fixed
+                        # geometry - guessing under exactly the condition
+                        # tracking exists to refuse to guess under. Report
+                        # failure instead; only an explicit
+                        # zahn_track_outlet=False may use the fixed path.
                         logger.warning(
-                            "Zahn outlet tracking disabled for %s (falling back to a fixed "
-                            "region): %s",
+                            "Zahn outlet tracking could not start for %s: %s",
                             self.video.path.name,
                             exc,
                         )
-                        use_tracking = False
+                        return self._tracking_unavailable_result(str(exc))
 
             state = TrackState.TRACKED
             offset_x = offset_y = 0.0
@@ -831,6 +974,18 @@ class ZahnCupDetector(BaseDetector):
             machine.update(sample.timestamp_s, scored, trusted=trusted)
             last_timestamp = sample.timestamp_s
 
+            if frames_log is not None:
+                self._write_tracking_frame_log(
+                    frames_log,
+                    sample.timestamp_s,
+                    state,
+                    offset_x,
+                    offset_y,
+                    reacquired,
+                    trusted,
+                    capture_roi,
+                )
+
             if (
                 self.keep_diagnostics
                 and tracker is not None
@@ -870,21 +1025,12 @@ class ZahnCupDetector(BaseDetector):
             measurement, trace, elapsed, plan.effective_interval_s, transitions, use_tracking
         )
 
-    def _diagnostic_transition(
-        self,
-        timestamp_s: float,
-        state: TrackState,
-        offset_x: float,
-        offset_y: float,
-        reacquired: bool,
-        capture_roi: ROI,
-    ) -> dict[str, Any] | None:
-        """A tracking-state snapshot for --save-diagnostics: geometry, not pixels.
+    def _tracked_geometry(self, offset_x: float, offset_y: float) -> tuple[ROI, ROI] | None:
+        """The analysis ROI and guard ROI at the tracker's current offset.
 
-        Best-effort like the rest of diagnostics: a transition whose offset
-        happens to carry the geometry off-frame is simply skipped rather than
-        raising, matching the project's rule that diagnostics never break an
-        otherwise successful analysis.
+        ``None`` when the offset carries the geometry off-frame - best-effort,
+        like the rest of diagnostics: this must never raise into the analysis
+        loop.
         """
         try:
             roi = ROI(
@@ -901,6 +1047,22 @@ class ZahnCupDetector(BaseDetector):
             ).clipped_to(self.video.width, self.video.height)
         except InvalidROIError:
             return None
+        return roi, guard_roi
+
+    def _diagnostic_transition(
+        self,
+        timestamp_s: float,
+        state: TrackState,
+        offset_x: float,
+        offset_y: float,
+        reacquired: bool,
+        capture_roi: ROI,
+    ) -> dict[str, Any] | None:
+        """A tracking-state snapshot for --save-diagnostics: geometry, not pixels."""
+        geometry = self._tracked_geometry(offset_x, offset_y)
+        if geometry is None:
+            return None
+        roi, guard_roi = geometry
         return {
             "timestamp_s": round(timestamp_s, 3),
             "state": state.value,
@@ -909,6 +1071,59 @@ class ZahnCupDetector(BaseDetector):
             "guard_roi": guard_roi.to_dict(),
             "search_roi": capture_roi.to_dict(),
         }
+
+    def _open_tracking_frames_log(self) -> TextIO | None:
+        """Open a streamed, bounded-memory per-frame tracking evidence file.
+
+        Codex review: state-transition JSON alone does not show the tracked
+        outlet, search window, scoring ROI and state for the frames actually
+        analysed. One JSON line per frame, written and flushed as the run
+        progresses, gives that without loading the whole video (or a
+        per-frame list) into memory. Gated on ``diagnostics_dir`` - set by the
+        service layer only when the operator has diagnostics enabled - not on
+        ``keep_diagnostics``, which separately controls the lightweight
+        transitions-only summary above. Best-effort like the rest of
+        diagnostics: any failure to create or open the file simply disables
+        this stream rather than failing the analysis.
+        """
+        if self._diagnostics_dir is None:
+            return None
+        try:
+            self._diagnostics_dir.mkdir(parents=True, exist_ok=True)
+            path = self._diagnostics_dir / "zahn_tracking_frames.jsonl"
+            handle = path.open("w", encoding="utf-8")
+        except OSError:
+            logger.warning("Could not open tracking frames log under %s", self._diagnostics_dir)
+            return None
+        self._tracking_frames_log_path = path
+        return handle
+
+    def _write_tracking_frame_log(
+        self,
+        frames_log: TextIO,
+        timestamp_s: float,
+        state: TrackState,
+        offset_x: float,
+        offset_y: float,
+        reacquired: bool,
+        trusted: bool,
+        capture_roi: ROI,
+    ) -> None:
+        geometry = self._tracked_geometry(offset_x, offset_y)
+        roi, guard_roi = geometry if geometry is not None else (None, None)
+        record = {
+            "timestamp_s": round(timestamp_s, 3),
+            "state": state.value,
+            "trusted": trusted,
+            "reacquired": bool(reacquired),
+            "search_roi": capture_roi.to_dict(),
+            "roi": roi.to_dict() if roi is not None else None,
+            "guard_roi": guard_roi.to_dict() if guard_roi is not None else None,
+        }
+        try:
+            frames_log.write(json.dumps(record) + "\n")
+        except OSError:
+            logger.warning("Could not write to tracking frames log", exc_info=True)
 
     def _inner_rect(self, scale: float) -> _Rect:
         """Where the analysis ROI sits inside the (scaled) guard crop."""
@@ -922,6 +1137,64 @@ class ZahnCupDetector(BaseDetector):
 
     # -- reporting --------------------------------------------------------- #
 
+    def _tracking_unavailable_result(self, reason: str) -> DetectorResult:
+        """Outlet tracking was requested but could not be started.
+
+        No frame has been scored, so there is no honest number to report -
+        not even a lower bound. This is a FAILED result, distinct from a
+        REVIEW one: the operator needs to re-mark the outlet or explicitly
+        opt out of tracking (``zahn_track_outlet=False``), not merely double
+        check an uncertain measurement.
+        """
+        message = (
+            "Outlet tracking is enabled but could not be started: "
+            f"{reason} Mark the outlet on a more textured part of the cup, "
+            "or set zahn_track_outlet=False to use a fixed region instead."
+        )
+        return DetectorResult(
+            events=[],
+            diagnostics={
+                "roi": self.roi.to_dict(),
+                "guard_roi": self.guard_roi.to_dict(),
+                "config": _zahn_config_to_dict(self.config),
+                "track_outlet": False,
+                "tracking_transitions": [],
+                "tracking_init_failed": True,
+                "tracking_frames_log": (
+                    str(self._tracking_frames_log_path)
+                    if self._tracking_frames_log_path is not None
+                    else None
+                ),
+            },
+            trace=ActivityTrace(),
+            summary={
+                "mode": self.name,
+                "flow_start_s": None,
+                "flow_end_s": None,
+                "efflux_seconds": None,
+                "efflux_seconds_bounds": None,
+                "end_confirmed": False,
+                "end_uncertain": False,
+                "start_uncertain": False,
+                "fps": round(self.video.fps, 4),
+                "frames_analysed": 0,
+                "frames_with_liquid": 0,
+                "frames_disturbed": 0,
+                "frames_untracked": 0,
+                "timed_frames": 0,
+                "continuity": 0.0,
+                "stream_breaks": 0,
+                "confidence": 0.0,
+                "status": EventStatus.FAILED.value,
+                "reasons": [message],
+                "processing_seconds": 0.0,
+                "roi": self.roi.to_dict(),
+                "sample_interval_s": round(1.0 / self.video.fps, 5),
+                "track_outlet": False,
+            },
+            warnings=[message],
+        )
+
     def _build_result(
         self,
         measurement: FlowMeasurement,
@@ -933,18 +1206,37 @@ class ZahnCupDetector(BaseDetector):
     ) -> DetectorResult:
         confidence, reasons = score_confidence(measurement, self.config)
         status = self._status_for(measurement, confidence)
-        efflux = measurement.efflux_s if status is not EventStatus.FAILED else None
+        uncertain = measurement.start_uncertain or measurement.end_uncertain
+        # An uncertain endpoint must not be presented as a precise, confirmed
+        # duration - the point of end_uncertain/start_uncertain existing at
+        # all. efflux_seconds is suppressed exactly like the FAILED case;
+        # efflux_seconds_bounds carries what the evidence actually supports.
+        efflux = (
+            measurement.efflux_s if status is not EventStatus.FAILED and not uncertain else None
+        )
+        efflux_bounds = self._efflux_bounds(measurement) if uncertain else None
 
         summary: dict[str, Any] = {
             "mode": self.name,
             "flow_start_s": measurement.start_s,
             "flow_end_s": measurement.end_s,
             "efflux_seconds": round(efflux, 3) if efflux is not None else None,
+            "efflux_seconds_bounds": (
+                [round(efflux_bounds[0], 3), round(efflux_bounds[1], 3)]
+                if efflux_bounds is not None
+                else None
+            ),
             "end_confirmed": measurement.end_confirmed,
             "end_uncertain": measurement.end_uncertain,
             "end_uncertainty_bounds": (
                 [round(bound, 3) for bound in measurement.end_uncertainty_bounds]
                 if measurement.end_uncertainty_bounds is not None
+                else None
+            ),
+            "start_uncertain": measurement.start_uncertain,
+            "start_uncertainty_bounds": (
+                [round(bound, 3) for bound in measurement.start_uncertainty_bounds]
+                if measurement.start_uncertainty_bounds is not None
                 else None
             ),
             "fps": round(self.video.fps, 4),
@@ -965,7 +1257,12 @@ class ZahnCupDetector(BaseDetector):
         }
 
         events: list[Event] = []
-        if measurement.start_s is not None and measurement.end_s is not None and efflux is not None:
+        if measurement.start_s is not None and measurement.end_s is not None:
+            # A candidate is preserved for review even when uncertain - the
+            # timestamps themselves (the earliest-supported bounds) are still
+            # useful to look at - but its details carry no precise
+            # efflux_seconds, only the bounds, so nothing downstream can
+            # present it as an authoritative number.
             events.append(
                 Event(
                     label="Zahn cup efflux",
@@ -976,10 +1273,13 @@ class ZahnCupDetector(BaseDetector):
                     status=status,
                     notes=tuple(reasons),
                     details={
-                        "efflux_seconds": round(efflux, 3),
+                        "efflux_seconds": round(efflux, 3) if efflux is not None else None,
+                        "efflux_seconds_bounds": summary["efflux_seconds_bounds"],
                         "end_confirmed": measurement.end_confirmed,
                         "end_uncertain": measurement.end_uncertain,
                         "end_uncertainty_bounds": summary["end_uncertainty_bounds"],
+                        "start_uncertain": measurement.start_uncertain,
+                        "start_uncertainty_bounds": summary["start_uncertainty_bounds"],
                         "stream_breaks": [
                             [round(a, 3), round(b, 3)] for a, b in measurement.breaks
                         ],
@@ -999,11 +1299,24 @@ class ZahnCupDetector(BaseDetector):
                 "background."
             )
         elif status is EventStatus.REVIEW:
-            if measurement.end_uncertain:
+            if measurement.end_uncertain and measurement.start_uncertain:
+                warnings.append(
+                    "The outlet was not confidently tracked around the reported start "
+                    "or the reported end - the true efflux time could be shorter or "
+                    "longer than shown. Please review before using this number."
+                )
+            elif measurement.end_uncertain:
                 warnings.append(
                     "The outlet was not confidently tracked around the reported end - "
                     "the true end could have occurred earlier. Please review before "
                     "using this number."
+                )
+            elif measurement.start_uncertain:
+                warnings.append(
+                    "The outlet was not confidently tracked around the reported start "
+                    "- the true start could have occurred earlier, making the efflux "
+                    "time reported here too short. Please review before using this "
+                    "number."
                 )
             else:
                 warnings.append(
@@ -1021,18 +1334,50 @@ class ZahnCupDetector(BaseDetector):
                 "stopped_early": measurement.stopped_early,
                 "track_outlet": tracking_used,
                 "tracking_transitions": transitions or [],
+                "tracking_frames_log": (
+                    str(self._tracking_frames_log_path)
+                    if self._tracking_frames_log_path is not None
+                    else None
+                ),
             },
             trace=trace,
             summary=summary,
             warnings=warnings,
         )
 
+    def _efflux_bounds(self, measurement: FlowMeasurement) -> tuple[float, float] | None:
+        """The range the true efflux time could fall in, given uncertain endpoints.
+
+        Combines whichever of start/end is uncertain with the other's exact
+        value (or both, worst case, if both are uncertain) - the widest
+        duration comes from the latest-plausible start and the
+        earliest-plausible... no: from the *earliest* start and *latest* end
+        for the upper bound, and the reverse for the lower bound.
+        """
+        if measurement.start_s is None or measurement.end_s is None:
+            return None
+        start_lo, start_hi = (
+            measurement.start_uncertainty_bounds
+            if measurement.start_uncertain and measurement.start_uncertainty_bounds is not None
+            else (measurement.start_s, measurement.start_s)
+        )
+        end_lo, end_hi = (
+            measurement.end_uncertainty_bounds
+            if measurement.end_uncertain and measurement.end_uncertainty_bounds is not None
+            else (measurement.end_s, measurement.end_s)
+        )
+        return max(0.0, end_lo - start_hi), max(0.0, end_hi - start_lo)
+
     def _status_for(self, measurement: FlowMeasurement, confidence: float) -> EventStatus:
         if measurement.start_s is None or measurement.end_s is None:
             return EventStatus.FAILED
         if confidence < self.config.fail_confidence:
             return EventStatus.FAILED
-        if confidence < self.config.review_confidence or not measurement.end_confirmed:
+        if (
+            confidence < self.config.review_confidence
+            or not measurement.end_confirmed
+            or measurement.start_uncertain
+        ):
             return EventStatus.REVIEW
         return EventStatus.CONFIRMED
 
@@ -1055,7 +1400,10 @@ def score_confidence(measurement: FlowMeasurement, config: ZahnConfig) -> tuple[
         confidence than a steady run, distinct from scene-wide disturbance;
     *   the whole result is capped at 0.5 when the end was never confirmed,
         whether because the video ended mid-flow or because a tracking/
-        visibility gap left the true end uncertain (see below).
+        visibility gap left the true end uncertain, and likewise capped at
+        0.5 when the *start* was confirmed right after such a gap - a
+        late-but-precise start reports a falsely short duration just as
+        surely as a falsely late end reports a falsely long one (see below).
     """
     reasons: list[str] = []
     if measurement.start_s is None:
@@ -1107,6 +1455,15 @@ def score_confidence(measurement: FlowMeasurement, config: ZahnConfig) -> tuple[
                 "The video ended while liquid was still visible, so the efflux time is a "
                 "lower bound rather than a measurement."
             )
+    if measurement.start_uncertain and measurement.start_uncertainty_bounds is not None:
+        confidence = min(confidence, 0.50)
+        gap_start, gap_end = measurement.start_uncertainty_bounds
+        reasons.append(
+            f"The outlet was not confidently tracked for {gap_end - gap_start:.2f}s "
+            f"around the reported start ({gap_start:.2f}-{gap_end:.2f}s); the true start "
+            "could have occurred anywhere in that span, so the efflux time is not "
+            "reported as precise."
+        )
     if untracked_ratio > 0.02:
         reasons.append(
             f"The outlet tracker could not confidently place the outlet in "

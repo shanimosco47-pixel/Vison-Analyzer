@@ -92,8 +92,14 @@ def zahn_video(tmp_path_factory: pytest.TempPathFactory) -> SyntheticVideo:
     for index in range(total_frames):
         timestamp = index / fps
         frame = _noisy_background(rng, width, height)
-        # The cup body: a static dark shape above the outlet.
+        # The cup body: a static dark shape above the outlet. A rim and a
+        # handle give it more than a bare rectangle's four corners - real
+        # Zahn cups are not flat-sided, and outlet tracking (Stage 1) needs
+        # genuine texture to find above the outlet the same way it would on
+        # an actual cup.
         cv2.rectangle(frame, (170, 60), (310, outlet[1]), (90, 90, 90), -1)
+        cv2.ellipse(frame, (240, 60), (70, 14), 0, 0, 360, (78, 78, 78), -1)
+        cv2.rectangle(frame, (310, 84), (334, 100), (82, 82, 82), -1)
 
         if stream_start <= timestamp < stream_end:
             # A continuous, slightly wobbling stream below the orifice.
@@ -210,6 +216,19 @@ def handheld_gap_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> Handhel
     """
     path = tmp_path_factory.mktemp("videos") / "handheld_gap_zahn.mp4"
     return build_handheld_clip(path, occlusion_s=(15.4, 18.2), **HANDHELD_TIMELINE)
+
+
+@pytest.fixture(scope="session")
+def handheld_gap_at_start_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> HandheldClip:
+    """The outlet is swung out of frame across the true *start*, not the end.
+
+    Occlusion covers 2.6-4.2s, straddling the true flow start at 3.0s: a
+    late-but-precise start is exactly as falsely precise as a falsely late
+    end, since the reported duration comes out too short with full
+    confidence. See FlowStateMachine's start_uncertain handling.
+    """
+    path = tmp_path_factory.mktemp("videos") / "handheld_gap_at_start_zahn.mp4"
+    return build_handheld_clip(path, occlusion_s=(2.6, 4.2), **HANDHELD_TIMELINE)
 
 
 @pytest.fixture

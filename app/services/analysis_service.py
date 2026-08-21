@@ -259,7 +259,16 @@ class AnalysisService:
             job.progress = JobProgress(stage, max(0.0, min(1.0, fraction)), message)
 
         try:
-            detector = create_detector(job.mode, record.info, job.params)
+            detector_params: dict[str, Any] = dict(job.params)
+            if self.config.save_diagnostics:
+                # Server-operator flag, not a per-request one - the same gate
+                # save_event_boundary_frames uses below. Streamed per-frame
+                # tracking evidence (see ZahnCupDetector._open_tracking_frames_log)
+                # only ever writes under here, one directory per job.
+                detector_params.setdefault(
+                    "diagnostics_dir", str(self.config.diagnostics_dir / job.job_id)
+                )
+            detector = create_detector(job.mode, record.info, detector_params)
             with VideoReader(record.path, record.info) as reader:
                 result = detector.run(reader, report)
                 if self.config.save_diagnostics and result.events:
@@ -272,6 +281,9 @@ class AnalysisService:
                             roi=getattr(detector, "roi", None),
                         )
                     ]
+                frames_log_path = result.diagnostics.get("tracking_frames_log")
+                if frames_log_path:
+                    job.diagnostics_paths.append(frames_log_path)
 
             job.result = result
             job.event_log = build_event_log(

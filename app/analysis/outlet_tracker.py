@@ -126,21 +126,50 @@ class TrackResult:
     reacquired: bool = False
 
 
-def _feature_mask(shape: tuple[int, int], outlet_y: float) -> np.ndarray:
-    """Restrict feature detection to the cup: everything above the outlet.
+def _feature_mask(
+    shape: tuple[int, int],
+    outlet_xy: tuple[float, float],
+    *,
+    half_width_px: int,
+    height_above_px: int,
+) -> np.ndarray:
+    """Restrict feature detection to a cup-sized box above the outlet.
+
+    Bounded on *both* axes, not just vertically: with an independently
+    moving camera and cup, an unbounded "everything above the outlet, full
+    crop width" mask lets strong background corners into the point set the
+    similarity transform is fit to, and the fitted transform then follows
+    whichever motion (camera or cup) has the stronger texture rather than
+    the cup specifically. The box is centred horizontally on the outlet and
+    reaches upward from it, sized by the caller from the cup's own scale
+    (the guard region), not the wider search window - the search window
+    bounds where the tracker may end up, not what it is allowed to treat as
+    "the cup" when picking features.
 
     Excluding the area at and below the orifice keeps the liquid itself -
-    which moves independently of the rigid cup body - out of the point set
-    the similarity transform is fit to.
+    which moves independently of the rigid cup body - out of the point set.
     """
+    height, width = shape
     mask = np.zeros(shape, dtype=np.uint8)
-    bottom = max(1, int(outlet_y) - _FEATURE_EXCLUSION_BELOW_OUTLET_PX)
-    mask[:bottom, :] = 255
+    bottom = max(1, int(outlet_xy[1]) - _FEATURE_EXCLUSION_BELOW_OUTLET_PX)
+    top = max(0, bottom - height_above_px)
+    left = max(0, int(outlet_xy[0]) - half_width_px)
+    right = min(width, int(outlet_xy[0]) + half_width_px)
+    if bottom > top and right > left:
+        mask[top:bottom, left:right] = 255
     return mask
 
 
-def _detect_features(gray: np.ndarray, outlet_y: float) -> np.ndarray | None:
-    mask = _feature_mask(gray.shape[:2], outlet_y)
+def _detect_features(
+    gray: np.ndarray,
+    outlet_xy: tuple[float, float],
+    *,
+    half_width_px: int,
+    height_above_px: int,
+) -> np.ndarray | None:
+    mask = _feature_mask(
+        gray.shape[:2], outlet_xy, half_width_px=half_width_px, height_above_px=height_above_px
+    )
     return cv2.goodFeaturesToTrack(
         gray,
         maxCorners=_MAX_FEATURES,
@@ -167,18 +196,26 @@ class OutletTracker:
         outlet_xy: tuple[float, float],
         *,
         patch_half_px: int,
+        cup_half_width_px: int,
+        cup_height_above_px: int,
         reference_timestamp_s: float = 0.0,
     ) -> None:
         self._config = config
         self._bounds = reference_gray.shape[:2]  # (height, width)
         self._reference_outlet = np.array(outlet_xy, dtype=np.float64)
         self._outlet = self._reference_outlet.copy()
+        # The cup-relative box feature detection is restricted to, sized by
+        # the caller from the cup's own scale (see _feature_mask). Stored so
+        # every later redetect - after a thin point set, after reacquisition
+        # - uses the same bound, not the full crop.
+        self._cup_half_width_px = cup_half_width_px
+        self._cup_height_above_px = cup_height_above_px
 
-        points = _detect_features(reference_gray, outlet_xy[1])
+        points = self._detect_cup_features(reference_gray, outlet_xy)
         if points is None or len(points) < _MIN_INIT_FEATURES:
             raise TrackerInitError(
                 f"Only {0 if points is None else len(points)} trackable feature(s) "
-                f"found above the outlet (need >= {_MIN_INIT_FEATURES})."
+                f"found in the cup region above the outlet (need >= {_MIN_INIT_FEATURES})."
             )
         self._points: np.ndarray | None = points
         self._prev_gray = reference_gray
@@ -308,7 +345,7 @@ class OutletTracker:
         self._state = TrackState.TRACKED
 
         if points is not None and len(points) < cfg.track_min_features:
-            fresh = _detect_features(gray, outlet[1])
+            fresh = self._detect_cup_features(gray, (outlet[0], outlet[1]))
             if fresh is not None and len(fresh) >= cfg.track_min_features:
                 points = fresh
         self._points = points
@@ -363,7 +400,7 @@ class OutletTracker:
         self._velocity = np.zeros(2, dtype=np.float64)
         self._bridge_start_s = None
         self._state = TrackState.TRACKED
-        self._points = _detect_features(gray, candidate[1])
+        self._points = self._detect_cup_features(gray, (candidate[0], candidate[1]))
 
         feature_count = 0 if self._points is None else len(self._points)
         return self._result(
@@ -387,6 +424,23 @@ class OutletTracker:
         return candidate
 
     # -- helpers ------------------------------------------------------------ #
+
+    def _detect_cup_features(
+        self, gray: np.ndarray, outlet_xy: tuple[float, float]
+    ) -> np.ndarray | None:
+        """goodFeaturesToTrack, bounded to the cup-sized box above ``outlet_xy``.
+
+        The bound is re-centred on the *current* outlet estimate every call
+        (init, low-point-count redetect, post-reacquisition redetect), not
+        fixed to where the outlet started - the cup has moved by the time any
+        of those later calls happen.
+        """
+        return _detect_features(
+            gray,
+            outlet_xy,
+            half_width_px=self._cup_half_width_px,
+            height_above_px=self._cup_height_above_px,
+        )
 
     def _within_bounds(self, point: np.ndarray) -> bool:
         height, width = self._bounds

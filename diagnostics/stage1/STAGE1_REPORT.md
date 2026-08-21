@@ -4,6 +4,12 @@ Implementation evidence and limitations, per the supervisor's approval
 comment on PR #4 (2026-08-20). **This is not ready to merge as a final
 review** — it is the evidence package for Codex review, on a still-draft PR.
 
+**Update, same PR:** the first Codex review round asked for five specific
+changes (§6). All five are implemented, tested, and re-validated (§7) in
+this revision. Sections 1–5 below are the original Stage 1 submission,
+left as-is as the historical record of what that round reviewed; §6–§8
+cover what changed since.
+
 Product decision in force (final, per the approval comment): single Zahn
 mode, outlet tracking on by default, `zahn_track_outlet` as a config-only
 rollback lever, no user-visible mode switch. Real-footage validation: no
@@ -209,3 +215,213 @@ carry a distinct "compensation confidence too low to say" state.
   the mutable `use_tracking`: the decode shape is fixed once the sampling
   plan starts, so the scoring branch must key off the fixed flag, not the
   one that can flip mid-run if tracker initialisation fails.
+
+## 6. Codex review round — five required changes, addressed
+
+### 6.1 — Feature selection is now genuinely cup-bounded
+
+**Finding:** production feature selection was not actually cup-bounded — a
+strongly textured, independently-moving background could out-compete the
+cup for the similarity fit or the reacquisition anchor.
+
+**Fix:** `outlet_tracker._feature_mask` / `_detect_features` now take
+`outlet_xy`, `half_width_px`, and `height_above_px` and mask *both* axes to
+a cup-sized box near/above the outlet, not just a vertical exclusion band
+below it. `OutletTracker.__init__` requires `cup_half_width_px` /
+`cup_height_above_px`; a new `_detect_cup_features()` wraps every detection
+site (initial detection, re-detection when tracked points thin out,
+post-reacquisition re-detection) so no code path can fall back to
+unbounded, frame-wide detection. `ZahnCupDetector.run()` computes the bound
+from the guard region itself (`cup_half_width_px = guard_roi.width // 2`,
+`cup_height_above_px = guard_roi.height`) and passes it through.
+
+**Evidence:** new regression
+`tests/test_outlet_tracker.py::TestTracking::test_a_strongly_textured_independently_moving_background_is_ignored`
+places a strongly textured block well outside the cup box, drifting in the
+opposite direction from the cup so the two never overlap in-frame, and
+asserts the tracked offset stays within tolerance of the cup's own motion.
+Verified as a genuine regression test (not a tautology) by monkeypatching
+the bound back to frame-wide and confirming it fails before the fix and
+passes after.
+
+**Regression discovered and fixed along the way:** tightening the bound
+exposed that the pre-existing `zahn_video` fixture's cup — a bare
+rectangle — has only 4 geometric corners, two of which sit inside
+`_FEATURE_EXCLUSION_BELOW_OUTLET_PX` right at the outlet, leaving exactly 2
+trackable features regardless of how the box was sized (below
+`track_min_features = 4`). This broke 6 tests in
+`test_pipeline_integration.py` and `test_web.py` that reuse that fixture
+with tracking on. Root-caused with a diagnostic sweep of bound sizes
+against the fixture (feature count stuck at 2 throughout). Fixed by giving
+the fixture's cup real texture above the outlet — a rim ellipse and a
+handle rectangle, both well clear of the exclusion zone — rather than
+loosening the production bound or exclusion logic; confirmed via the same
+sweep script that the corrected fixture now yields 20–55 features. The
+enrichment does not touch the stream or timing pixels those tests assert
+on.
+
+### 6.2 — Tracker init failure now fails loudly, never silently falls back
+
+**Finding:** when the tracker could not even initialise (e.g. no texture
+above the outlet), the old code fell back to the fixed-ROI path — silently
+using exactly the known-bad geometry Stage 0 diagnosed, and reporting it as
+a normal (potentially confirmed) result.
+
+**Fix:** `TrackerInitError` raised during first-frame construction now
+returns `_tracking_unavailable_result()` — a `FAILED` result, zero events,
+`frames_analysed = 0`, and an explicit reason in both `summary["reasons"]`
+and `warnings`. Only an *explicit* `zahn_track_outlet=False` may use the
+fixed-ROI path; tracking-on-by-default (the product decision) now means
+tracking either works or the run fails honestly, never a silent downgrade.
+
+**Evidence:** new `tests/test_zahn_tracking_integration.py::TestTrackingInitFailure`,
+built on a new session-scoped `blank_video_path` fixture (a perfectly flat
+clip — no texture above any point): `test_no_texture_above_outlet_fails_loudly_when_tracking_is_on`
+asserts `status == "failed"`, no events, zero frames analysed, and a
+tracking-specific warning; `test_the_same_clip_with_tracking_explicitly_off_does_not_fail`
+confirms the same clip with `zahn_track_outlet=False` proceeds through the
+ordinary fixed-ROI "no stream found" outcome instead of being blocked
+before a single frame decodes — the one sanctioned rollback still works.
+
+### 6.3 — Start-side uncertainty, symmetric to the end side
+
+**Finding:** a long tracking gap around flow *start* was still falsely
+precise — "the start can only be late" is not actually safe, because a
+late-but-precise start reports a duration shorter than true, with full
+confidence.
+
+**Fix:** `FlowStateMachine` now opens a gap timer (`_gap_start_ts`) on any
+untrusted sample, not only after flow has started. If flow is confirmed to
+start immediately after such a gap closes, `_update_waiting()` sets
+`measurement.start_uncertain` and `start_uncertainty_bounds` — the same
+shape as the existing end-side machinery. `_status_for()` and
+`score_confidence()` both treat `start_uncertain` exactly like
+`end_uncertain`: forced `REVIEW`, confidence capped at 0.5, and an
+explanatory reason naming the gap span.
+
+**Evidence:** new fixture `handheld_gap_at_start_zahn_video` (occlusion
+2.6–4.2 s, straddling the true 3.0 s start) and new
+`TestBreakDuringATrackingGapAtStart` (2 tests):
+`test_start_is_unconfirmed_with_bounds_not_falsely_precise` asserts
+`start_uncertain`, bounds that bracket the true start, `REVIEW` status, and
+confidence ≤ 0.5; `test_the_event_is_preserved_for_review_without_a_precise_duration`
+checks the `Event` object itself carries no precise `efflux_seconds` (see
+§6.4).
+
+### 6.4 — Uncertain endpoints no longer emit a precise `efflux_seconds` or `Event`
+
+**Finding:** even with `end_uncertain` / (now) `start_uncertain` set, the
+result still emitted an exact, authoritative `efflux_seconds` and an
+`Event` with a precise duration — the uncertainty flag existed but nothing
+downstream actually honoured it.
+
+**Fix:** `_build_result()` now suppresses `efflux_seconds` whenever
+`measurement.start_uncertain or measurement.end_uncertain` — treated the
+same as the existing `FAILED`-status suppression — and instead computes
+`efflux_seconds_bounds` via a new `_efflux_bounds()` helper: the widest
+plausible range from combining whichever endpoint(s) are uncertain with
+the other's exact value (earliest-start/latest-end for the upper bound,
+latest-start/earliest-end for the lower). The `Event` creation condition
+no longer requires a non-`None` `efflux`, so a candidate is still preserved
+for review — its `details["efflux_seconds"]` is `None` and
+`details["efflux_seconds_bounds"]` carries the range instead, alongside the
+existing `start_uncertain`/`end_uncertain` flags. `warnings` text now
+distinguishes start-only, end-only, and both-uncertain phrasing rather than
+one generic message.
+
+**Evidence:** `summary["efflux_seconds"] is None` and
+`summary["efflux_seconds_bounds"]` bracketing the true efflux time are now
+asserted in both `TestBreakDuringATrackingGap` (end-side) and
+`TestBreakDuringATrackingGapAtStart` (start-side); the new
+`test_the_event_is_preserved_for_review_without_a_precise_duration` reads
+`result.events[0].details` directly rather than only the summary, so a
+regression that fixed the summary but left the `Event` payload precise
+would still be caught.
+
+### 6.5 — Bounded/streamed per-frame diagnostics
+
+**Finding:** the state-transition JSON (capped at
+`MAX_DIAGNOSTIC_TRANSITIONS`) does not show the tracked outlet position,
+search window, scoring ROI, or state for the frames actually analysed —
+below the requested contract of being able to inspect a run without
+loading the full video into memory.
+
+**Fix:** `ZahnCupDetector.run()` now opens (via `_open_tracking_frames_log()`)
+a JSONL file when a `diagnostics_dir` param is present, and
+`_write_tracking_frame_log()` appends one record per analysed frame —
+`timestamp_s`, `state`, `trusted`, `reacquired`, `search_roi`, `roi`,
+`guard_roi` — written and flushed to disk as the run progresses, so memory
+use does not grow with run length. `run()` was split into `run()` (owns
+the file's lifecycle, guaranteeing it closes via `finally` even on an early
+return or exception) and `_run_loop()` (the per-frame loop, unchanged in
+behaviour). `diagnostics_dir` is not a user-facing parameter: it is
+injected by `AnalysisService._run_job()` — `<config.diagnostics_dir>/<job_id>`
+— only when the server operator's `save_diagnostics` config flag is on,
+independent from the existing `save_diagnostics` *request* param that
+separately gates the lightweight, bounded, always-in-memory transitions
+summary. The resulting path is surfaced via both
+`DetectorResult.diagnostics["tracking_frames_log"]` and
+`job.diagnostics_paths` (→ `diagnostics_files` in the job API response).
+
+**Evidence:** new `TestTrackingFramesLog` (2 tests):
+`test_a_frame_evidence_file_is_streamed_when_a_diagnostics_dir_is_given`
+asserts the file exists, has exactly one JSON line per analysed frame with
+the documented keys, and monotonic timestamps;
+`test_no_file_is_written_without_a_diagnostics_dir` confirms the default
+(no `diagnostics_dir` param) writes nothing to disk. Overhead measured on
+`handheld_zahn_video` (447 frames): 0.881 s mean without the log vs.
+0.893 s mean with it, over 3 trials each — about 1% — see §7.
+
+## 7. Re-validation after the fixes
+
+```
+python -m pytest          331 passed        (pre-round: 324 passed, 0 failed)
+python -m ruff check .    All checks passed
+python -m ruff format --check .   all files already formatted
+python -m mypy app        Success: no issues found in 29 source files
+node --test tests_js/*.test.js   44 pass, 0 fail
+```
+
+7 new tests this round (§6.1–§6.5); no pre-existing test was modified to
+pass except where §4's assertions were *strengthened* (adding
+`efflux_seconds is None`/bounds checks to the existing gap tests, per
+§6.4) — nothing was loosened.
+
+**Runtime, before this round's fixes vs. after**, measured on
+`handheld_zahn_video` (480×360, 25 FPS, 22 s, both camera and cup
+drifting), comparing the pre-review commit (`0c8f5c4`, checked out into a
+scratch worktree) against the current tree, 3 trials each, tracking on
+(default), no `diagnostics_dir`:
+
+| | mean elapsed | trials |
+| --- | --- | --- |
+| before (`0c8f5c4`) | 0.911 s | 0.923 / 0.890 / 0.921 |
+| after (this revision, no diagnostics log) | 0.881 s | 0.925 / 0.866 / 0.851 |
+| after, with `diagnostics_dir` set (streamed log on) | 0.893 s | 0.923 / 0.868 / 0.888 |
+
+The five fixes — tighter feature bounding, the init-failure early return,
+the extra gap bookkeeping for start uncertainty, and the bounds
+computation — cost nothing measurable (within run-to-run noise); streaming
+447 per-frame JSON records to disk adds roughly 1%. Peak memory remains
+bounded by construction: the frames log is written and flushed one line at
+a time, never accumulated.
+
+## 8. What to look for in this round's review
+
+* `app/analysis/outlet_tracker.py::_feature_mask` / `_detect_cup_features`
+  (§6.1) — both axes now bounded, and every detection call site routed
+  through the same bounded method.
+* `app/analysis/zahn_detector.py::ZahnCupDetector.run()` /`_run_loop()`
+  (§6.2, §6.5) — `TrackerInitError` handling returns before any frame is
+  scored, and the `run()`/`_run_loop()` split exists solely so the frames
+  log's `finally`-close is guaranteed regardless of how the loop exits.
+* `app/analysis/zahn_detector.py::FlowStateMachine` (§6.3) — the
+  `_pending_start_gap` bookkeeping mirrors the existing end-side gap logic
+  deliberately; a change to one without the other is worth flagging.
+* `app/analysis/zahn_detector.py::ZahnCupDetector._build_result` /
+  `_efflux_bounds` (§6.4) — the suppression condition
+  (`start_uncertain or end_uncertain`) and that it applies to the `Event`
+  payload, not only `summary`.
+* `app/services/analysis_service.py::AnalysisService._run_job` (§6.5) —
+  `diagnostics_dir` is only ever injected server-side, gated on the
+  operator config flag, never accepted as a request param.
