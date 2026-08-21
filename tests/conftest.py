@@ -524,6 +524,55 @@ def translucent_cup_overlapping_distractor_zahn_video(
     return clip, distractor_center
 
 
+@pytest.fixture(scope="session")
+def translucent_cup_near_distractor_genuinely_translucent_zahn_video(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[HandheldClip, tuple[float, float]]:
+    """The achievable case Stage 3 compensation is meant for, distinct from
+    ``translucent_cup_overlapping_distractor_zahn_video``'s worst case: a
+    genuinely translucent (alpha-blended - ``_draw_translucent_cup``, not
+    ``translucent_cup_near_distractor_zahn_video``'s solid-filled cup)
+    outlet, initialised cleanly (the distractor sits away from the cup's
+    own t=0 position, so the reference patch is drawn from real, if weak,
+    cup texture) with a strong distractor nearby it could later drift
+    toward. Motion-compensated feature selection has a genuine chance here
+    - unlike the overlapping case, where even the reference patch itself
+    is already contaminated.
+
+    ``cup_opacity=0.5`` - the default 0.22 is too faint for any feature
+    selection strategy (raw or compensated) to find much to work with at
+    all; a fully opaque cup is Stage 1's already-solved case. 0.5 is
+    genuinely translucent (background still visibly shows through) while
+    leaving enough real contrast for compensated evidence to exist -
+    measured empirically, not a physical constant, same caveat as the
+    other Stage 3 thresholds. A smaller/shorter clip than the worst-case
+    fixture's 1080x1920/20s: this one exists to be run in an A/B
+    comparison (see the integration test using it), not to reproduce the
+    real clip's own resolution.
+    """
+    from ._synthetic_handheld import MARGIN, build_translucent_cup_clip
+
+    path = tmp_path_factory.mktemp("videos") / "translucent_near_distractor_real.mp4"
+    width, height, duration_s = 480, 640, 10.0
+    offset = (80.0, -25.0)
+    clip = build_translucent_cup_clip(
+        path,
+        width=width,
+        height=height,
+        duration_s=duration_s,
+        flow_start_s=1.5,
+        stream_break_s=7.0,
+        flow_end_s=7.3,
+        distractor_offset=offset,
+        cup_opacity=0.5,
+        camera_drift_px=15.0,
+        hand_drift_px=13.0,
+        tremor_px=1.0,
+    )
+    distractor_center = (MARGIN + width / 2.0 + offset[0], MARGIN + height * 0.34 + offset[1])
+    return clip, distractor_center
+
+
 @pytest.fixture
 def broken_video(tmp_path: Path) -> Path:
     """A file with a video extension that is not a video at all."""

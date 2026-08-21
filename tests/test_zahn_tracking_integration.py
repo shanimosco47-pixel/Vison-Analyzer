@@ -531,6 +531,112 @@ class TestCameraMotionCompensation:
         assert summary["frames_untracked"] > 0
         assert summary["frames_analysed"] == len(records)
 
+    def test_compensation_recovers_trust_and_trackability_through_the_flow_window(
+        self,
+        translucent_cup_near_distractor_genuinely_translucent_zahn_video,
+        monkeypatch,
+        tmp_path,
+    ):
+        """The mechanism claim behind this round's actual-compensation work
+        (STAGE1_REPORT.md): a veto alone cannot help when the base
+        LK/RANSAC tracker never finds a plausible cup candidate to begin
+        with (the real clip's own failure mode, diagnosed after the
+        previous, veto-only round) - only compensated *feature selection*
+        can. This checks that causal claim directly, running the same clip
+        with ``_foreground_residual_mask`` disabled (falls back to the
+        pre-compensation behaviour) and enabled, rather than trusting a
+        single run's outcome:
+
+        * far fewer frames go untracked overall;
+        * within the clip's *true* flow window specifically - the interval
+          that determines the measured efflux - the fraction of frames
+          actually TRACKED (not bridged/lost) rises dramatically, since a
+          window nobody could track through cannot possibly be timed
+          correctly regardless of what the state machine does with it;
+        * the positions reported for those window-tracked frames stay
+          within a bound loose enough for the fixture's own drift/tremor
+          but tight enough that locking onto the distractor (over 200px
+          away) would fail it - "trusted" that is actually wrong is worse
+          than untracked.
+
+        This fixture's own liquid-visibility rendering is not calibrated
+        to make the full summary (``flow_start_s``/``efflux_seconds``) land
+        on the true value - that depends on a separate classification
+        threshold this round does not touch - so those fields are
+        deliberately not asserted here; trackability through the window is
+        the claim Stage 3 compensation actually makes, and is what is
+        checked.
+        """
+        import json
+        import statistics
+
+        import app.analysis.outlet_tracker as ot_mod
+
+        from ._synthetic_handheld import MARGIN, outlet_position_at
+
+        clip, _distractor_center = translucent_cup_near_distractor_genuinely_translucent_zahn_video
+        base_x = MARGIN + clip.width / 2.0
+        base_y = MARGIN + clip.height * 0.34
+        above_px = max(2, int(0.02 * clip.height))
+
+        def run(*, disabled: bool, diagnostics_dir: Path):
+            if disabled:
+                monkeypatch.setattr(
+                    ot_mod.OutletTracker, "_foreground_residual_mask", lambda self, gray: None
+                )
+            result = _run(
+                clip.path,
+                clip.outlet_at_reference,
+                clip=clip,
+                diagnostics_dir=str(diagnostics_dir),
+            )
+            if disabled:
+                monkeypatch.undo()
+            records = [
+                json.loads(line)
+                for line in Path(result.diagnostics["tracking_frames_log"]).read_text().splitlines()
+            ]
+            window = [
+                r for r in records if clip.flow_start_s <= r["timestamp_s"] <= clip.flow_end_s
+            ]
+            tracked_in_window = [r for r in window if r["state"] == "tracked"]
+            errors = []
+            for record in tracked_in_window:
+                roi = record["roi"]
+                if roi is None:
+                    continue
+                tracked_x = roi["x"] + roi["width"] / 2.0
+                tracked_y = roi["y"] + above_px
+                true_x, true_y = outlet_position_at(
+                    record["timestamp_s"],
+                    base_x=base_x,
+                    base_y=base_y,
+                    camera_drift_px=15.0,
+                    hand_drift_px=13.0,
+                    tremor_px=1.0,
+                )
+                errors.append(float(np.hypot(tracked_x - true_x, tracked_y - true_y)))
+            return result.summary["frames_untracked"], len(window), len(tracked_in_window), errors
+
+        untracked_off, window_len, tracked_off, _errors_off = run(
+            disabled=True, diagnostics_dir=tmp_path / "disabled"
+        )
+        untracked_on, window_len_on, tracked_on, errors_on = run(
+            disabled=False, diagnostics_dir=tmp_path / "enabled"
+        )
+        assert window_len == window_len_on
+
+        assert untracked_on < untracked_off, "compensation should trust more frames overall"
+        coverage_off = tracked_off / window_len
+        coverage_on = tracked_on / window_len
+        assert coverage_on > coverage_off * 2, (
+            "compensation should track through much more of the true flow window - "
+            f"{coverage_off:.0%} -> {coverage_on:.0%}"
+        )
+        assert coverage_on >= 0.5, "compensation should track through most of the flow window"
+        assert errors_on, "expected at least some window-tracked frames to check position against"
+        assert statistics.median(errors_on) < 60.0
+
 
 class TestSearchWindowRecentres:
     """Third Codex review round, against real footage: "the real cup later
@@ -867,10 +973,12 @@ class TestTrackingFramesLog:
             "background_dy",
             "residual_px",
             "rejection_reason",
+            "used_residual",
         }
         assert first["state"] in {"tracked", "predicted", "lost"}
         assert isinstance(first["trusted"], bool)
         assert isinstance(first["background_available"], bool)
+        assert isinstance(first["used_residual"], bool)
         assert set(first["search_roi"]) == {"x", "y", "width", "height"}
         # Timestamps are monotonic - one line per frame, in decode order.
         timestamps = [record["timestamp_s"] for record in records]

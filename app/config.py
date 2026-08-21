@@ -472,6 +472,23 @@ class ZahnConfig:
     # 0.5-1.0s range this stage's synthetic suite could distinguish within.
     background_motion_window_s: float = 0.7
 
+    # Stage 3 actual compensation (not merely the veto above): the
+    # grayscale intensity difference, 0-255, a pixel inside the cup box
+    # must show between the current frame and the *previous* frame warped
+    # by the background transform, before it counts as evidence of
+    # independent (cup) motion rather than background moving with the
+    # camera - see OutletTracker._foreground_residual_mask. Feature
+    # detection prefers corners that also clear this residual check over
+    # plain, unfiltered cup-box corners whenever at least
+    # _MIN_INIT_FEATURES of them do - closing the gap a pure veto cannot:
+    # rejecting a bad candidate does nothing when Stage 1's own tracker
+    # never finds a plausible one to begin with, on a translucent cup
+    # where background-through-cup already dominates the raw image.
+    # Comparable in scale to sensor noise (Stage 0 measured ~1.8 grey
+    # levels of frame-to-frame noise on real footage) with margin for
+    # warp-interpolation artefacts.
+    background_motion_residual_intensity_threshold: int = 12
+
     # If liquid was last confirmed before an untrusted (`lost`/`predicted`)
     # span and no trusted evidence follows it before flow-end would otherwise
     # be confirmed, the true break could have happened anywhere in that span.
@@ -527,6 +544,10 @@ class ZahnConfig:
             )
         if self.background_motion_window_s <= 0:
             raise ConfigurationError("The background-motion window must be greater than zero.")
+        if not 0 <= self.background_motion_residual_intensity_threshold <= 255:
+            raise ConfigurationError(
+                "The background-motion residual intensity threshold must be between 0 and 255."
+            )
         if self.zahn_max_endpoint_uncertainty_s < 0:
             raise ConfigurationError("The endpoint uncertainty bound must not be negative.")
 

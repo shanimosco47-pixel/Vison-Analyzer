@@ -115,6 +115,11 @@ _FEATURE_EXCLUSION_BELOW_OUTLET_PX = 4
 # to lose.
 _MIN_INIT_FEATURES = 4
 
+# Stage 3: how far a detected corner's own pixel may sit from the nearest
+# residual-motion pixel and still count as "drawn from compensated
+# evidence" - see OutletTracker._foreground_residual_mask.
+_RESIDUAL_DILATE_KERNEL = np.ones((5, 5), dtype=np.uint8)
+
 
 class TrackerInitError(Exception):
     """Raised when the initial frame has too little texture to track at all.
@@ -161,12 +166,17 @@ class TrackResult:
     # signal to compare against; rejection_reason names *why* a frame that
     # would otherwise have been accepted was not - "background_consistent"
     # today, None whenever the veto did not change the outcome (including
-    # every frame before Stage 3 existed).
+    # every frame before Stage 3 existed). used_residual records whether
+    # *this* frame's own feature selection actually drew on compensated
+    # (warp-stabilized residual-motion) evidence - see
+    # OutletTracker._detect_cup_features/_foreground_residual_mask - as
+    # opposed to the veto merely rejecting a candidate after the fact.
     background_dx: float = 0.0
     background_dy: float = 0.0
     background_available: bool = False
     residual_px: float | None = None
     rejection_reason: str | None = None
+    used_residual: bool = False
 
 
 def _feature_mask(
@@ -309,6 +319,13 @@ class _BackgroundMotionEstimator:
         # approximation - see the module docstring.
         self.cumulative_dx = 0.0
         self.cumulative_dy = 0.0
+        # This frame's full affine background transform (prev_gray -> gray),
+        # None whenever unavailable - see update(). Stage 3 compensation
+        # (OutletTracker._foreground_residual_mask) warps the previous frame
+        # by this to cancel camera motion before looking for the cup's own,
+        # independent motion; the scalar dx/dy above are not enough for
+        # that, since warpAffine needs the transform itself.
+        self.last_matrix: np.ndarray | None = None
 
     def _detect(self, gray: np.ndarray, outlet_xy: tuple[float, float]) -> np.ndarray | None:
         mask = _background_mask(
@@ -332,6 +349,7 @@ class _BackgroundMotionEstimator:
     ) -> _BackgroundMotionResult:
         cfg = self._config
         min_features = cfg.background_motion_min_features
+        self.last_matrix = None  # cleared here; set again only on full success below
         if self._points is None or len(self._points) < min_features:
             self._points = self._detect(gray, outlet_xy)
             feature_count = 0 if self._points is None else len(self._points)
@@ -401,6 +419,7 @@ class _BackgroundMotionEstimator:
         dy = float(predicted[1] - outlet_xy[1])
         self.cumulative_dx += dx
         self.cumulative_dy += dy
+        self.last_matrix = matrix
 
         survivors = target[inlier_mask.ravel() == 1].reshape(-1, 1, 2)
         if len(survivors) < min_features:
@@ -456,27 +475,7 @@ class OutletTracker:
         # - uses the same bound, not the full crop.
         self._cup_half_width_px = cup_half_width_px
         self._cup_height_above_px = cup_height_above_px
-
-        points = self._detect_cup_features(reference_gray, outlet_xy)
-        if points is None or len(points) < _MIN_INIT_FEATURES:
-            raise TrackerInitError(
-                f"Only {0 if points is None else len(points)} trackable feature(s) "
-                f"found in the cup region above the outlet (need >= {_MIN_INIT_FEATURES})."
-            )
         self._prev_gray = reference_gray
-        self._bridge_start_s: float | None = None
-        self._velocity = np.zeros(2, dtype=np.float64)
-        # A reacquisition candidate awaiting a second, consistent frame
-        # before it is trusted - see _attempt_reacquisition.
-        self._pending_reacquisition: np.ndarray | None = None
-        self._points: np.ndarray | None = points
-        self._state = TrackState.TRACKED
-        self._last_confident_outlet = self._outlet.copy()
-        # Set from construction, not left None until the first successful
-        # update(): the reference frame *is* a confident observation, and a
-        # gap on the very next frame must still have a timestamp and a
-        # (zero, until real motion is observed) velocity to bridge from.
-        self._last_confident_timestamp: float | None = reference_timestamp_s
 
         # Stage 3: dominant camera/background motion, from features outside
         # the cup/outlet/guard/stream box - see _BackgroundMotionEstimator
@@ -495,6 +494,15 @@ class OutletTracker:
         # geometry this stage builds (a Zahn cup's guard region is narrow
         # and tall, not wide) and keeps the total exclusion within the
         # crop's own margin (track_search_margin_px) on every side.
+        #
+        # Constructed *before* the first _detect_cup_features call below,
+        # not after: that call (Stage 3 actual compensation - see
+        # _foreground_residual_mask) needs self._background to exist, even
+        # though its own last_matrix is still None at this exact point (no
+        # prior frame to have computed a transform from yet) - the very
+        # first frame falls back to raw-image detection precisely because
+        # there is nothing to compensate against, not because the
+        # attribute is missing.
         self._background = _BackgroundMotionEstimator(
             config,
             reference_gray,
@@ -506,6 +514,31 @@ class OutletTracker:
         self._last_background = _BackgroundMotionResult(
             available=False, dx=0.0, dy=0.0, inliers=0, feature_count=0
         )
+        # Whether the most recent _detect_cup_features call actually used
+        # residual (motion-compensated) evidence to pick points, or fell
+        # back to raw-image detection - streamed for diagnostics, see
+        # ZahnCupDetector._write_tracking_frame_log.
+        self._last_detection_used_residual = False
+
+        points = self._detect_cup_features(reference_gray, outlet_xy)
+        if points is None or len(points) < _MIN_INIT_FEATURES:
+            raise TrackerInitError(
+                f"Only {0 if points is None else len(points)} trackable feature(s) "
+                f"found in the cup region above the outlet (need >= {_MIN_INIT_FEATURES})."
+            )
+        self._bridge_start_s: float | None = None
+        self._velocity = np.zeros(2, dtype=np.float64)
+        # A reacquisition candidate awaiting a second, consistent frame
+        # before it is trusted - see _attempt_reacquisition.
+        self._pending_reacquisition: np.ndarray | None = None
+        self._points: np.ndarray | None = points
+        self._state = TrackState.TRACKED
+        self._last_confident_outlet = self._outlet.copy()
+        # Set from construction, not left None until the first successful
+        # update(): the reference frame *is* a confident observation, and a
+        # gap on the very next frame must still have a timestamp and a
+        # (zero, until real motion is observed) velocity to bridge from.
+        self._last_confident_timestamp: float | None = reference_timestamp_s
         # Snapshot of self._background's cumulative offset at the moment
         # _last_confident_outlet/_timestamp were last set - see
         # _background_veto_since_confident. The reference frame is itself a
@@ -525,72 +558,9 @@ class OutletTracker:
         # own motion cycle).
         self._motion_history: list[tuple[float, float, float, float, float]] = []
 
-        # The reacquisition patch is centred on a strong detected feature
-        # near the *top* of the search box, not the single strongest corner
-        # wherever it happens to be, not the outlet itself, and not the
-        # centroid of every feature found: the outlet is a narrow, often
-        # near-featureless point (the same reason a single click there is
-        # not enough to track frame to frame - see the module docstring),
-        # and averaging every feature's position dilutes towards whatever
-        # smooth, low-response area most of them sit in. The top-of-box bias
-        # (Codex review, fourth round) is a rim prior: on a translucent,
-        # low-texture cup the single strongest corner anywhere in the box
-        # can just as easily be background structure showing through the
-        # body lower down, while the rim - nearest the top, farthest from
-        # the outlet - is "the one feature a real translucent cup usually
-        # keeps a visible edge on" (see tests/_synthetic_handheld.py's
-        # _draw_translucent_cup). cv2.goodFeaturesToTrack returns points in
-        # decreasing order of corner response, so restricting the choice to
-        # a small top tier and then taking the highest of those balances
-        # "distinctive enough for template matching" against "likely to
-        # survive translucency" - a shape prior, not a guarantee: it does
-        # nothing for a cup whose rim itself is also low-contrast. The tier
-        # is deliberately the top 3 by response, not the top third: this
-        # patch also anchors the continuous per-frame patch-correlation
-        # gate below (every accepted frame, not just reacquisition), so a
-        # weak corner promoted purely for being higher in the box costs
-        # ordinary opaque-cup tracking precision, not just reacquisition
-        # robustness. Measured on the hand-held regression fixture (Stage 1
-        # two-anchor round): a top-third tier left 41% of frames untracked
-        # and the recovered start 0.8s off; the top-3 tier matches the
-        # unbiased points[0] baseline (single-digit percent untracked, exact
-        # start) while still preferring the highest of a genuinely strong
-        # few over the single strongest wherever it sits. The outlet's
-        # position is still recovered precisely via the stored offset from
-        # whichever point is chosen.
-        flat_points = points.reshape(-1, 2)
-        top_tier = flat_points[: max(1, min(3, len(flat_points) // 3))]
-        anchor_point = top_tier[np.argmin(top_tier[:, 1])]
-        self._reference_patch, self._patch_outlet_offset = self._extract_patch(
-            reference_gray, anchor_point, self._outlet, patch_half_px
-        )
-        # Codex review: a real translucent, low-texture cup can let
-        # goodFeaturesToTrack/RANSAC lock onto structure visible through or
-        # around the cup rather than the cup itself - inlier count and
-        # per-frame displacement alone do not catch this, since the wrong
-        # structure can still move smoothly and pass both. This offset
-        # (translation-only; per-frame rotation/scale over a hand-held
-        # clip's frame interval is small enough for a plausibility check,
-        # unlike for precise tracking) lets _attempt_tracking ask, for any
-        # candidate outlet position, "does the anchor feature's implied
-        # position still look like the cup we started with" - see
-        # _patch_correlation_at.
-        self._anchor_offset_from_outlet = anchor_point - self._outlet
-        # The reference patch's own top-left corner, relative to the anchor
-        # it was cropped around - not necessarily (-patch_half_px,
-        # -patch_half_px): _extract_patch clips at the frame edge, so an
-        # anchor near an edge (a real possibility - it is simply the
-        # strongest corner found, wherever that is) produces a shorter,
-        # asymmetric patch. _patch_correlation_at must slide this exact
-        # rectangle to a new center, not re-derive a symmetric one from
-        # patch_w/patch_h alone, or it recomputes a window that was never
-        # actually extracted and can end up entirely outside the frame even
-        # at zero displacement.
-        anchor_cx = int(round(anchor_point[0]))
-        anchor_cy = int(round(anchor_point[1]))
-        patch_x0 = max(0, anchor_cx - patch_half_px)
-        patch_y0 = max(0, anchor_cy - patch_half_px)
-        self._patch_offset_from_anchor = (patch_x0 - anchor_cx, patch_y0 - anchor_cy)
+        self._patch_half_px = patch_half_px
+        self._reference_refined = False
+        self._build_reference_patch(reference_gray, points, self._outlet)
 
     # -- public ------------------------------------------------------------ #
 
@@ -805,11 +775,27 @@ class OutletTracker:
         self._bridge_start_s = None
         self._state = TrackState.TRACKED
 
-        if points is not None and len(points) < cfg.track_min_features:
+        # Stage 3 actual compensation: re-seed from residual (motion-
+        # compensated) evidence on *every* accepted frame a background
+        # transform is available, not only once the LK-propagated point
+        # set has thinned out - re-detecting only on a low count means
+        # this box's compensated evidence is consulted rarely (observed:
+        # 3 times across an 811-frame real-clip run), so an initial point
+        # set contaminated by background-through-cup keeps getting
+        # LK-tracked forward essentially unchallenged for the rest of the
+        # run. Continuous re-seeding gives every accepted frame a chance
+        # to correct course onto genuine cup evidence, not just the rare
+        # frame where the old point set happened to run thin. Falls back
+        # to the low-count-only redetect when no compensation is available
+        # this frame (unchanged from before Stage 3).
+        point_count_thin = points is None or len(points) < cfg.track_min_features
+        if self._background.last_matrix is not None or point_count_thin:
             fresh = self._detect_cup_features(gray, (outlet[0], outlet[1]))
-            if fresh is not None and len(fresh) >= cfg.track_min_features:
+            fresh_usable = fresh is not None and len(fresh) >= cfg.track_min_features
+            if fresh_usable and (self._last_detection_used_residual or point_count_thin):
                 points = fresh
         self._points = points
+        self._maybe_refine_reference_patch(gray, outlet)
 
         return self._result(
             TrackState.TRACKED,
@@ -1061,19 +1047,210 @@ class OutletTracker:
     def _detect_cup_features(
         self, gray: np.ndarray, outlet_xy: tuple[float, float]
     ) -> np.ndarray | None:
-        """goodFeaturesToTrack, bounded to the cup-sized box above ``outlet_xy``.
+        """goodFeaturesToTrack, bounded to the cup-sized box above ``outlet_xy``,
+        preferring residual (motion-compensated) evidence when there is
+        enough of it - see ``_foreground_residual_mask``.
 
         The bound is re-centred on the *current* outlet estimate every call
         (init, low-point-count redetect, post-reacquisition redetect), not
         fixed to where the outlet started - the cup has moved by the time any
         of those later calls happen.
+
+        Stage 3 actual compensation, not only the veto in ``_background_
+        veto``/``_background_veto_since_confident``: those can only ever
+        *reject* a candidate the rest of the pipeline already found, which
+        does nothing when the raw image never offered a plausible candidate
+        to begin with - exactly the real-clip failure mode (Codex review:
+        "the implementation only removes trust from a candidate after the
+        Stage 1 tracker already finds one; it provides no mechanism to
+        recover or follow the cup when Stage 1 loses it"). Restricting
+        feature selection itself to pixels that moved independently of the
+        background gives the tracker genuine cup/rim evidence to seed
+        LK/RANSAC from, on a translucent cup where the raw image's
+        strongest corners are just as often background showing through.
         """
-        return _detect_features(
+        # Detect corners over the *whole* cup box first, exactly as before
+        # Stage 3, then filter to the ones that also show residual motion -
+        # not the other way around (restricting goodFeaturesToTrack's own
+        # search to only the residual-masked pixels). A residual region
+        # highlights *where* something moved independently of the camera,
+        # but corner detection itself needs real local texture to find
+        # anything there at all - a smooth-bodied cup's own residual blob
+        # can easily contain no strong corners despite being a large,
+        # genuine motion signal, while restricting the search to it starves
+        # the search of exactly the well-textured points (a rim's own
+        # edge, most often) that both approaches would otherwise agree on.
+        # Filtering detected corners by residual, instead, only needs each
+        # already-strong corner to individually clear the residual check at
+        # its own location - corners sit on intensity edges, and edges are
+        # exactly where a real position difference between frames shows up
+        # most clearly after the background warp, so this is both cheaper
+        # and, empirically, the one that actually finds points (a masked-
+        # detection version of this method found usable residual points on
+        # 4 of 402 calls in one regression clip; this version - unchanged
+        # in every other respect - found them on the clear majority).
+        points = _detect_features(
             gray,
             outlet_xy,
             half_width_px=self._cup_half_width_px,
             height_above_px=self._cup_height_above_px,
         )
+        residual_mask = self._foreground_residual_mask(gray)
+        if points is not None and residual_mask is not None:
+            height, width = residual_mask.shape[:2]
+            residual_points = []
+            for point in points.reshape(-1, 2):
+                x, y = int(round(point[0])), int(round(point[1]))
+                if 0 <= x < width and 0 <= y < height and residual_mask[y, x] != 0:
+                    residual_points.append(point)
+            if len(residual_points) >= _MIN_INIT_FEATURES:
+                self._last_detection_used_residual = True
+                return np.array(residual_points, dtype=points.dtype).reshape(-1, 1, 2)
+
+        self._last_detection_used_residual = False
+        return points
+
+    def _foreground_residual_mask(self, gray: np.ndarray) -> np.ndarray | None:
+        """Pixels that moved *more* than the background transform alone
+        explains - genuine independent (cup) motion, not background moving
+        with the camera.
+
+        Warps the previous frame by this frame's background transform
+        (``self._background.last_matrix``) and diffs it against the
+        current frame: a pixel that is purely background, however
+        strongly textured, lines back up after that warp and shows near-
+        zero difference; a pixel on the cup - moving with the operator's
+        hand, independently of the camera - does not. ``None`` whenever no
+        transform is available this frame (construction, before any
+        ``update()``; or the background estimator itself lacked enough
+        texture/inliers) - callers fall back to plain cup-box detection,
+        exactly Stage 1's original behaviour, never an invented signal.
+        """
+        matrix = self._background.last_matrix
+        if matrix is None:
+            return None
+        height, width = self._bounds
+        warped_prev = cv2.warpAffine(self._prev_gray, matrix, (width, height))
+        diff = cv2.absdiff(gray, warped_prev)
+        _, mask = cv2.threshold(
+            diff,
+            self._config.background_motion_residual_intensity_threshold,
+            255,
+            cv2.THRESH_BINARY,
+        )
+        # Dilated by a few pixels: a detected corner's own coordinate and
+        # the residual signal it should coincide with are not pixel-exact -
+        # sub-pixel motion, warp interpolation and ordinary sensor noise all
+        # shift or soften a real edge's residual by a pixel or two, and
+        # goodFeaturesToTrack's own corner localisation has similar slack.
+        # Without this, a genuinely-moving corner's own pixel can land just
+        # outside its true residual region and be filtered out as if it
+        # were background.
+        return cv2.dilate(mask, _RESIDUAL_DILATE_KERNEL)
+
+    def _build_reference_patch(
+        self, gray: np.ndarray, points: np.ndarray, outlet: np.ndarray
+    ) -> None:
+        """(Re)build the reacquisition/correlation reference patch from
+        ``points`` - centred on a strong detected feature near the *top*
+        of the search box, not the single strongest corner wherever it
+        happens to be, not the outlet itself, and not the centroid of
+        every feature found: the outlet is a narrow, often near-
+        featureless point (the same reason a single click there is not
+        enough to track frame to frame - see the module docstring), and
+        averaging every feature's position dilutes towards whatever
+        smooth, low-response area most of them sit in. The top-of-box bias
+        (Codex review, fourth round) is a rim prior: on a translucent,
+        low-texture cup the single strongest corner anywhere in the box
+        can just as easily be background structure showing through the
+        body lower down, while the rim - nearest the top, farthest from
+        the outlet - is "the one feature a real translucent cup usually
+        keeps a visible edge on" (see tests/_synthetic_handheld.py's
+        _draw_translucent_cup). cv2.goodFeaturesToTrack returns points in
+        decreasing order of corner response, so restricting the choice to
+        a small top tier and then taking the highest of those balances
+        "distinctive enough for template matching" against "likely to
+        survive translucency" - a shape prior, not a guarantee: it does
+        nothing for a cup whose rim itself is also low-contrast. The tier
+        is deliberately the top 3 by response, not the top third: this
+        patch also anchors the continuous per-frame patch-correlation
+        gate below (every accepted frame, not just reacquisition), so a
+        weak corner promoted purely for being higher in the box costs
+        ordinary opaque-cup tracking precision, not just reacquisition
+        robustness. Measured on the hand-held regression fixture (Stage 1
+        two-anchor round): a top-third tier left 41% of frames untracked
+        and the recovered start 0.8s off; the top-3 tier matches the
+        unbiased points[0] baseline (single-digit percent untracked, exact
+        start) while still preferring the highest of a genuinely strong
+        few over the single strongest wherever it sits. The outlet's
+        position is still recovered precisely via the stored offset from
+        whichever point is chosen.
+
+        Called once at construction, and - Stage 3 - at most once more
+        after that (see ``_maybe_refine_reference_patch``): the initial
+        call has no compensated evidence to draw on (no prior frame
+        exists yet to have computed a background transform from), so a
+        translucent cup's very first reference patch can only ever be
+        built from raw, uncompensated pixels - exactly the reference this
+        stage's correlation gate then holds every later frame to,
+        regardless of how much better later feature selection becomes.
+        Rebuilding once, on the first already-independently-verified frame
+        where compensated evidence is available, gives the correlation
+        gate itself a chance at a genuinely-cup patch instead - bounded to
+        once, not continuous, so this cannot become the same unverified
+        self-drift the gate exists to prevent.
+        """
+        flat_points = points.reshape(-1, 2)
+        top_tier = flat_points[: max(1, min(3, len(flat_points) // 3))]
+        anchor_point = top_tier[np.argmin(top_tier[:, 1])]
+        self._reference_patch, self._patch_outlet_offset = self._extract_patch(
+            gray, anchor_point, outlet, self._patch_half_px
+        )
+        # Codex review: a real translucent, low-texture cup can let
+        # goodFeaturesToTrack/RANSAC lock onto structure visible through or
+        # around the cup rather than the cup itself - inlier count and
+        # per-frame displacement alone do not catch this, since the wrong
+        # structure can still move smoothly and pass both. This offset
+        # (translation-only; per-frame rotation/scale over a hand-held
+        # clip's frame interval is small enough for a plausibility check,
+        # unlike for precise tracking) lets _attempt_tracking ask, for any
+        # candidate outlet position, "does the anchor feature's implied
+        # position still look like the cup we started with" - see
+        # _patch_correlation_at.
+        self._anchor_offset_from_outlet = anchor_point - outlet
+        # The reference patch's own top-left corner, relative to the anchor
+        # it was cropped around - not necessarily (-patch_half_px,
+        # -patch_half_px): _extract_patch clips at the frame edge, so an
+        # anchor near an edge (a real possibility - it is simply the
+        # strongest corner found, wherever that is) produces a shorter,
+        # asymmetric patch. _patch_correlation_at must slide this exact
+        # rectangle to a new center, not re-derive a symmetric one from
+        # patch_w/patch_h alone, or it recomputes a window that was never
+        # actually extracted and can end up entirely outside the frame even
+        # at zero displacement.
+        anchor_cx = int(round(anchor_point[0]))
+        anchor_cy = int(round(anchor_point[1]))
+        patch_x0 = max(0, anchor_cx - self._patch_half_px)
+        patch_y0 = max(0, anchor_cy - self._patch_half_px)
+        self._patch_offset_from_anchor = (patch_x0 - anchor_cx, patch_y0 - anchor_cy)
+
+    def _maybe_refine_reference_patch(self, gray: np.ndarray, outlet: np.ndarray) -> None:
+        """Stage 3: the one-time reference-patch refinement
+        ``_build_reference_patch`` describes - called only from
+        ``_accept_tracked``, i.e. only on a frame that has *already*
+        cleared every existing check (inliers, displacement, correlation
+        against the original patch), and only once per tracker (see
+        ``self._reference_refined``), and only when that frame's own
+        feature selection actually drew on compensated evidence
+        (``self._last_detection_used_residual``) - not merely that a
+        background transform happened to be available.
+        """
+        if self._reference_refined or not self._last_detection_used_residual:
+            return
+        if self._points is None or len(self._points) < _MIN_INIT_FEATURES:
+            return
+        self._reference_refined = True
+        self._build_reference_patch(gray, self._points, outlet)
 
     def _within_bounds(self, point: np.ndarray) -> bool:
         height, width = self._bounds
@@ -1120,4 +1297,5 @@ class OutletTracker:
             background_available=background.available,
             residual_px=residual_px,
             rejection_reason=rejection_reason,
+            used_residual=self._last_detection_used_residual,
         )

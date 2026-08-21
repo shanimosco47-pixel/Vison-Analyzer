@@ -816,6 +816,7 @@ class _FrameEvidence:
     background_available: bool = False
     residual_px: float | None = None
     rejection_reason: str | None = None
+    used_residual: bool = False
 
     @classmethod
     def from_result(cls, result: TrackResult) -> _FrameEvidence:
@@ -829,6 +830,7 @@ class _FrameEvidence:
             background_available=result.background_available,
             residual_px=result.residual_px,
             rejection_reason=result.rejection_reason,
+            used_residual=result.used_residual,
         )
 
 
@@ -1346,6 +1348,7 @@ class ZahnCupDetector(BaseDetector):
             forward.residual_px if forward.residual_px is not None else backward.residual_px
         )
         rejection_reason = forward.rejection_reason or backward.rejection_reason
+        used_residual = forward.used_residual or backward.used_residual
 
         if forward.state is not TrackState.TRACKED or backward.state is not TrackState.TRACKED:
             return _FrameEvidence(
@@ -1357,6 +1360,7 @@ class ZahnCupDetector(BaseDetector):
                 background_available=background_available,
                 residual_px=residual_px,
                 rejection_reason=rejection_reason,
+                used_residual=used_residual,
             )
         displacement = float(
             np.hypot(forward.outlet_x - backward.outlet_x, forward.outlet_y - backward.outlet_y)
@@ -1371,6 +1375,7 @@ class ZahnCupDetector(BaseDetector):
                 background_available=background_available,
                 residual_px=residual_px,
                 rejection_reason=rejection_reason,
+                used_residual=used_residual,
             )
         x = (forward.outlet_x + backward.outlet_x) / 2.0
         y = (forward.outlet_y + backward.outlet_y) / 2.0
@@ -1384,6 +1389,7 @@ class ZahnCupDetector(BaseDetector):
             background_available=background_available,
             residual_px=residual_px,
             rejection_reason=rejection_reason,
+            used_residual=used_residual,
         )
 
     def _process_between_anchors_span(
@@ -2465,9 +2471,12 @@ class ZahnCupDetector(BaseDetector):
             # independently-estimated background/camera motion, the cup
             # candidate's residual once that motion is subtracted out (only
             # ever populated when there was a background signal to compare
-            # against), and *why* a frame that would otherwise have been
-            # accepted was not - together enough to audit a real run's
-            # background-through-cup rejections frame by frame.
+            # against), *why* a frame that would otherwise have been
+            # accepted was not, and whether this frame's own active point
+            # set was actually (re)selected from warp-stabilized residual
+            # evidence rather than merely surviving the veto - together
+            # enough to audit a real run's compensation path, not just its
+            # rejections, frame by frame.
             "background_available": evidence.background_available,
             "background_dx": round(evidence.background_dx, 3),
             "background_dy": round(evidence.background_dy, 3),
@@ -2475,6 +2484,7 @@ class ZahnCupDetector(BaseDetector):
                 round(evidence.residual_px, 3) if evidence.residual_px is not None else None
             ),
             "rejection_reason": evidence.rejection_reason,
+            "used_residual": evidence.used_residual,
         }
         try:
             frames_log.write(json.dumps(record) + "\n")
@@ -2969,6 +2979,7 @@ def _zahn_config_to_dict(config: ZahnConfig) -> dict[str, Any]:
             "background_motion_min_signal_px",
             "background_motion_min_residual_px",
             "background_motion_window_s",
+            "background_motion_residual_intensity_threshold",
             "zahn_max_endpoint_uncertainty_s",
         )
     }

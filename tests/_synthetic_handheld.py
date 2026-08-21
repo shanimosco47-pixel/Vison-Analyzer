@@ -305,6 +305,7 @@ def build_translucent_cup_clip(
     hand_drift_px: float = 26.0,
     tremor_px: float = 2.0,
     late_reference_s: float | None = None,
+    distractor_offset: tuple[float, float] = (0.0, 0.0),
     seed: int = 20260821,
 ) -> HandheldClip:
     """A hand-held clip whose cup is translucent, low-texture, over a
@@ -318,12 +319,22 @@ def build_translucent_cup_clip(
     the cup does not. Defaults to a portrait resolution and hand-held
     reframing large enough to also exercise the resolution-scaled ROI/guard
     geometry from the same review round.
+
+    ``distractor_offset`` shifts the checkerboard away from the cup's own
+    t=0 world position - (0, 0), the default, is the worst case (already
+    coincides with the cup, so even the initial reference patch is drawn
+    from it); a non-zero offset instead exercises the "genuinely-
+    initialised cup that a strong distractor threatens later" case, the
+    same shape as ``translucent_cup_near_distractor_zahn_video`` but with
+    an actually translucent (alpha-blended) cup rather than an opaque one.
     """
     rng = np.random.default_rng(seed)
     base_x = MARGIN + width / 2.0
     base_y = MARGIN + height * 0.34
     world = _world_background(width, height, background_level, texture_strength)
-    _checkerboard_patch(world, (base_x, base_y), background_level)
+    _checkerboard_patch(
+        world, (base_x + distractor_offset[0], base_y + distractor_offset[1]), background_level
+    )
 
     writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     if not writer.isOpened():  # pragma: no cover - depends on the OpenCV build
