@@ -817,6 +817,15 @@ class _FrameEvidence:
     residual_px: float | None = None
     rejection_reason: str | None = None
     used_residual: bool = False
+    # Stage 3, round two - see OutletTracker's module docstring and
+    # _contour_candidate. contour_available/contour_score mirror
+    # background_available/residual_px for the cup-silhouette (edge/
+    # contour) evidence path; used_contour records whether *this* frame's
+    # own accepted position was actually carried from the fitted cup
+    # silhouette rather than the corner/LK transform.
+    contour_available: bool = False
+    contour_score: float | None = None
+    used_contour: bool = False
 
     @classmethod
     def from_result(cls, result: TrackResult) -> _FrameEvidence:
@@ -831,6 +840,9 @@ class _FrameEvidence:
             residual_px=result.residual_px,
             rejection_reason=result.rejection_reason,
             used_residual=result.used_residual,
+            contour_available=result.contour_available,
+            contour_score=result.contour_score,
+            used_contour=result.used_contour,
         )
 
 
@@ -1335,7 +1347,9 @@ class ZahnCupDetector(BaseDetector):
         when available, backward's otherwise, and either direction's own
         ``rejection_reason`` if either was itself vetoed - so a frame lost
         to reconciliation disagreement is still auditable, not just a bare
-        ``lost``.
+        ``lost``. Contour/silhouette diagnostics (Stage 3, round two) follow
+        the exact same "forward's own reading when available, backward's
+        otherwise" convention as the background fields above.
         """
         background_dx = (
             forward.background_dx if forward.background_available else backward.background_dx
@@ -1349,6 +1363,11 @@ class ZahnCupDetector(BaseDetector):
         )
         rejection_reason = forward.rejection_reason or backward.rejection_reason
         used_residual = forward.used_residual or backward.used_residual
+        contour_available = forward.contour_available or backward.contour_available
+        contour_score = (
+            forward.contour_score if forward.contour_score is not None else backward.contour_score
+        )
+        used_contour = forward.used_contour or backward.used_contour
 
         if forward.state is not TrackState.TRACKED or backward.state is not TrackState.TRACKED:
             return _FrameEvidence(
@@ -1361,6 +1380,9 @@ class ZahnCupDetector(BaseDetector):
                 residual_px=residual_px,
                 rejection_reason=rejection_reason,
                 used_residual=used_residual,
+                contour_available=contour_available,
+                contour_score=contour_score,
+                used_contour=used_contour,
             )
         displacement = float(
             np.hypot(forward.outlet_x - backward.outlet_x, forward.outlet_y - backward.outlet_y)
@@ -1376,6 +1398,9 @@ class ZahnCupDetector(BaseDetector):
                 residual_px=residual_px,
                 rejection_reason=rejection_reason,
                 used_residual=used_residual,
+                contour_available=contour_available,
+                contour_score=contour_score,
+                used_contour=used_contour,
             )
         x = (forward.outlet_x + backward.outlet_x) / 2.0
         y = (forward.outlet_y + backward.outlet_y) / 2.0
@@ -1390,6 +1415,9 @@ class ZahnCupDetector(BaseDetector):
             residual_px=residual_px,
             rejection_reason=rejection_reason,
             used_residual=used_residual,
+            contour_available=contour_available,
+            contour_score=contour_score,
+            used_contour=used_contour,
         )
 
     def _process_between_anchors_span(
@@ -2485,6 +2513,19 @@ class ZahnCupDetector(BaseDetector):
             ),
             "rejection_reason": evidence.rejection_reason,
             "used_residual": evidence.used_residual,
+            # Stage 3, round two - see OutletTracker's module docstring and
+            # _contour_candidate. Whether a cup-silhouette (edge/contour)
+            # search was attempted this frame, the best forward match score
+            # it achieved (None whenever no search ran), and whether this
+            # frame's own accepted position was actually carried from the
+            # fitted cup silhouette - the mechanism this round adds because
+            # residual-filtered corner features alone (used_residual above)
+            # proved too sparse to recover a trajectory on the real clip.
+            "contour_available": evidence.contour_available,
+            "contour_score": (
+                round(evidence.contour_score, 3) if evidence.contour_score is not None else None
+            ),
+            "used_contour": evidence.used_contour,
         }
         try:
             frames_log.write(json.dumps(record) + "\n")

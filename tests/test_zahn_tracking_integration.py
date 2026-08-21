@@ -637,6 +637,133 @@ class TestCameraMotionCompensation:
         assert errors_on, "expected at least some window-tracked frames to check position against"
         assert statistics.median(errors_on) < 60.0
 
+    def test_contour_silhouette_recovers_trajectory_when_residual_corners_fail(
+        self,
+        translucent_cup_boundary_only_zahn_video,
+        monkeypatch,
+        tmp_path,
+    ):
+        """The mechanism claim behind Stage 3's *second* round (STAGE1_
+        REPORT.md §30): the previous round's residual-filtered *corner*
+        selection (§29) still failed the real-clip gate - `used_residual`
+        fired on 805/811 frames, yet only 17 ended up trusted, because
+        residual-filtered corner features simply do not exist in enough
+        density on a real translucent cup, however well the compensation
+        math around them works. Tracking the cup's own visible *geometry*
+        (its rim/side/bottom silhouette) instead of interior texture is
+        this round's response - checked here the same way §29's own test
+        checked its claim: A/B on the same clip, ``OutletTracker.
+        _contour_candidate`` monkeypatched to a no-op for the "corner-
+        only" arm (residual-filtered corner selection stays fully active
+        in *both* arms - this isolates the contour mechanism's own
+        contribution, not compensation in general, which §29's test
+        already covers) versus left enabled.
+
+        ``translucent_cup_boundary_only_zahn_video`` is calibrated
+        (cup_opacity=0.12) so the corner-only arm genuinely struggles -
+        asserted directly below, not just assumed - while the rim's own
+        fixed-contrast edge (unlike the alpha-blended body, its contrast
+        does not scale down with opacity) remains a real, matchable
+        boundary. As in §29's own test, the fixture's liquid-visibility
+        rendering is not calibrated for exact efflux timing, so
+        ``flow_start_s``/``efflux_seconds`` are deliberately not asserted -
+        trackability through the true flow window, and bounded position
+        accuracy for the frames trusted that way, are what Stage 3's
+        contour mechanism actually controls, and what is checked.
+        """
+        import json
+        import statistics
+
+        import app.analysis.outlet_tracker as ot_mod
+
+        from ._synthetic_handheld import MARGIN, outlet_position_at
+
+        clip = translucent_cup_boundary_only_zahn_video
+        base_x = MARGIN + clip.width / 2.0
+        base_y = MARGIN + clip.height * 0.34
+        above_px = max(2, int(0.02 * clip.height))
+
+        def run(*, disabled: bool, diagnostics_dir: Path):
+            if disabled:
+
+                def no_contour(self, gray, search_center, margin):
+                    self._last_contour_available = False
+                    self._last_contour_score = None
+                    self._last_contour_rejection = None
+                    return None, None
+
+                monkeypatch.setattr(ot_mod.OutletTracker, "_contour_candidate", no_contour)
+            result = _run(
+                clip.path,
+                clip.outlet_at_reference,
+                clip=clip,
+                diagnostics_dir=str(diagnostics_dir),
+            )
+            if disabled:
+                monkeypatch.undo()
+            records = [
+                json.loads(line)
+                for line in Path(result.diagnostics["tracking_frames_log"]).read_text().splitlines()
+            ]
+            window = [
+                r for r in records if clip.flow_start_s <= r["timestamp_s"] <= clip.flow_end_s
+            ]
+            tracked_in_window = [r for r in window if r["state"] == "tracked"]
+            used_contour = sum(1 for r in records if r["used_contour"])
+            errors = []
+            for record in tracked_in_window:
+                roi = record["roi"]
+                if roi is None:
+                    continue
+                tracked_x = roi["x"] + roi["width"] / 2.0
+                tracked_y = roi["y"] + above_px
+                true_x, true_y = outlet_position_at(
+                    record["timestamp_s"],
+                    base_x=base_x,
+                    base_y=base_y,
+                    camera_drift_px=15.0,
+                    hand_drift_px=13.0,
+                    tremor_px=1.0,
+                )
+                errors.append(float(np.hypot(tracked_x - true_x, tracked_y - true_y)))
+            return (
+                result.summary["frames_untracked"],
+                len(window),
+                len(tracked_in_window),
+                used_contour,
+                errors,
+            )
+
+        untracked_off, window_len, tracked_off, used_contour_off, _errors_off = run(
+            disabled=True, diagnostics_dir=tmp_path / "corner_only"
+        )
+        untracked_on, window_len_on, tracked_on, used_contour_on, errors_on = run(
+            disabled=False, diagnostics_dir=tmp_path / "with_contour"
+        )
+        assert window_len == window_len_on
+        assert used_contour_off == 0, "the disabled arm must never fall back to the contour path"
+
+        coverage_off = tracked_off / window_len
+        coverage_on = tracked_on / window_len
+        # The failure mode this fixture exists to reproduce: residual-
+        # filtered corner selection alone genuinely struggles here, not
+        # merely "does somewhat worse."
+        assert coverage_off < 0.3, (
+            "fixture calibration assumption failed - corner-only tracking should "
+            f"struggle through the flow window, got {coverage_off:.0%}"
+        )
+        assert used_contour_on > 0, "the contour path should actually fire on this fixture"
+        assert untracked_on < untracked_off, "the contour path should trust more frames overall"
+        assert coverage_on > coverage_off * 2, (
+            "the contour path should recover trackability through most of the true flow "
+            f"window that corner selection alone missed - {coverage_off:.0%} -> {coverage_on:.0%}"
+        )
+        assert coverage_on >= 0.7, (
+            "the contour path should track through most of the flow window on this fixture"
+        )
+        assert errors_on, "expected at least some window-tracked frames to check position against"
+        assert statistics.median(errors_on) < 60.0
+
 
 class TestSearchWindowRecentres:
     """Third Codex review round, against real footage: "the real cup later
@@ -974,11 +1101,18 @@ class TestTrackingFramesLog:
             "residual_px",
             "rejection_reason",
             "used_residual",
+            # Stage 3, round two - cup-silhouette (edge/contour) evidence,
+            # see OutletTracker._contour_candidate.
+            "contour_available",
+            "contour_score",
+            "used_contour",
         }
         assert first["state"] in {"tracked", "predicted", "lost"}
         assert isinstance(first["trusted"], bool)
         assert isinstance(first["background_available"], bool)
         assert isinstance(first["used_residual"], bool)
+        assert isinstance(first["contour_available"], bool)
+        assert isinstance(first["used_contour"], bool)
         assert set(first["search_roi"]) == {"x", "y", "width", "height"}
         # Timestamps are monotonic - one line per frame, in decode order.
         timestamps = [record["timestamp_s"] for record in records]

@@ -573,6 +573,63 @@ def translucent_cup_near_distractor_genuinely_translucent_zahn_video(
     return clip, distractor_center
 
 
+@pytest.fixture(scope="session")
+def translucent_cup_boundary_only_zahn_video(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> HandheldClip:
+    """Stage 3, round two's own regression case: sparse residual-filtered
+    *corner* features fail, but the cup's rim/boundary silhouette remains
+    visible - the exact gap the corner/LK path's own compensation (§29)
+    could not close, per the supervisor's real-clip diagnosis of `3208924`
+    (`used_residual` fired on 805/811 frames, yet only 17 ended up trusted:
+    residual-filtered corner features simply do not exist in enough
+    density on a real translucent cup).
+
+    ``cup_opacity=0.12`` - low enough that the cup's alpha-blended *body*
+    offers essentially no exploitable corner texture (measured: only 15/300
+    frames redetect any usable residual-filtered corner set at all, and
+    window-trackability without the contour path is 7.4%), while
+    ``_draw_translucent_cup``'s rim ellipse is drawn at a fixed, opacity-
+    independent contrast (always ~8 grey levels darker than the
+    background, regardless of body opacity) - a genuine, matchable
+    boundary that never disappears just because the body does. This is
+    the calibrated split between "corner features fail" and "the boundary
+    remains visible" the authorising review asked for, found empirically
+    (see diagnostics/stage1/STAGE1_REPORT.md §30) by sweeping opacity
+    while watching both the corner path's own trust and the contour
+    path's own match outcomes independently.
+
+    ``distractor_offset=(250, -25)`` - far enough that the checkerboard
+    distractor (``_checkerboard_patch``'s own 70px span) never enters the
+    contour search/round-trip windows around the cup; a closer offset
+    (this fixture's own calibration first tried the existing 80px offset
+    other translucent-cup fixtures use) let the checkerboard's repeating
+    edges produce several near-identical match peaks inside the search
+    window, correctly triggering the score-margin safeguard - genuine
+    ambiguity, not a bug, but a different failure mode than the one this
+    fixture exists to isolate (a distractor's own robustness is already
+    covered by the other translucent-cup fixtures above).
+    """
+    from ._synthetic_handheld import build_translucent_cup_clip
+
+    path = tmp_path_factory.mktemp("videos") / "translucent_boundary_only.mp4"
+    width, height, duration_s = 480, 640, 10.0
+    return build_translucent_cup_clip(
+        path,
+        width=width,
+        height=height,
+        duration_s=duration_s,
+        flow_start_s=1.5,
+        stream_break_s=7.0,
+        flow_end_s=7.3,
+        distractor_offset=(250.0, -25.0),
+        cup_opacity=0.12,
+        camera_drift_px=15.0,
+        hand_drift_px=13.0,
+        tremor_px=1.0,
+    )
+
+
 @pytest.fixture
 def broken_video(tmp_path: Path) -> Path:
     """A file with a video extension that is not a video at all."""

@@ -489,6 +489,65 @@ class ZahnConfig:
     # warp-interpolation artefacts.
     background_motion_residual_intensity_threshold: int = 12
 
+    # Stage 3, round two (Codex review of `3208924`): on the real clip,
+    # `used_residual` fired on 805/811 frames yet only 17 ended up trusted -
+    # residual-filtered *corner* features (goodFeaturesToTrack over a
+    # translucent, low-texture cup) simply do not exist in enough density to
+    # build a trajectory from, however well the compensation math around
+    # them works. OutletTracker._contour_candidate tracks the cup's visible
+    # *geometry* instead - a gradient/edge template of the rim/side/bottom
+    # silhouette, matched against a background-suppressed edge map (see
+    # OutletTracker._contour_edge_map, which reuses the same
+    # _foreground_residual_mask this section's other fields already
+    # calibrate) - as a fallback whenever the corner/LK path itself finds no
+    # accepted candidate this frame, not a replacement for it (existing
+    # opaque-cup regressions keep passing through the unmodified corner
+    # path). These four fields are that mechanism's own thresholds, all
+    # unvalidated against real footage for the same reason as the
+    # background-motion fields above.
+
+    # Normalised template-match correlation (0-1) a contour candidate's
+    # *forward* match (this frame's edge map against the stored edge
+    # template) must reach before it is considered at all. Comparable in
+    # spirit to track_reacquire_min_correlation, but over an edge/gradient
+    # representation, not raw intensity - "never trust raw-intensity matches
+    # through the cup" (the explicit instruction this field exists to
+    # satisfy) means this path's own acceptance never falls back to
+    # _patch_correlation_at.
+    contour_min_match_score: float = 0.5
+
+    # How far the forward match's best score must exceed the next-best,
+    # non-overlapping local peak in the same response map, before the match
+    # counts as a genuine, unambiguous lock rather than one of several
+    # similarly-plausible locations (a repetitive or low-texture edge map
+    # can otherwise clear contour_min_match_score at more than one place at
+    # once, any of which would be an equally "confident" but arbitrary
+    # pick) - the "score margin" the authorising review named explicitly.
+    contour_score_margin: float = 0.15
+
+    # The "propagate bidirectionally... require geometric agreement" half of
+    # the authorisation: after a forward match is found, the same-sized
+    # patch it matched *in the current frame* is matched back against a
+    # slightly larger context crop around the anchor in the *reference*
+    # frame (cached at construction) - mirroring the corner path's own
+    # forward-backward check, but for the edge template instead of LK
+    # points. A genuine match's round trip lands back within this many
+    # pixels of the true anchor; a coincidental one, matching some other
+    # edge-rich structure that merely resembles the template, generally
+    # does not.
+    contour_max_roundtrip_px: float = 3.0
+
+    # Padding, in pixels, added on every side of the edge template's own
+    # size to build the window the forward match searches within (bounded
+    # to the tracker's local crop) - large enough to give the score-margin
+    # check a real neighbourhood of alternative locations to rule out
+    # (contour_score_margin), without searching the entire crop on every
+    # ordinary continuous-tracking frame the corner path has already failed
+    # on. Reacquisition after a full loss searches the whole crop
+    # regardless of this value, the same way the raw-intensity reacquisition
+    # search already does - the gap's length is not known in advance.
+    contour_search_margin_px: int = 40
+
     # If liquid was last confirmed before an untrusted (`lost`/`predicted`)
     # span and no trusted evidence follows it before flow-end would otherwise
     # be confirmed, the true break could have happened anywhere in that span.
@@ -548,6 +607,14 @@ class ZahnConfig:
             raise ConfigurationError(
                 "The background-motion residual intensity threshold must be between 0 and 255."
             )
+        if not 0.0 < self.contour_min_match_score <= 1.0:
+            raise ConfigurationError("The contour match score floor must be between 0 and 1.")
+        if self.contour_score_margin < 0:
+            raise ConfigurationError("The contour score margin must not be negative.")
+        if self.contour_max_roundtrip_px <= 0:
+            raise ConfigurationError("The contour round-trip bound must be greater than zero.")
+        if self.contour_search_margin_px <= 0:
+            raise ConfigurationError("The contour search margin must be greater than zero.")
         if self.zahn_max_endpoint_uncertainty_s < 0:
             raise ConfigurationError("The endpoint uncertainty bound must not be negative.")
 
