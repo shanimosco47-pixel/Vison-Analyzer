@@ -7,10 +7,12 @@ review** — it is the evidence package for Codex review, on a still-draft PR.
 **Update, same PR:** the first Codex review round asked for five specific
 changes (§6). All five were implemented, tested, and re-validated (§7).
 A second review round of that revision found three remaining blocking
-gaps plus two minor issues (§9); all are addressed and re-validated (§10).
+gaps plus two minor issues (§9); all were addressed and re-validated
+(§10). A third review round found one remaining blocking gap in that
+fix's own semantics (§12); it is addressed and re-validated (§13).
 Sections 1–5 are the original Stage 1 submission, left as-is as the
 historical record of the first round; §6–§8 cover the first round's
-fixes; §9–§10 cover the second.
+fixes; §9–§10 cover the second; §12–§13 cover the third.
 
 Product decision in force (final, per the approval comment): single Zahn
 mode, outlet tracking on by default, `zahn_track_outlet` as a config-only
@@ -588,3 +590,95 @@ streaming overhead, still comfortably within run-to-run noise.
   (§9.3) — set once, on the first qualifying gap, and specifically **not**
   cleared by `_update_flowing`'s liquid-resumes branch (contrast with
   `_gap_after_activity` just above it, which still is).
+
+## 12. Third Codex review round — one remaining blocking gap, addressed
+
+Codex re-reviewed `82dda38` (§9–§11's revision): the Event/CSV/summary
+duration leak, the server-owned diagnostics path, and the stale
+documentation/flush issues were all confirmed sound. One blocker remained
+in the *semantics* of §9.3's own fix.
+
+### 12.1 — The mid-flow gap's own span was still (wrongly) reported as `end_uncertainty_bounds`
+
+**Finding:** §9.3 added `_unresolved_flow_gap` to stop a mid-flow gap from
+being forgotten, but the fix folded that gap's own `(gap_start, gap_end)`
+timestamps into `end_uncertainty_bounds` alongside the genuinely-adjacent
+case. That is backwards: trusted liquid *was* seen again after the gap
+closed - that is precisely what makes it "mid-flow" rather than
+"adjacent-to-the-end" - which proves the true end is **not** "somewhere in
+that gap". Reporting the gap's span as the end's bound therefore fabricated
+a range that could actively **exclude** the real, later end and duration.
+The new unit test from §9.3 only checked that the bounds bracketed the
+gap itself, which codified the wrong semantics rather than catching the
+bug.
+
+**Fix:** `FlowMeasurement` gained a dedicated `end_gap_unresolved: bool`
+field, separate from `end_uncertain`/`end_uncertainty_bounds`.
+`_unresolved_flow_gap` changed from carrying a `(start, end)` span to a
+plain `bool` - there is no honest span to carry. When it fires,
+`end_confirmed` is forced `False` and `end_uncertain`/`end_gap_unresolved`
+are both set `True` (still suppressing the Event and the precise
+`efflux_seconds`, exactly as for any other uncertain measurement), but
+`end_uncertainty_bounds` is left untouched by it - populated only by the
+existing, still-correct adjacent-gap logic (`_gap_after_activity`, which
+is itself only non-`None` when *no* trusted liquid was seen between it
+closing and the end being confirmed - i.e. it was never actually
+susceptible to this bug). `_efflux_bounds()` now returns `None` outright
+(not a degenerate range collapsed onto the raw measurement) when
+`end_gap_unresolved` is set and no independently-valid
+`end_uncertainty_bounds` exists - "null when the evidence only establishes
+invalidity," per the review's own suggested contract. The `score_confidence`
+reason and the `_build_result` review warning were both rewritten for this
+case specifically: they no longer say the true end "could have occurred
+earlier" (contradicted by the evidence - liquid *was* seen afterward);
+instead they say plainly that continuity through the gap could not be
+verified.
+
+A mid-flow gap can still coexist with a *separate*, genuinely adjacent gap
+right before the end (two different gaps in the same run) - that case is
+unaffected: the adjacent gap's own bounds are still honestly computed and
+reported, `end_gap_unresolved` from the earlier one is layered on top
+purely to keep the measurement unconfirmed, without touching those bounds.
+
+**Evidence:**
+* `tests/test_zahn_state_machine.py::TestUntrackedGapsDuringFlow` rewritten:
+  `test_a_long_gap_in_the_middle_of_flow_still_poisons_a_later_clean_end`
+  now asserts `end_uncertainty_bounds is None` (previously asserted the
+  fabricated bound); a new
+  `test_a_mid_flow_gap_plus_a_separate_adjacent_end_gap_keeps_the_adjacent_bounds`
+  covers the two-gaps-in-one-run case, confirming the adjacent gap's
+  bounds survive untouched.
+* New `tests/test_zahn_tracking_integration.py::TestUnresolvedGapInTheMiddleOfFlow`,
+  over a new synthetic fixture `handheld_gap_mid_flow_zahn_video`
+  (occlusion 8.0–9.6s, entirely inside the continuous-stream window,
+  nowhere near the true start or break/end - liquid trustedly visible
+  immediately before and after, flow then runs normally to an ordinary
+  later end): `test_the_measurement_is_unconfirmed_without_a_fabricated_bound`
+  asserts `end_confirmed is False`, `end_gap_unresolved is True`,
+  `end_uncertainty_bounds is None`, `efflux_seconds_bounds is None`, and
+  that the reported `flow_end_s` itself stays close to the true end (its
+  own timing was never actually in question);
+  `test_no_event_is_emitted_and_the_warning_does_not_claim_an_earlier_end`
+  reuses the §9.1 `_assert_no_precise_duration_leaks` helper and asserts
+  the literal phrase "could have occurred earlier" is absent from the
+  warning text.
+
+## 13. Re-validation after the third round's fix
+
+```
+python -m pytest          339 passed        (previous: 336 passed, 0 failed)
+python -m ruff check .    All checks passed
+python -m ruff format --check .   all files already formatted
+python -m mypy app        Success: no issues found in 29 source files
+node --test tests_js/*.test.js   44 pass, 0 fail
+```
+
+3 new tests this round: 1 in `test_zahn_state_machine.py` (the two-gaps
+case), 2 in `test_zahn_tracking_integration.py` (the new mid-flow fixture).
+One existing unit test's assertions were corrected in place (§12.1) rather
+than added to, since it had codified the wrong semantics.
+
+Runtime, same `handheld_zahn_video` fixture, 3 trials, no `diagnostics_dir`:
+0.838 / 0.865 / 0.875 s, mean 0.859 s - consistent with every prior
+round's measurements (§7, §10); this round changed only how bounds are
+computed at end-confirmation, not what gets decoded or how often.

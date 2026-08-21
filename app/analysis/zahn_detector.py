@@ -379,16 +379,28 @@ class FlowMeasurement:
     mean_noise_sigma: float = 0.0
     stopped_early: bool = False
     # Set when the reported end sits right after an untrusted (lost/predicted
-    # tracking) span wider than zahn_max_endpoint_uncertainty_s, OR when any
-    # such span occurred anywhere earlier while flow was ongoing - even if
-    # trusted liquid resumed afterward and flow appeared to continue
-    # normally to a later, clean end (Codex review: tracking loss long
-    # enough to lose confidence must not be forgotten just because liquid
-    # came back). Either way the true break could have happened anywhere in
-    # end_uncertainty_bounds, so end_confirmed is also forced False rather
-    # than reporting a falsely precise duration.
+    # tracking) span wider than zahn_max_endpoint_uncertainty_s: the true
+    # break could have happened anywhere in end_uncertainty_bounds, so
+    # end_confirmed is also forced False rather than reporting a falsely
+    # precise duration. Only set from a gap with no trusted liquid observed
+    # between it closing and the end being confirmed - see
+    # end_gap_unresolved below for the case where liquid *did* return.
     end_uncertain: bool = False
     end_uncertainty_bounds: tuple[float, float] | None = None
+    # Set when an untrusted span wider than zahn_max_endpoint_uncertainty_s
+    # occurred anywhere earlier while flow was ongoing, and trusted liquid
+    # was seen again afterward - flow visibly continued past it. Codex
+    # review (second round): unlike end_uncertainty_bounds above, this gap's
+    # own span must NOT be reported as bounding the end - trusted liquid
+    # after it proves the true end is not "somewhere in that gap", so using
+    # the gap's timestamps there would be a fabricated bound that could
+    # exclude the actual later end entirely. What the gap genuinely
+    # establishes is narrower: continuity through that span could not be
+    # verified, so the measurement as a whole is not confirmed - end_s is
+    # still the best available candidate, but end_confirmed is forced False
+    # and no precise duration/Event is produced (same suppression as
+    # end_uncertain), without claiming to know where the true end is.
+    end_gap_unresolved: bool = False
     # Symmetric case: the persistence run that confirmed the start began
     # immediately after an untrusted span wider than
     # zahn_max_endpoint_uncertainty_s. Flow could have started anywhere in
@@ -439,16 +451,23 @@ class FlowStateMachine:
         # timing could actually fall within. See update()'s `trusted` param.
         self._gap_open = False
         self._gap_after_activity: tuple[float, float] | None = None
-        # Codex review: _gap_after_activity alone is forgotten the moment
-        # fresh trusted liquid arrives (see _update_flowing), so a long gap
-        # in the *middle* of an otherwise continuous-looking run - liquid
-        # before, liquid after - left no trace by the time a later, clean
-        # end was confirmed. That is exactly the case the acceptance
-        # criterion means by "tracking lost longer than the defined
-        # duration": once any such gap has been seen while flowing, this
-        # is set once and never cleared, so it still poisons the eventual
-        # end confirmation however long afterward flow actually stops.
-        self._unresolved_flow_gap: tuple[float, float] | None = None
+        # Codex review (first round): _gap_after_activity alone is forgotten
+        # the moment fresh trusted liquid arrives (see _update_flowing), so
+        # a long gap in the *middle* of an otherwise continuous-looking run
+        # - liquid before, liquid after - left no trace by the time a
+        # later, clean end was confirmed. Set once (first qualifying gap
+        # only) and never cleared, so it still poisons the eventual end
+        # confirmation however long afterward flow actually stops.
+        #
+        # Deliberately a bool, not the gap's own (start, end) span (Codex
+        # review, second round): trusted liquid seen again after this gap
+        # closed proves the true end is not "somewhere in that gap" -
+        # reporting the gap's own timestamps as end_uncertainty_bounds would
+        # be a fabricated bound that could exclude the actual later end
+        # entirely. All this flag may honestly claim is that continuity
+        # through that span could not be verified - see
+        # FlowMeasurement.end_gap_unresolved.
+        self._unresolved_flow_gap = False
         # Symmetric bookkeeping for the start side: the timestamp of the
         # last trusted frame seen at all (regardless of content - "flow
         # hadn't started as of here" is valid negative evidence even from a
@@ -534,11 +553,8 @@ class FlowStateMachine:
                     # already ended.
                     gap = (self._last_activity_s, timestamp_s)
                     self._gap_after_activity = gap
-                    if (
-                        self._unresolved_flow_gap is None
-                        and (gap[1] - gap[0]) > self.config.zahn_max_endpoint_uncertainty_s
-                    ):
-                        self._unresolved_flow_gap = gap
+                    if (gap[1] - gap[0]) > self.config.zahn_max_endpoint_uncertainty_s:
+                        self._unresolved_flow_gap = True
             elif self._gap_start_ts is not None:
                 # Symmetric case, still waiting for flow to start: the last
                 # trusted frame before the gap - whatever it showed - is
@@ -649,23 +665,32 @@ class FlowStateMachine:
             # interval; removing them keeps the continuity ratio honest.
             self.measurement.timed_frames -= self._frames_since_activity
 
-            candidate_bounds: list[tuple[float, float]] = []
             if self._gap_after_activity is not None:
                 gap_start, gap_end = self._gap_after_activity
                 if (gap_end - gap_start) > self.config.zahn_max_endpoint_uncertainty_s:
-                    candidate_bounds.append((gap_start, gap_end))
-            if self._unresolved_flow_gap is not None:
-                candidate_bounds.append(self._unresolved_flow_gap)
-            if candidate_bounds:
-                # The break could have happened anywhere any of these spans
-                # cover: reporting a precise, confirmed number would be
-                # inventing certainty the evidence does not support.
+                    # No trusted liquid was seen between this gap closing and
+                    # the end being confirmed, so the true break could
+                    # genuinely have happened anywhere in that span:
+                    # reporting a precise, confirmed number would be
+                    # inventing certainty the evidence does not support.
+                    self.measurement.end_confirmed = False
+                    self.measurement.end_uncertain = True
+                    self.measurement.end_uncertainty_bounds = (gap_start, gap_end)
+            if self._unresolved_flow_gap:
+                # An earlier gap whose continuity could not be verified -
+                # but trusted liquid *was* seen again afterward, so (Codex
+                # review, second round) that gap's own span must NOT be
+                # folded into end_uncertainty_bounds: doing so would claim
+                # the true end sits somewhere back in that gap, when the
+                # evidence actually shows the opposite (flow continued past
+                # it). This only forces the measurement unconfirmed; it does
+                # not - and must not - narrow where the true end is. Any
+                # end_uncertainty_bounds set above (a separate, genuinely
+                # adjacent gap) is left untouched, since that one still
+                # honestly bounds the end regardless of this concern.
                 self.measurement.end_confirmed = False
                 self.measurement.end_uncertain = True
-                self.measurement.end_uncertainty_bounds = (
-                    min(bound[0] for bound in candidate_bounds),
-                    max(bound[1] for bound in candidate_bounds),
-                )
+                self.measurement.end_gap_unresolved = True
             logger.info(
                 "Zahn flow end detected at %.3fs (no liquid for %.2fs, confirmed at %.3fs)",
                 self.measurement.end_s if self.measurement.end_s is not None else -1.0,
@@ -1214,6 +1239,7 @@ class ZahnCupDetector(BaseDetector):
                 "efflux_seconds_bounds": None,
                 "end_confirmed": False,
                 "end_uncertain": False,
+                "end_gap_unresolved": False,
                 "start_uncertain": False,
                 "fps": round(self.video.fps, 4),
                 "frames_analysed": 0,
@@ -1272,6 +1298,7 @@ class ZahnCupDetector(BaseDetector):
                 if measurement.end_uncertainty_bounds is not None
                 else None
             ),
+            "end_gap_unresolved": measurement.end_gap_unresolved,
             "start_uncertain": measurement.start_uncertain,
             "start_uncertainty_bounds": (
                 [round(bound, 3) for bound in measurement.start_uncertainty_bounds]
@@ -1324,6 +1351,7 @@ class ZahnCupDetector(BaseDetector):
                         "end_confirmed": measurement.end_confirmed,
                         "end_uncertain": measurement.end_uncertain,
                         "end_uncertainty_bounds": summary["end_uncertainty_bounds"],
+                        "end_gap_unresolved": measurement.end_gap_unresolved,
                         "start_uncertain": measurement.start_uncertain,
                         "start_uncertainty_bounds": summary["start_uncertainty_bounds"],
                         "stream_breaks": [
@@ -1345,7 +1373,18 @@ class ZahnCupDetector(BaseDetector):
                 "background."
             )
         elif status is EventStatus.REVIEW:
-            if measurement.end_uncertain and measurement.start_uncertain:
+            if measurement.end_gap_unresolved:
+                # Deliberately does not say the true end "could have
+                # occurred earlier" - trusted liquid seen again after the
+                # gap proves the opposite (Codex review, second round).
+                warnings.append(
+                    "The outlet tracker lost the outlet for long enough, during the "
+                    "flow, that the stream's continuity through that span could not "
+                    "be confirmed, even though liquid was seen again afterward. The "
+                    "reported end may not reflect a single continuous stream - please "
+                    "review the footage directly before using this measurement."
+                )
+            elif measurement.end_uncertain and measurement.start_uncertain:
                 warnings.append(
                     "The outlet was not confidently tracked around the reported start "
                     "or the reported end - the true efflux time could be shorter or "
@@ -1399,8 +1438,19 @@ class ZahnCupDetector(BaseDetector):
         duration comes from the latest-plausible start and the
         earliest-plausible... no: from the *earliest* start and *latest* end
         for the upper bound, and the reverse for the lower bound.
+
+        Returns ``None`` - no range at all, not a degenerate one collapsed
+        onto the raw measurement - when an unresolved mid-flow gap
+        (``end_gap_unresolved``) leaves no genuine bound on the end (Codex
+        review, second round): ``end_s`` is not trustworthy even as a point
+        estimate there, so a "range" built from it would still be inventing
+        precision the evidence does not support. When a separate, genuinely
+        adjacent gap *did* also produce real ``end_uncertainty_bounds``,
+        that case does not apply and the normal computation below runs.
         """
         if measurement.start_s is None or measurement.end_s is None:
+            return None
+        if measurement.end_gap_unresolved and measurement.end_uncertainty_bounds is None:
             return None
         start_lo, start_hi = (
             measurement.start_uncertainty_bounds
@@ -1488,7 +1538,20 @@ def score_confidence(measurement: FlowMeasurement, config: ZahnConfig) -> tuple[
 
     if not measurement.end_confirmed:
         confidence = min(confidence, 0.50)
-        if measurement.end_uncertain and measurement.end_uncertainty_bounds is not None:
+        if measurement.end_gap_unresolved:
+            # Deliberately does NOT say the true end "could have occurred
+            # earlier" (Codex review, second round): trusted liquid was
+            # seen again after the gap, which proves the opposite - flow
+            # continued past it. What is actually unverified is continuity
+            # through that span, not the end's location.
+            reasons.append(
+                "The outlet tracker lost the outlet for long enough, during the "
+                "flow, that the stream's continuity through that span could not be "
+                "confirmed - even though liquid was seen again afterward. The "
+                "reported end may not reflect a single continuous stream, so the "
+                "efflux time is not reported as precise."
+            )
+        elif measurement.end_uncertain and measurement.end_uncertainty_bounds is not None:
             gap_start, gap_end = measurement.end_uncertainty_bounds
             reasons.append(
                 f"The outlet was not confidently tracked for {gap_end - gap_start:.2f}s "

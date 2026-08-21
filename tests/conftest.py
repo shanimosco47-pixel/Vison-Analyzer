@@ -219,6 +219,24 @@ def handheld_gap_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> Handhel
 
 
 @pytest.fixture(scope="session")
+def handheld_gap_mid_flow_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> HandheldClip:
+    """The outlet swings out of frame in the *middle* of an otherwise clean run.
+
+    Occlusion covers 8.0-9.6s - well inside the continuous-stream window
+    (3.0-16.0s), nowhere near the true start or the true break/end. Liquid
+    is trustedly visible both immediately before and immediately after the
+    gap, and the run then continues to an ordinary, cleanly-confirmed end.
+    Second Codex review round: this is the case FlowStateMachine's
+    end_gap_unresolved handling exists for - trusted liquid returning after
+    the gap proves the true end is not "somewhere in that gap", so the
+    measurement must be unconfirmed without inventing a bound that could
+    exclude the actual, later true end.
+    """
+    path = tmp_path_factory.mktemp("videos") / "handheld_gap_mid_flow_zahn.mp4"
+    return build_handheld_clip(path, occlusion_s=(8.0, 9.6), **HANDHELD_TIMELINE)
+
+
+@pytest.fixture(scope="session")
 def handheld_gap_at_start_zahn_video(tmp_path_factory: pytest.TempPathFactory) -> HandheldClip:
     """The outlet is swung out of frame across the true *start*, not the end.
 

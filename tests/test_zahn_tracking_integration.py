@@ -167,6 +167,63 @@ class TestBreakDuringATrackingGap:
         assert result.summary["frames_untracked"] == 0
 
 
+class TestUnresolvedGapInTheMiddleOfFlow:
+    """Second Codex review round: a gap with trusted liquid on both sides.
+
+    Unlike TestBreakDuringATrackingGap (where nothing trusted is seen again
+    before the end is confirmed), here liquid is trustedly visible right
+    before *and* right after the gap, and flow continues normally to an
+    ordinary, cleanly-confirmed end well afterward. That later liquid
+    proves the true end is not "somewhere in the gap" - so, unlike the
+    adjacent-gap case, no bound may be reported that claims to know where
+    the true end is. The measurement must still come back unconfirmed
+    (continuity through the gap could not be verified), with no Event and
+    no precise duration - but with honest (here: absent) bounds, and a
+    warning that does not claim the end could have occurred earlier.
+    """
+
+    def test_the_measurement_is_unconfirmed_without_a_fabricated_bound(
+        self, handheld_gap_mid_flow_zahn_video
+    ):
+        clip = handheld_gap_mid_flow_zahn_video
+        result = _run(clip.path, clip.outlet_at_reference)
+        summary = result.summary
+
+        assert summary["end_confirmed"] is False
+        assert summary["end_uncertain"] is True
+        assert summary["end_gap_unresolved"] is True
+        assert summary["status"] == "review"
+        assert summary["confidence"] <= 0.5
+
+        # The reported end itself is still close to the true one: liquid
+        # was trustedly seen right up to the real break, well after the gap
+        # closed. Nothing about its own timing was actually in question.
+        assert summary["flow_end_s"] == pytest.approx(clip.flow_end_s, abs=SYNTHETIC_TOLERANCE_S)
+
+        # No fabricated bound: the gap does not honestly bound the end
+        # (trusted liquid afterward disproves that story), and there is no
+        # separate, genuinely adjacent gap here to bound it either - so
+        # there is nothing to report as end_uncertainty_bounds or
+        # efflux_seconds_bounds, per the "or be null" half of the contract.
+        assert summary["end_uncertainty_bounds"] is None
+        assert summary["efflux_seconds"] is None
+        assert summary["efflux_seconds_bounds"] is None
+
+    def test_no_event_is_emitted_and_the_warning_does_not_claim_an_earlier_end(
+        self, handheld_gap_mid_flow_zahn_video
+    ):
+        clip = handheld_gap_mid_flow_zahn_video
+        result = _run(clip.path, clip.outlet_at_reference)
+        _assert_no_precise_duration_leaks(result)
+
+        assert result.warnings
+        warning_text = " ".join(result.warnings).lower()
+        # The specific thing Codex flagged: liquid was seen again after the
+        # gap, so claiming the true end "could have occurred earlier" would
+        # contradict the evidence rather than honestly describe it.
+        assert "could have occurred earlier" not in warning_text
+
+
 class TestBreakDuringATrackingGapAtStart:
     """Symmetric case: the true *start*, not the end, falls inside a gap.
 
