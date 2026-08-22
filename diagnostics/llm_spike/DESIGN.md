@@ -1263,7 +1263,7 @@ frame's own label. This is the same class of gap the isolated experiment
 own evidence: one coherent request, given the right contract, found
 20.2s (0.3s from truth) unprompted.
 
-**Fix** (commit TBD, no pipeline expansion): `PROMPT_END_VALIDATE_V2`
+**Fix** (commit `b42bb9a`, no pipeline expansion): `PROMPT_END_VALIDATE_V2`
 reframes the CANDIDATE frame as a reference point, not a fixed answer.
 The model must find the EARLIEST frame anywhere in the window - baseline
 before the candidate, evidence after it - where a SUSTAINED shortening
@@ -1301,7 +1301,9 @@ evidence already in front of it. Two things did change in `pipeline.py`:
    backward refinement (toward the baseline) always safe by construction
    - the window only grows wider from any earlier point - while forward
    refinement (past the sparse candidate) is structurally always short on
-   trailing evidence and reliably abstains.
+   trailing evidence and reliably abstains. (§22 below replaced this
+   pre-flight-check-plus-point-anchored-window design entirely - see
+   there for what superseded it.)
 
 The end-coarse candidate itself (`candidate_ts`) is preserved in
 `Event.details["end_coarse_candidate_s"]`, distinct from the final
@@ -1334,6 +1336,130 @@ noted since §11; `node --test tests_js/*.test.js` - 44/44, unaffected.
 No real-clip rerun was run from this sandbox (no API key or real clip
 exists here, as every prior round has noted) - the operator runs that
 next, per the standing workflow.
+
+## 22. The point-anchored validation window itself was the bug: replaced with a wide coherent window
+
+A Codex review ran the real clip against commit `b42bb9a` (§21's
+region-refinement change). Result: still safe ABSTAIN - refined onset
+16.533s, validation window `[?, 18.50]`s, truth ~20.5s. 78.516s harness /
+56.734s provider, 163,330 tokens, zero retries. Reason given: `16.533 +
+2.0s` exceeded the submitted horizon by 0.033s.
+
+Reconstructing the run's own numbers from the pipeline's arithmetic
+(`validation_hi = candidate_ts + end_validation_horizon_s`, so
+`candidate_ts = 18.50 - 2.0 = 16.50s`): end-coarse's sparse candidate had
+moved to **16.5s**, now ~4 seconds *before* the true break, rather than
+after it as in the two prior rounds (18.5s, 21.5s). Under §21's
+point-anchored window (`candidate_ts - 1.0s` to `candidate_ts + 2.0s`,
+i.e. `[15.5, 18.5]` for this run), the true break at 20.5s was not merely
+missed - it was structurally outside the request entirely. The 0.033s
+future-context shortfall that actually produced the ABSTAIN was
+incidental: even a validation response that had cleanly CONFIRMED inside
+`[15.5, 18.5]` would have been wrong by roughly 4 seconds, the exact
+"confidently wrong" outcome this whole design exists to prevent. The
+supervisor's explicit instruction was **not** to relax the future-context
+comparison - doing so would have converted this safe abstain into a false
+positive nearly 4s early - and to diagnose and redesign instead of
+tweaking wording again.
+
+Three consecutive real reruns (18.5s → 21.5s → 16.5s candidates, against
+a truth near 20.5s) established that the sparse end-coarse pass's own
+error can swing several seconds in *either* direction. A window sized
+only from a tight baseline/horizon around one possibly-wrong candidate
+cannot be fixed by choosing a better baseline/horizon - any fixed small
+window anchored to a single point has some coarse error large enough to
+put the truth outside it.
+
+**Fix** (commit TBD): the dense validation window is now sized as one
+coherent region wide enough to contain the observed coarse error range,
+not point-anchored:
+
+- `PipelineConfig.end_validation_baseline_s`/`end_validation_horizon_s`
+  (1.0s/2.0s, used only to size the request) are replaced by four fields:
+  `end_validation_pre_s` (4.0s default, before the candidate),
+  `end_validation_post_s` (6.0s default, after the candidate - sizing
+  only), `end_validation_max_span_s` (10.0s hard cap on
+  `pre_s + post_s`, enforced in `PipelineConfig.validate()` - this stays
+  one coherent request, never an open-ended or multi-candidate search),
+  and `end_validation_min_future_s` (2.0s default - the *structural*
+  future-evidence requirement, now fully decoupled from `post_s`'s
+  sizing role).
+- `run_llm_timing` computes `validation_lo = max(locked_start_s,
+  candidate_ts - end_validation_pre_s)` and `validation_hi =
+  min(duration_s, candidate_ts + end_validation_post_s)` - clamped by the
+  clip's own bounds on both sides, never past either edge.
+- The old *pre-flight* check (`candidate_ts + end_validation_horizon_s >
+  duration_s` → abstain before ever sending the request) is gone
+  entirely: a candidate near the clip's end now still gets a window and
+  a validation request, clamped at `duration_s`, exactly per the
+  supervisor's "if clipping at the video end still leaves >=2s after a
+  refined T, it is eligible; otherwise abstain" instruction. Eligibility
+  is decided once, post-hoc, against whichever timestamp validation
+  actually reports: `validation_verdict.end_s + end_validation_min_future_s
+  > validation_hi` converges on ABSTAIN (`insufficient_future_context`)
+  - the same check §21 introduced, just re-parameterized on the new
+    fields and (now) the request's own actual, possibly clip-clamped
+    upper bound rather than a value guaranteed by a pre-flight check that
+    no longer exists.
+- `PROMPT_END_VALIDATE_V2` needed **no wording change and no new
+  version**: its MEASUREMENT RULE already scans the *whole* submitted
+  batch chronologically for the earliest sustained onset without hard-
+  coding any specific window size - the fix is entirely in how wide a
+  window `pipeline.py` builds before asking, not in what the prompt
+  tells the model to do with it. This is the same lesson as §20 in
+  reverse: there, the bug was in the prompt and the pipeline needed no
+  change; here, the bug is in the pipeline's window sizing and the
+  prompt needs no change.
+
+**Diagnosability for future failures**: the supervisor also asked that
+the eval artifact retain enough detail to diagnose the *next* real
+failure without another paid rerun. `PipelineOutcome` gained
+`pass_verdicts: dict[str, TimingVerdict]` - each pass's own
+post-grounding verdict (candidate/refined timestamp, evidence, reason
+codes, raw_notes, model/prompt IDs), populated incrementally so a run
+that abstains partway through still records every pass that ran before
+the abstain. `scripts/llm_timing_eval.py`'s `ClipResult` now carries the
+same dict (via each verdict's existing `to_dict()`) into the `--json`
+artifact. Nothing new here carries image bytes or credentials -
+`TimingVerdict.raw_notes` was already sanitized/bounded (see
+`redaction.py`) before this. `Event.details` also gained
+`end_validation_window_s: [validation_lo, validation_hi]` - the actual
+window sent - alongside the existing `end_coarse_candidate_s`, so a
+CONFIRMED result's own audit trail shows both the original sparse
+nomination and the window it was validated against, distinctly.
+
+**Tests**: the five scenarios requested -
+`test_pipeline_clamps_the_validation_window_to_locked_start_s_for_an_early_candidate`
+(early candidate, window clamped at the confirmed start, not
+`candidate - pre_s`),
+`test_pipeline_clamps_the_validation_window_to_the_clip_end_and_still_confirms`
+and
+`test_pipeline_sends_validation_then_abstains_when_clip_end_clamping_leaves_no_future_room`
+(late candidate / clip-end clamping, both the succeeds-with-enough-room
+and the aborts-for-lack-of-room cases, proving the pre-flight abort is
+gone and eligibility is checked post-hoc against the actual clamped
+window),
+`test_pipeline_abstains_when_the_refined_onset_has_no_room_for_its_own_future_horizon`
+(updated numbers - the refined-T future-horizon rule, re-verified under
+the new wider window), byte-budget abstention
+(`test_pipeline_abstains_with_request_too_large_when_the_wide_validation_window_cannot_fit`),
+and the real-failure reproduction
+`test_pipeline_reaches_a_break_the_old_narrow_validation_window_could_not_reach`
+(16.5s sparse candidate, 20.5s true break - exactly this run's own
+numbers - CONFIRMED at 20.5s, proving the old `[15.5, 18.5]` window could
+never have reached it while the new `[12.5, 22.5]` window does). Two new
+`PipelineConfig.validate()` regressions cover the new invariants
+(`end_validation_pre_s + post_s` over the hard cap;
+`end_validation_min_future_s` over `end_validation_post_s`).
+
+**Gates**: `pytest -q` - green (481 tests total across the full repo, up
+from 475 - six new/replaced regressions net this round); `ruff check .` /
+`ruff format --check .` - clean; `mypy app` - clean except the same
+pre-existing, unrelated `app/web/routes.py:261` finding noted since §11;
+`node --test tests_js/*.test.js` - 44/44, unaffected. No real-clip rerun
+was run from this sandbox (no API key or real clip exists here, as every
+prior round has noted) - the operator runs that next, per the standing
+workflow.
 
 No pipeline expansion, no UI, no unrelated cleanup. PR #5 stays draft -
 ready for one real whole-clip rerun.

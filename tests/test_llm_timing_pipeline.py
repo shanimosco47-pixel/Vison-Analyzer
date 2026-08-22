@@ -767,27 +767,118 @@ def test_pipeline_abstains_when_the_only_candidate_fails_trend_validation(zahn_v
     ]
 
 
-def test_pipeline_abstains_when_the_candidate_has_no_room_for_the_full_validation_horizon(
+def test_pipeline_clamps_the_validation_window_to_locked_start_s_for_an_early_candidate(
     zahn_video,
 ):
-    """The "at least ~2s future context" rule is enforced structurally, not
-    left to the model noticing a silently-shortened horizon and
-    self-abstaining per the prompt: a candidate close enough to the end of
-    the clip that it cannot receive the full mandatory validation horizon
-    must abstain immediately, and the validation request must never even
-    be sent (Codex review finding, see diagnostics/llm_spike/DESIGN.md)."""
-    # duration_s is 26.0 and the default end_validation_horizon_s is 2.0 -
-    # a candidate at 25.0s would need frames up to 27.0s, past the clip.
-    near_end_candidate_s = 25.0
-    validate_calls: list[ProviderRequest] = []
+    """A candidate close enough to the confirmed start that
+    ``candidate_ts - end_validation_pre_s`` would fall before it must have
+    its validation window clamped at ``locked_start_s``, never reaching
+    back before the confirmed start of the stream itself."""
+    # locked_start_s is 4.0 (default fine_margin_s=1.5 puts start_hi at
+    # 5.5) - scan_from_s is 5.5, so the earliest reachable candidate is
+    # just past that; end_validation_pre_s=4.0 would reach back to 1.5s,
+    # before the confirmed start, without the clamp.
+    early_candidate_s = 6.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=early_candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(
+                start_s=4.0, end_s=4.0, confidence=0.9, evidence_frame_timestamps_s=(4.0,)
+            )
+        if request.pass_name == "end_validate":
+            return _confirm_validation(request)
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(
+            start_s=early_candidate_s,
+            end_s=early_candidate_s,
+            confidence=0.9,
+            evidence_frame_timestamps_s=(early_candidate_s,),
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    validate_call = next(c for c in provider.calls if c.pass_name == "end_validate")
+    validate_times = [f.timestamp_s for f in validate_call.frames]
+    assert min(validate_times) == pytest.approx(4.0, abs=0.1)  # clamped, not 6.0 - 4.0 = 2.0
+
+
+def test_pipeline_clamps_the_validation_window_to_the_clip_end_and_still_confirms(zahn_video):
+    """A candidate close to the end of the clip gets a validation window
+    clamped at ``duration_s`` (never past the clip), but the request is
+    still sent - unlike the earlier pre-flight design, clip-end clamping
+    alone is no longer a reason to abstain before even asking. If the
+    refined onset reported still has enough of *this clamped window's own*
+    future evidence after it, the run confirms normally."""
+    # duration_s is 26.0; end_validation_post_s defaults to 6.0, so an
+    # unclamped window would reach to 29.0s - past the clip - and must be
+    # clamped to 26.0 instead.
+    near_end_candidate_s = 23.0
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
             return canned_json_response(start_s=4.0, end_s=near_end_candidate_s, confidence=0.9)
         if request.pass_name == "fine":
-            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+            return canned_json_response(
+                start_s=4.0, end_s=4.0, confidence=0.9, evidence_frame_timestamps_s=(4.0,)
+            )
         if request.pass_name == "end_validate":
-            validate_calls.append(request)
+            return _confirm_validation(request)
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(
+            start_s=near_end_candidate_s,
+            end_s=near_end_candidate_s,
+            confidence=0.9,
+            evidence_frame_timestamps_s=(near_end_candidate_s,),
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.end_s == pytest.approx(near_end_candidate_s)
+    validate_call = next(c for c in provider.calls if c.pass_name == "end_validate")
+    validate_times = [f.timestamp_s for f in validate_call.frames]
+    assert max(validate_times) == pytest.approx(zahn_video.duration_s, abs=0.1)  # clamped to 26.0
+
+
+def test_pipeline_sends_validation_then_abstains_when_clip_end_clamping_leaves_no_future_room(
+    zahn_video,
+):
+    """The mandatory future-evidence rule is now checked against the
+    validation window's own actual (possibly clip-clamped) upper bound,
+    after the response comes back - not as a pre-flight refusal to even
+    ask, per the old design. A candidate near enough to the clip's own end
+    that even the clamped window leaves no room for the refined onset's
+    required future evidence must still abstain, but only after the
+    validation request was actually sent."""
+    # duration_s is 26.0 - a candidate at 25.0s clamps the window to
+    # [21.0, 26.0]s (1.0s of nominal future room, well under the 2.0s
+    # end_validation_min_future_s floor if the model reports the candidate
+    # itself as the onset).
+    near_end_candidate_s = 25.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=near_end_candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(
+                start_s=4.0, end_s=4.0, confidence=0.9, evidence_frame_timestamps_s=(4.0,)
+            )
+        if request.pass_name == "end_validate":
             return _confirm_validation(request)
         assert request.pass_name == "end_coarse"
         return canned_json_response(
@@ -807,9 +898,15 @@ def test_pipeline_abstains_when_the_candidate_has_no_room_for_the_full_validatio
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
     assert "insufficient_future_context" in outcome.verdict.reason_codes
-    assert validate_calls == []  # the validation request was never sent
-    assert [c.pass_name for c in provider.calls] == ["coarse", "fine", "end_coarse"]
-    assert outcome.end_validation_response is None
+    # Unlike the old pre-flight design, the validation request WAS sent -
+    # only the response's own reported onset was rejected.
+    assert [c.pass_name for c in provider.calls] == [
+        "coarse",
+        "fine",
+        "end_coarse",
+        "end_validate",
+    ]
+    assert outcome.end_validation_response is not None
 
 
 def test_pipeline_reaches_the_true_break_in_one_call_when_end_coarse_avoids_the_transient(
@@ -871,14 +968,14 @@ def test_pipeline_accepts_a_validation_refined_onset_earlier_than_the_sparse_can
     """Reproduces the shape of a real whole-clip rerun (commit 86c083d):
     the sparse end-coarse pass nominated 21.5s, a second too late; the
     dense validation window - which already reaches back to
-    candidate - end_validation_baseline_s by design - contained the true
+    ``candidate - end_validation_pre_s`` by design - contained the true
     onset at 20.5s. PROMPT_END_VALIDATE_V2 is explicitly allowed to report
     that earlier, better-supported timestamp instead of only confirming
     or rejecting the sparse candidate verbatim, and the pipeline must
     report the validation pass's own (refined) answer, not the coarse
     candidate that only nominated the window to search."""
     sparse_candidate_s = 21.5
-    refined_onset_s = 20.5  # exactly at validation_lo with the default 1.0s baseline
+    refined_onset_s = 20.5  # comfortably within [17.5, 26.0] at the default 4.0s pre-margin
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
@@ -914,6 +1011,66 @@ def test_pipeline_accepts_a_validation_refined_onset_earlier_than_the_sparse_can
     # The original sparse nomination stays visible for audit, distinct
     # from the final refined answer.
     assert outcome.event.details["end_coarse_candidate_s"] == pytest.approx(sparse_candidate_s)
+
+
+def test_pipeline_reaches_a_break_the_old_narrow_validation_window_could_not_reach(zahn_video):
+    """Reproduces the exact shape of a real whole-clip rerun (commit
+    b42bb9a): the sparse end-coarse pass nominated 16.5s - now ~4s
+    *before* the true break (~20.5s), rather than after it. Under the old
+    point-anchored window (``candidate_ts - 1.0s`` to
+    ``candidate_ts + 2.0s``, i.e. ``[15.5, 18.5]``), the true break was
+    structurally unreachable - not merely missed, but nowhere in the
+    request at all - so even a clean CONFIRMED there would have been
+    wrong by roughly 4 seconds. The wider default window
+    (``end_validation_pre_s``/``end_validation_post_s`` = 4.0s/6.0s) now
+    reaches ``[12.5, 22.5]``, which does contain 20.5s, and the dense
+    validation pass - which scans its whole batch chronologically per
+    PROMPT_END_VALIDATE_V2 - can refine forward from the sparse (wrong,
+    too-early) candidate to the true, later, evidence-supported onset."""
+    sparse_candidate_s = 16.5  # a real end-coarse nomination that was ~4s early
+    true_break_s = 20.5
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=sparse_candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(
+                start_s=4.0, end_s=4.0, confidence=0.9, evidence_frame_timestamps_s=(4.0,)
+            )
+        if request.pass_name == "end_validate":
+            # A compliant model rejects the early transient near the
+            # sparse candidate and reports the true, later, sustained
+            # onset it can see later in this same wide batch.
+            return canned_json_response(
+                start_s=true_break_s,
+                end_s=true_break_s,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(true_break_s,),
+            )
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(
+            start_s=sparse_candidate_s,
+            end_s=sparse_candidate_s,
+            confidence=0.9,
+            evidence_frame_timestamps_s=(sparse_candidate_s,),
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.end_s == pytest.approx(true_break_s)
+    assert outcome.event.details["end_coarse_candidate_s"] == pytest.approx(sparse_candidate_s)
+    # The window actually sent reaches well past where the old 2.0s
+    # horizon would have stopped (18.5s) - it must cover the true break.
+    validate_call = next(c for c in provider.calls if c.pass_name == "end_validate")
+    validate_times = [f.timestamp_s for f in validate_call.frames]
+    assert max(validate_times) >= true_break_s
 
 
 def test_pipeline_abstains_when_a_refined_onset_falls_outside_the_validation_window(zahn_video):
@@ -962,12 +1119,16 @@ def test_pipeline_abstains_when_the_refined_onset_has_no_room_for_its_own_future
     """The mandatory future-context rule is re-checked against whatever
     timestamp validation actually reports, not just the original sparse
     candidate: refining forward, toward the validation window's own edge,
-    leaves less than the mandatory horizon of submitted evidence after it
-    - the pipeline must catch this structurally rather than trust the
-    model's own compliance, exactly like the pre-flight check for the
-    sparse candidate itself."""
+    leaves less than the mandatory ``end_validation_min_future_s`` of
+    submitted evidence after it - the pipeline must catch this
+    structurally rather than trust the model's own compliance."""
     candidate_s = 10.0
-    forward_point_s = 11.5  # later than candidate_s - inherently short on trailing evidence
+    # Window is [6.0, 16.0] (locked_start_s=4.0 clamps the low side;
+    # candidate_s + end_validation_post_s=6.0 sets the high side). A
+    # refined onset at 15.0s only has 1.0s of submitted evidence after it
+    # within this window - short of the 2.0s end_validation_min_future_s
+    # floor.
+    forward_point_s = 15.0
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
@@ -1060,6 +1221,65 @@ def test_pipeline_accepts_a_candidate_with_sustained_per_second_shortening(zahn_
     assert outcome.end_validation_response is not None  # validated immediately, no rejects
 
 
+def test_pipeline_abstains_with_request_too_large_when_the_wide_validation_window_cannot_fit(
+    zahn_video,
+):
+    """The dense validation window is now up to ``end_validation_max_span_s``
+    wide (10.0s by default) - far larger than the ~3s fine window or the
+    sparse coarse/end-coarse batches - so a byte budget that comfortably
+    fits every other pass can still be too small for the validation
+    pass's own precision floor. The validation request must never be
+    sent in that case, same "abstain, never send an undersized or
+    oversized request" contract as every other budget failure (see
+    ``_fit_frames_to_budget``)."""
+    candidate_s = 15.0  # far enough from either clip edge that the window is the full 10.0s
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(
+                start_s=4.0, end_s=4.0, confidence=0.9, evidence_frame_timestamps_s=(4.0,)
+            )
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(
+            start_s=candidate_s,
+            end_s=candidate_s,
+            confidence=0.9,
+            evidence_frame_timestamps_s=(candidate_s,),
+        )
+
+    provider = StubTimingProvider(respond)
+    # A tight target_tolerance_s inflates every window's own precision
+    # floor (frame count needed), but the validation window (~10s) is far
+    # wider than the fine window (~3s), so its floor grows disproportion-
+    # ately more - a budget sized to comfortably fit coarse/fine/end-coarse
+    # at this tolerance still can't fit the validation pass's own floor.
+    config = PipelineConfig(max_request_bytes=800_000, target_tolerance_s=0.1)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+        config=config,
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "request_too_large" in outcome.verdict.reason_codes
+    assert [c.pass_name for c in provider.calls] == ["coarse", "fine", "end_coarse"]
+    assert outcome.end_validation_response is None  # never sent
+
+
 def test_pipeline_config_rejects_invalid_bounds():
     with pytest.raises(ConfigurationError):
         PipelineConfig(min_confidence=0.9, review_confidence=0.5).validate()
+
+
+def test_pipeline_config_rejects_end_validation_span_exceeding_the_hard_cap():
+    with pytest.raises(ConfigurationError):
+        PipelineConfig(end_validation_pre_s=8.0, end_validation_post_s=8.0).validate()
+
+
+def test_pipeline_config_rejects_min_future_exceeding_the_post_margin():
+    with pytest.raises(ConfigurationError):
+        PipelineConfig(end_validation_post_s=1.0, end_validation_min_future_s=2.0).validate()

@@ -194,12 +194,15 @@ def _stub_matching_truth(truth: dict[str, float]):
 def test_pipeline_thins_fine_frames_under_a_tight_byte_budget(zahn_video):
     provider = _stub_matching_truth(zahn_video.truth)
     # Real synthetic-video JPEGs here run several KB each. This budget
-    # comfortably fits the coarse pass's floor (~19 frames, ~163KB - see
-    # _min_coarse_frames) and each fine window's own precision floor (~9
-    # frames, well under its 100KB half-share), but not native-fps dense
-    # sampling of two ~3s windows (~150 frames total, roughly 1MB) - forcing
-    # thinning without being literally unsatisfiable.
-    config = PipelineConfig(max_request_bytes=200_000)
+    # comfortably fits every pass's own precision floor (coarse ~19
+    # frames/~163KB; the single start-only fine window ~9 frames; the
+    # end-coarse sparse batch similarly small; the dense end-validate
+    # window - now up to end_validation_max_span_s=10.0s wide, ~24 frames
+    # at its own floor here - see PipelineConfig.end_validation_pre_s/
+    # end_validation_post_s), but not native-fps dense sampling of the
+    # ~3s fine window (~75 frames, several hundred KB) - forcing thinning
+    # there without being literally unsatisfiable for any pass.
+    config = PipelineConfig(max_request_bytes=300_000)
     outcome = run_llm_timing(
         zahn_video.path,
         provider,

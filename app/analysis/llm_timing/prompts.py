@@ -111,15 +111,38 @@ final answer (the refined onset), not the end-coarse candidate's - the
 here for this reason (it existed to stop the validation call from
 unilaterally drifting past its own candidate; V2 is deliberately allowed
 to refine within its own grounded window instead) - while a new
-structural check enforces that the reported onset still has the full
-``end_validation_horizon_s`` of *actually submitted* future evidence
-after it, in either direction, converging on ABSTAIN
+structural check enforces that the reported onset still has
+``PipelineConfig.end_validation_min_future_s`` of *actually submitted*
+future evidence after it, in either direction, converging on ABSTAIN
 (``insufficient_future_context``) otherwise rather than trusting an
 onset the model could not have actually confirmed from what it was
 shown. Reuses ``schema.TimingVerdict``'s existing degenerate-point shape
 exactly like ``PROMPT_END_SCAN_V2``/``PROMPT_START_REFINE_V1`` -
 CONFIRMED means an onset was found and confirmed, ABSTAIN means none in
 this window was.
+
+A third real whole-clip rerun (commit `b42bb9a`, against the
+region-refinement change just described) still came back a safe ABSTAIN:
+end-coarse's sparse candidate had moved to 16.5s - now ~4s *before* the
+true break rather than after it - and the dense window's point-anchored
+sizing at the time (``candidate_ts - 1.0s`` to ``candidate_ts + 2.0s``,
+i.e. ``[15.5, 18.5]``) never reached anywhere near 20.5s at all, so even
+a clean CONFIRMED inside that window would have been reported roughly
+4 seconds early - a "confidently wrong" result, the one outcome this
+whole design exists to prevent. The 0.033s future-context shortfall that
+actually produced the ABSTAIN was incidental, not the bug: three
+consecutive real reruns (16.5s, 18.5s, 21.5s candidates against a truth
+near 20.5s) showed the sparse end-coarse pass's own error can swing
+several seconds either direction, so ``pipeline.run_llm_timing`` widens
+the window itself - ``PipelineConfig.end_validation_pre_s``/
+``end_validation_post_s`` (defaults 4.0s/6.0s, hard-capped by
+``end_validation_max_span_s``) - rather than changing this prompt's
+wording. ``PROMPT_END_VALIDATE_V2``'s own instructions already describe
+scanning the *whole* batch chronologically for the earliest sustained
+onset without hard-coding any specific window size, so no prompt edit or
+new version was needed for this fix - only how wide a window the
+pipeline builds around the candidate before asking (supervisor-directed,
+see diagnostics/llm_spike/DESIGN.md).
 
 ``PROMPT_END_COARSE_V1`` (superseded by V2 below, kept only as the
 historical record of what the first real whole-clip rerun was actually

@@ -86,6 +86,7 @@ class ClipResult:
     total_retries: int
     total_tokens: int | None  # None unless every pass that ran reported usage
     estimated_cost_usd: float | None  # None unless every pass's model is priced
+    pass_verdicts: dict[str, dict]  # per-pass sanitized verdict (see PipelineOutcome.pass_verdicts)
 
 
 def _load_manifest(path: Path) -> list[dict]:
@@ -226,6 +227,13 @@ def _evaluate_clip(
     total_retries = outcome.total_retries
     total_tokens = outcome.total_tokens
     estimated_cost_usd = outcome.estimated_cost_usd()
+    # Every pass's own post-grounding verdict (candidate/refined timestamps,
+    # evidence, reason codes, raw_notes, model/prompt IDs) - already
+    # sanitized/bounded (TimingVerdict.raw_notes - see redaction.py), never
+    # image bytes or credentials - so a real-clip failure is diagnosable
+    # straight from this JSON artifact, without another paid rerun
+    # (supervisor-directed, see diagnostics/llm_spike/DESIGN.md).
+    pass_verdicts = {name: v.to_dict() for name, v in outcome.pass_verdicts.items()}
 
     if verdict.status is not TimingStatus.CONFIRMED:
         return ClipResult(
@@ -249,6 +257,7 @@ def _evaluate_clip(
             total_retries=total_retries,
             total_tokens=total_tokens,
             estimated_cost_usd=estimated_cost_usd,
+            pass_verdicts=pass_verdicts,
         )
 
     assert verdict.start_s is not None and verdict.end_s is not None
@@ -280,6 +289,7 @@ def _evaluate_clip(
         total_retries=total_retries,
         total_tokens=total_tokens,
         estimated_cost_usd=estimated_cost_usd,
+        pass_verdicts=pass_verdicts,
     )
 
 

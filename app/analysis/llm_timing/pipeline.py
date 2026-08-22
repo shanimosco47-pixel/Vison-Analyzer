@@ -17,7 +17,7 @@ wrong" contract this whole application is built under.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import cv2
@@ -102,18 +102,39 @@ class PipelineConfig:
             a request that still can't fit at that floor aborts with
             ``request_too_large`` rather than sending fewer frames than the
             gate needs, or a request the provider would reject anyway.
-        end_validation_baseline_s: how much clip, immediately before the
-            end-coarse pass's nominated candidate, gets sent along with a
-            trend-validation follow-up request as the "already established,
-            continuous stream" baseline the model checks the candidate
-            against - see ``_build_validation_frames`` and ``run_llm_timing``'s
-            trend-validation follow-up request below. Supervisor-specified
-            floor is "~1s"; this is that default.
-        end_validation_horizon_s: how much clip, immediately after the
-            end-coarse pass's nominated candidate, gets sent along with the
-            same follow-up request as the evidence a sustained shortening
-            trend must hold across before the candidate is accepted.
-            Supervisor-specified floor is "~2s"; this is that default.
+        end_validation_pre_s: how much clip, immediately before the
+            end-coarse pass's nominated candidate, gets included in the
+            single dense trend-validation window - see
+            ``_build_validation_frames`` and ``run_llm_timing``'s
+            trend-validation follow-up request below. Widened (from an
+            original "~1s") after three consecutive real gate-1 reruns put
+            the sparse end-coarse candidate anywhere from ~1s to ~4s away
+            from the true break: a window built tightly around a
+            *possibly-wrong* candidate can structurally exclude the truth
+            regardless of what the candidate is (supervisor-directed, see
+            diagnostics/llm_spike/DESIGN.md).
+        end_validation_post_s: how much clip, immediately after the
+            end-coarse pass's nominated candidate, gets included in the same
+            window - sizing only. This is deliberately decoupled from the
+            *required* future-evidence rule below (``end_validation_min_future_s``)
+            - a candidate near the clip's own end still gets a window
+            clipped at the clip boundary, and it is the refined onset's own
+            trailing evidence that is actually checked, not this nominal
+            sizing value.
+        end_validation_max_span_s: hard ceiling on
+            ``end_validation_pre_s + end_validation_post_s`` (enforced in
+            ``validate()``, not at request time) - this window is still one
+            coherent dense request, never an open-ended or multi-candidate
+            search, however wide the observed coarse error range gets.
+        end_validation_min_future_s: how much *actually submitted* evidence
+            must follow the timestamp the dense validation pass reports
+            (which may be a refinement, not the original candidate - see
+            ``PROMPT_END_VALIDATE_V2``) before that onset is trusted, at all
+            within the same window. Checked against the refined onset, not
+            the nominal ``end_validation_post_s`` sizing above, so clipping
+            the window at the clip's end still allows a refined onset with
+            enough room after it. Supervisor-specified floor is "~2s"; this
+            is that default.
     """
 
     coarse_step_s: float = 0.5
@@ -126,8 +147,10 @@ class PipelineConfig:
     max_frame_dimension_px: int = 768
     jpeg_quality: int = 80
     max_request_bytes: int = 18_000_000
-    end_validation_baseline_s: float = 1.0
-    end_validation_horizon_s: float = 2.0
+    end_validation_pre_s: float = 4.0
+    end_validation_post_s: float = 6.0
+    end_validation_max_span_s: float = 10.0
+    end_validation_min_future_s: float = 2.0
 
     def validate(self) -> None:
         if self.coarse_step_s <= 0:
@@ -148,10 +171,27 @@ class PipelineConfig:
             raise ConfigurationError("max_frame_dimension_px must be positive.")
         if not 1 <= self.jpeg_quality <= 100:
             raise ConfigurationError("jpeg_quality must be between 1 and 100.")
-        if self.end_validation_baseline_s <= 0:
-            raise ConfigurationError("end_validation_baseline_s must be positive.")
-        if self.end_validation_horizon_s <= 0:
-            raise ConfigurationError("end_validation_horizon_s must be positive.")
+        if self.end_validation_pre_s <= 0:
+            raise ConfigurationError("end_validation_pre_s must be positive.")
+        if self.end_validation_post_s <= 0:
+            raise ConfigurationError("end_validation_post_s must be positive.")
+        if self.end_validation_max_span_s <= 0:
+            raise ConfigurationError("end_validation_max_span_s must be positive.")
+        if self.end_validation_pre_s + self.end_validation_post_s > (
+            self.end_validation_max_span_s + _BOUNDS_EPSILON_S
+        ):
+            raise ConfigurationError(
+                "end_validation_pre_s + end_validation_post_s must not exceed "
+                "end_validation_max_span_s - this window is a single coherent "
+                "request, not an open-ended search."
+            )
+        if self.end_validation_min_future_s <= 0:
+            raise ConfigurationError("end_validation_min_future_s must be positive.")
+        if self.end_validation_min_future_s > self.end_validation_post_s + _BOUNDS_EPSILON_S:
+            raise ConfigurationError(
+                "end_validation_min_future_s must not exceed end_validation_post_s - "
+                "a refined onset could never have enough trailing evidence otherwise."
+            )
         if self.max_request_bytes <= 0:
             raise ConfigurationError("max_request_bytes must be positive.")
 
@@ -188,6 +228,20 @@ class PipelineOutcome:
     this phase. A rejected or unvalidatable candidate now converges
     directly on ABSTAIN (never confidently wrong) rather than searching
     for another candidate - see ``run_llm_timing``."""
+    pass_verdicts: dict[str, TimingVerdict] = field(default_factory=dict)
+    """Every pass's own post-grounding verdict, keyed by pass name
+    ("coarse", "fine", "end_coarse", "end_validate") - populated
+    incrementally as each pass in ``run_llm_timing`` completes, so a run
+    that abstains partway through still records what every pass *before*
+    the abstain actually said. Distinct from ``verdict`` (the run's single
+    final answer) and from the ``*_response`` fields above (the unparsed
+    provider payload): this is each pass's own candidate/refined timestamp,
+    evidence, reason codes, and raw_notes, after grounding - exactly the
+    per-pass detail a real-clip failure needs to be diagnosed without
+    another paid rerun (supervisor-directed, see
+    diagnostics/llm_spike/DESIGN.md). ``TimingVerdict.raw_notes`` is already
+    sanitized/bounded (see ``redaction.py``); nothing here ever carries
+    image bytes or credentials."""
 
     @property
     def total_retries(self) -> int:
@@ -291,6 +345,7 @@ class PipelineOutcome:
             "total_tokens": self.total_tokens,
             "estimated_cost_usd": self.estimated_cost_usd(),
             "pricing_table_version": PRICING_TABLE_VERSION,
+            "pass_verdicts": {name: v.to_dict() for name, v in self.pass_verdicts.items()},
         }
 
 
@@ -704,10 +759,17 @@ def _validate_grounding(
 
 
 def _abstain_outcome(
-    verdict: TimingVerdict, coarse_response: RawProviderResponse
+    verdict: TimingVerdict,
+    coarse_response: RawProviderResponse,
+    *,
+    pass_verdicts: dict[str, TimingVerdict] | None = None,
 ) -> PipelineOutcome:
     return PipelineOutcome(
-        verdict=verdict, event=None, coarse_response=coarse_response, fine_response=None
+        verdict=verdict,
+        event=None,
+        coarse_response=coarse_response,
+        fine_response=None,
+        pass_verdicts=dict(pass_verdicts) if pass_verdicts else {},
     )
 
 
@@ -751,6 +813,7 @@ def run_llm_timing(
     """
     cfg = config or PipelineConfig()
     cfg.validate()
+    pass_verdicts: dict[str, TimingVerdict] = {}
 
     with VideoReader(video_path, video_info).open() as reader:
         duration_s = reader.info.duration_s
@@ -813,8 +876,9 @@ def run_llm_timing(
             max_uncertainty_s=cfg.max_uncertainty_s,
         )
 
+        pass_verdicts["coarse"] = coarse_verdict
         if coarse_verdict.status is not TimingStatus.CONFIRMED:
-            return _abstain_outcome(coarse_verdict, coarse_response)
+            return _abstain_outcome(coarse_verdict, coarse_response, pass_verdicts=pass_verdicts)
 
         assert coarse_verdict.start_s is not None and coarse_verdict.end_s is not None
         # The fine pass now asks about the start ONLY - a single window,
@@ -877,6 +941,7 @@ def run_llm_timing(
                 event=None,
                 coarse_response=coarse_response,
                 fine_response=_unsent_response(abstain.raw_notes),
+                pass_verdicts=dict(pass_verdicts),
             )
 
         fine_request = ProviderRequest(
@@ -907,12 +972,14 @@ def run_llm_timing(
             max_uncertainty_s=cfg.max_uncertainty_s,
         )
 
+        pass_verdicts["fine"] = fine_verdict
         if fine_verdict.status is not TimingStatus.CONFIRMED:
             return PipelineOutcome(
                 verdict=fine_verdict,
                 event=None,
                 coarse_response=coarse_response,
                 fine_response=fine_response,
+                pass_verdicts=dict(pass_verdicts),
             )
 
         # The end is nominated by ONE whole-clip (post-start), sparsely
@@ -981,6 +1048,7 @@ def run_llm_timing(
                 event=None,
                 coarse_response=coarse_response,
                 fine_response=fine_response,
+                pass_verdicts=dict(pass_verdicts),
             )
 
         end_coarse_request = ProviderRequest(
@@ -1007,6 +1075,7 @@ def run_llm_timing(
             end_region=end_coarse_region,
             max_uncertainty_s=cfg.max_uncertainty_s,
         )
+        pass_verdicts["end_coarse"] = end_coarse_verdict
         if end_coarse_verdict.status is not TimingStatus.CONFIRMED:
             return PipelineOutcome(
                 verdict=end_coarse_verdict,
@@ -1014,6 +1083,7 @@ def run_llm_timing(
                 coarse_response=coarse_response,
                 fine_response=fine_response,
                 end_coarse_response=end_coarse_response,
+                pass_verdicts=dict(pass_verdicts),
             )
 
         # A sparse coarse candidate is never trusted on its own - it must
@@ -1025,37 +1095,22 @@ def run_llm_timing(
         assert end_coarse_verdict.end_s is not None
         candidate_ts = end_coarse_verdict.end_s
 
-        # The "at least ~2s future context" rule is enforced structurally
-        # here, not left to the model noticing a silently-shortened horizon
-        # and self-abstaining per the prompt: a candidate this close to the
-        # end of the clip can never receive the full mandatory validation
-        # horizon, so the pipeline refuses to even attempt the follow-up
-        # (supervisor-directed, see diagnostics/llm_spike/DESIGN.md).
-        if candidate_ts + cfg.end_validation_horizon_s > duration_s:
-            abstain = TimingVerdict.abstain(
-                reason_codes=("insufficient_future_context",),
-                model_id=end_coarse_verdict.model_id,
-                prompt_version=PROMPT_END_COARSE_V2_ID,
-                raw_notes=(
-                    f"candidate at t={candidate_ts:.2f}s needs "
-                    f"{cfg.end_validation_horizon_s:.2f}s of future context to validate, "
-                    f"but the clip ends at t={duration_s:.2f}s "
-                    f"({duration_s - candidate_ts:.2f}s available)"
-                ),
-            )
-            return PipelineOutcome(
-                verdict=abstain,
-                event=None,
-                coarse_response=coarse_response,
-                fine_response=fine_response,
-                end_coarse_response=end_coarse_response,
-            )
-
-        validation_lo = max(locked_start_s, candidate_ts - cfg.end_validation_baseline_s)
-        # Never clamped by duration_s here - the check above already
-        # guarantees the full horizon fits, so every validation request
-        # gets the mandatory horizon in full, never a silently-shortened one.
-        validation_hi = candidate_ts + cfg.end_validation_horizon_s
+        # The dense validation window is a WIDE, coherent region around the
+        # sparse candidate, not a narrow point-anchored one: three
+        # consecutive real gate-1 reruns nominated candidates at 16.5s,
+        # 18.5s, and 21.5s against a true break near 20.5s - the sparse
+        # end-coarse pass's own error can exceed a few seconds in either
+        # direction, and a window built only from a tight baseline/horizon
+        # around a wrong candidate structurally excludes the true break,
+        # whatever the candidate turns out to be. Clamped by locked_start_s
+        # and duration_s (never past the clip, never before the confirmed
+        # start); PipelineConfig.validate() already guarantees
+        # end_validation_pre_s + end_validation_post_s fits the hard
+        # end_validation_max_span_s cap, so this is still one coherent
+        # request, never a multi-candidate search (supervisor-directed, see
+        # diagnostics/llm_spike/DESIGN.md).
+        validation_lo = max(locked_start_s, candidate_ts - cfg.end_validation_pre_s)
+        validation_hi = min(duration_s, candidate_ts + cfg.end_validation_post_s)
         validation_frames = _build_validation_frames(
             reader,
             candidate_ts=candidate_ts,
@@ -1083,6 +1138,7 @@ def run_llm_timing(
                 coarse_response=coarse_response,
                 fine_response=fine_response,
                 end_coarse_response=end_coarse_response,
+                pass_verdicts=dict(pass_verdicts),
             )
 
         validation_request = ProviderRequest(
@@ -1112,26 +1168,29 @@ def run_llm_timing(
         if validation_verdict.status is TimingStatus.CONFIRMED:
             # The validation pass may refine the onset to a different
             # timestamp than the sparse candidate (see PROMPT_END_VALIDATE_V2)
-            # - so the "full future horizon" guarantee established above for
-            # candidate_ts must be re-checked against whatever timestamp was
-            # actually reported: refining forward, toward the window's own
-            # edge, can leave less than the mandatory horizon of *submitted*
-            # evidence after it, which the pipeline must catch structurally
-            # rather than trust the model's own compliance for
-            # (supervisor-directed, see diagnostics/llm_spike/DESIGN.md).
+            # - so the future-evidence requirement is checked against
+            # whatever timestamp was actually reported, using the window's
+            # own actual (possibly clip-clamped) upper bound - never the
+            # nominal end_validation_post_s sizing value: a candidate near
+            # the clip's end still gets a window and a chance at CONFIRMED,
+            # but only if the refined onset it reports still has
+            # end_validation_min_future_s of *submitted* evidence after it
+            # within that window (supervisor-directed, see
+            # diagnostics/llm_spike/DESIGN.md).
             assert validation_verdict.end_s is not None
-            if validation_verdict.end_s + cfg.end_validation_horizon_s > (
+            if validation_verdict.end_s + cfg.end_validation_min_future_s > (
                 validation_hi + _BOUNDS_EPSILON_S
             ):
                 validation_verdict = _grounding_abstain(
                     validation_verdict,
                     "insufficient_future_context",
                     f"refined onset at t={validation_verdict.end_s:.3f}s needs "
-                    f"{cfg.end_validation_horizon_s:.2f}s of future context within this "
-                    f"window, but only {validation_hi - validation_verdict.end_s:.2f}s of "
-                    f"submitted evidence follows it (window ends at "
-                    f"t={validation_hi:.2f}s)",
+                    f"{cfg.end_validation_min_future_s:.2f}s of future context within "
+                    f"this window, but only "
+                    f"{validation_hi - validation_verdict.end_s:.2f}s of submitted "
+                    f"evidence follows it (window ends at t={validation_hi:.2f}s)",
                 )
+        pass_verdicts["end_validate"] = validation_verdict
         if validation_verdict.status is not TimingStatus.CONFIRMED:
             # Rejected (trend didn't hold) or couldn't be validated at all
             # (insufficient future context, ambiguous, malformed, or
@@ -1145,6 +1204,7 @@ def run_llm_timing(
                 fine_response=fine_response,
                 end_coarse_response=end_coarse_response,
                 end_validation_response=validation_response,
+                pass_verdicts=dict(pass_verdicts),
             )
 
         # Report the dense validation pass's own (possibly refined) onset,
@@ -1216,6 +1276,7 @@ def run_llm_timing(
                 "coarse_start_s": coarse_verdict.start_s,
                 "coarse_end_s": coarse_verdict.end_s,
                 "end_coarse_candidate_s": candidate_ts,
+                "end_validation_window_s": [validation_lo, validation_hi],
             },
         )
         return PipelineOutcome(
@@ -1225,4 +1286,5 @@ def run_llm_timing(
             fine_response=fine_response,
             end_coarse_response=end_coarse_response,
             end_validation_response=validation_response,
+            pass_verdicts=dict(pass_verdicts),
         )
