@@ -112,6 +112,29 @@ def test_sends_one_text_and_one_image_part_per_frame_plus_the_prompt():
     assert parts[2]["inline_data"]["mime_type"] == "image/jpeg"
 
 
+def test_a_candidate_marked_frame_gets_a_distinguishing_label():
+    client = _FakeClient(lambda model, parts, cfg: OpenAICallResult(text=CONFIRMED_JSON))
+    provider = OpenAITimingProvider(client, sleep_fn=_RecordingSleep())
+    request = ProviderRequest(
+        prompt_version="test-v1",
+        prompt_text="analyze this",
+        frames=(
+            _frame(4.0),
+            TimedFrame(
+                timestamp_s=10.0,
+                image_bytes=b"\xff\xd8\xff\xe0fakejpeg",
+                media_type="image/jpeg",
+                is_candidate=True,
+            ),
+        ),
+        pass_name="end_validate",
+    )
+    provider.analyze(request)
+    parts = client.calls[0]["parts"]
+    assert parts[1]["text"] == "[frame at t=4.000s]"
+    assert parts[3]["text"] == "[CANDIDATE frame at t=10.000s]"
+
+
 def test_response_round_trips_through_parse_raw_response_to_confirmed():
     client = _FakeClient(lambda model, parts, cfg: OpenAICallResult(text=CONFIRMED_JSON))
     provider = OpenAITimingProvider(client, sleep_fn=_RecordingSleep())
@@ -383,6 +406,19 @@ def test_response_schema_for_end_scan_deduplicates_and_sorts_timestamps():
     schema = _response_schema_for_pass("end_scan", [21.8, 20.0, 21.8, 23.0, 20.6])
     enum = schema["properties"]["start_s"]["anyOf"][0]["enum"]
     assert enum == [20.0, 20.6, 21.8, 23.0]
+
+
+def test_response_schema_for_end_validate_constrains_start_and_end_to_submitted_timestamps():
+    # Trend-validation requests carry the same timestamp-fabrication risk
+    # as an end-scan window (the model must echo the CANDIDATE frame's own
+    # timestamp verbatim) - the schema constrains it identically.
+    window_timestamps = [9.0, 9.5, 10.0, 10.5, 11.0, 11.5, 12.0]
+    schema = _response_schema_for_pass("end_validate", window_timestamps)
+    for field in ("start_s", "end_s"):
+        prop = schema["properties"][field]
+        assert "anyOf" in prop
+        numeric_branch = next(b for b in prop["anyOf"] if b.get("type") == "number")
+        assert numeric_branch["enum"] == window_timestamps
 
 
 def test_response_schema_for_coarse_and_fine_is_unconstrained():

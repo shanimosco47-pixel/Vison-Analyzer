@@ -51,6 +51,31 @@ asks only about the start, over only a start window, reusing
 ``PROMPT_END_SCAN_V2`` does (a degenerate point, ``start_s == end_s``) -
 grounding then only has one boundary's claim to check, independent of
 anything about the end.
+
+``PROMPT_END_VALIDATE_V1`` is a follow-up, used only after a chronological
+end-scan window has already produced a CONFIRMED candidate break (see
+``pipeline._build_validation_frames`` and ``pipeline.run_llm_timing``'s
+trend-validation follow-up request). A real gate-1 run showed that a
+single window's own judgement is not enough on its own: the first
+end-scan window (starting right at the confirmed start, before the onset
+fix above existed) still saw the stream's own onset transition and
+mistook it for a break. The onset fix keeps that specific case from
+recurring structurally, but the supervisor's own follow-up authorization
+generalizes the underlying lesson: a real break is the onset of a
+*sustained* shortening trend, not a single frame that happens to look
+shorter - a momentary contrast/camera artifact can look identical to a
+genuine break in one frame alone. This prompt asks the model to check ONE
+already-proposed candidate timestamp against the frames that come after
+it (a bounded validation horizon), rather than accepting the first
+plausible-looking window on its own. The candidate frame is identified by
+a distinguishing frame label ("CANDIDATE frame" vs plain "frame" - see
+``gemini_provider._build_parts``/``openai_provider._build_parts``) rather
+than a number embedded in the prompt text itself, so this prompt's own
+wording stays static and version-pinned like every other one here. Reuses
+``schema.TimingVerdict``'s existing degenerate-point shape exactly like
+``PROMPT_END_SCAN_V2``/``PROMPT_START_REFINE_V1`` - CONFIRMED means the
+candidate is validated (echo its own timestamp back), ABSTAIN means it is
+rejected (the trend didn't hold) or there isn't enough evidence to judge.
 """
 
 from __future__ import annotations
@@ -352,11 +377,103 @@ null, and explain why in reason_codes. Do not invent a confident-sounding
 timestamp when the evidence does not support one.
 """
 
+PROMPT_END_VALIDATE_V1_ID = "zahn-efflux-end-validate-v1"
+
+PROMPT_END_VALIDATE_V1 = """\
+You are analyzing frames from a Zahn cup viscosity test video: a short
+baseline period, then a specific CANDIDATE break, then a validation
+period after it. One frame in this batch is labelled "[CANDIDATE frame at
+t=...s]" - all the others are labelled plainly, "[frame at t=...s]". An
+earlier pass flagged the CANDIDATE frame as a *possible* break; you are
+being asked to VALIDATE or REJECT it, not to find a different one.
+
+Each frame is labelled with its exact timestamp in seconds. Frame
+selection was done deterministically by the calling pipeline, not by you;
+rely only on the timestamps given.
+
+MEASUREMENT RULE (use exactly this rule, do not invent your own):
+- Before the CANDIDATE frame, the connected, outlet-attached stream has an
+  established, roughly stable reach - use those frames as the baseline.
+- A candidate break is VALIDATED only if the frames after it show a
+  clear, SUSTAINED net-shortening trend: checkpoint by checkpoint through
+  to the end of this batch, the connected stream's reach keeps getting
+  shorter than it was at the candidate frame - not just a single shorter
+  frame at the candidate itself.
+- A brief re-extension (the reach lengthening slightly at some point after
+  the candidate) does not by itself invalidate it, AS LONG AS later frames
+  shorten again and reach a point shorter than any point already seen -
+  the overall trend must still be net shortening, never just recovering
+  back toward the baseline and stopping there.
+- If instead the reach returns to (or back toward) the established
+  baseline reach and STAYS there through the rest of this batch, rather
+  than continuing to shorten, that is a visual/camera/contrast artifact,
+  not a real break: REJECT the candidate. Use reason_codes including
+  "trend_not_sustained".
+- Drops that have already detached and fallen below the connected
+  stream's own tip are not part of the stream's reach - judge the
+  connected segment only, never any separated droplets below it.
+- If this batch simply does not contain enough frames after the candidate
+  to judge a sustained trend, or the evidence could genuinely go either
+  way, REJECT the candidate for lack of evidence rather than guess. Use
+  reason_codes including "insufficient_future_context" (not enough
+  frames) or "ambiguous_trend" (frames present, but inconclusive), as
+  appropriate.
+
+TIMESTAMP RULE (read this carefully): if validated, start_s and end_s
+must be COPIED EXACTLY, character-for-character, from the "[CANDIDATE
+frame at t=...s]" label above - the candidate's own timestamp, unchanged.
+Never compute, estimate, or substitute a different frame's timestamp,
+even a later one that also looks like a break - validating means
+confirming THIS candidate, not proposing a new one.
+
+HAZARDS SPECIFIC TO THIS FOOTAGE:
+- The cup, stream and background are often close to the same pale/dusty
+  colour (industrial environment) - contrast can be very low. A drop in
+  raw pixel brightness alone is not evidence of shortening: look for the
+  connected stream's own geometric reach, not an absolute brightness
+  threshold.
+- The footage is handheld - there is camera shake. Do not confuse
+  whole-frame motion (camera movement) with real motion of the stream
+  itself.
+- If no clear geometric edge is visible and the evidence is genuinely
+  ambiguous, reject the candidate rather than guess.
+
+OUTPUT: reply with a single JSON object and nothing else (no prose before
+or after it), matching exactly this shape. This reports a single moment
+(the candidate, if validated), not an interval - set start_s and end_s to
+the SAME timestamp, and start_uncertainty_s/end_uncertainty_s to the same
+value:
+
+{
+  "status": "confirmed" | "abstain",
+  "start_s": <float seconds, copied exactly from the CANDIDATE frame label
+              above - identical to end_s; or null if rejecting>,
+  "end_s": <float seconds, copied exactly from the CANDIDATE frame label
+            above - identical to start_s; or null if rejecting>,
+  "start_uncertainty_s": <float, your own +/- bound on the timestamp>,
+  "end_uncertainty_s": <float, the same +/- bound as start_uncertainty_s>,
+  "confidence": <float 0..1>,
+  "reason_codes": [<short machine-readable strings, e.g.
+                     "trend_not_sustained", "insufficient_future_context",
+                     "ambiguous_trend", "weak_contrast", "camera_motion">],
+  "evidence_frame_timestamps_s": [<frame timestamps from THIS batch you
+                                     actually inspected - baseline and
+                                     post-candidate checkpoints alike>],
+  "raw_notes": "<short free-text explanation, for a human audit log only>"
+}
+
+If you are not confident the trend is sustained, set "status" to
+"abstain", leave start_s/end_s null, and explain why in reason_codes. Do
+not invent a confident-sounding validation when the evidence does not
+support one.
+"""
+
 PROMPTS: dict[str, str] = {
     PROMPT_V1_ID: PROMPT_V1,
     PROMPT_END_SCAN_V1_ID: PROMPT_END_SCAN_V1,
     PROMPT_END_SCAN_V2_ID: PROMPT_END_SCAN_V2,
     PROMPT_START_REFINE_V1_ID: PROMPT_START_REFINE_V1,
+    PROMPT_END_VALIDATE_V1_ID: PROMPT_END_VALIDATE_V1,
 }
 
 

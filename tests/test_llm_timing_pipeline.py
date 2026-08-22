@@ -31,6 +31,30 @@ from app.errors import ConfigurationError
 PROMPT_VERSION = "test-prompt-v1"
 
 
+def _candidate_timestamp(request: ProviderRequest) -> float:
+    """The timestamp of the frame the pipeline marked as the trend-
+    validation candidate (see ``TimedFrame.is_candidate``) - every
+    "end_validate" request has exactly one."""
+    for frame in request.frames:
+        if frame.is_candidate:
+            return frame.timestamp_s
+    raise AssertionError("end_validate request missing a candidate-marked frame")
+
+
+def _confirm_validation(
+    request: ProviderRequest, *, confidence: float = 0.9
+) -> RawProviderResponse:
+    """A perfect trend-validation stub response: always validates whichever
+    candidate the pipeline flagged. Good enough for tests whose synthetic
+    fixture has a single genuine, sustained break with no recovery - the
+    dedicated trend-validation regressions below script something more
+    specific."""
+    ts = _candidate_timestamp(request)
+    return canned_json_response(
+        start_s=ts, end_s=ts, confidence=confidence, evidence_frame_timestamps_s=(ts,)
+    )
+
+
 # --------------------------------------------------------------------------- #
 # schema.TimingVerdict invariants
 # --------------------------------------------------------------------------- #
@@ -236,6 +260,8 @@ def _stub_matching_truth(
                 confidence=fine_confidence,
                 evidence_frame_timestamps_s=(truth["flow_start_s"],),
             )
+        if request.pass_name == "end_validate":
+            return _confirm_validation(request)
         assert request.pass_name == "end_scan"
         window_times = [f.timestamp_s for f in request.frames]
         end_s = truth["flow_end_s"]
@@ -268,17 +294,21 @@ def test_pipeline_confirms_event_matching_ground_truth(zahn_video):
     assert outcome.event.status is EventStatus.CONFIRMED
     assert outcome.event.start_s == pytest.approx(zahn_video.truth["flow_start_s"])
     assert outcome.event.end_s == pytest.approx(zahn_video.truth["flow_end_s"])
-    # coarse, then fine (start), then one or more end-scan windows, stopping
-    # at the one that actually contains the true break.
+    # coarse, then fine (start), then one or more end-scan windows, each
+    # CONFIRMED window immediately followed by a trend-validation call -
+    # stopping once a candidate both occurs and validates.
     assert provider.calls[0].pass_name == "coarse"
     assert provider.calls[1].pass_name == "fine"
     assert len(provider.calls[1].frames) > len(provider.calls[0].frames)
-    assert len(provider.calls) > 2
-    assert all(c.pass_name == "end_scan" for c in provider.calls[2:])
-    # The winning window's frames actually contain the true break.
-    winning_times = [f.timestamp_s for f in provider.calls[-1].frames]
+    assert len(provider.calls) > 3  # at least one end-scan window + its validation
+    assert all(c.pass_name in ("end_scan", "end_validate") for c in provider.calls[2:])
+    assert provider.calls[-1].pass_name == "end_validate"
+    assert provider.calls[-2].pass_name == "end_scan"
+    # The winning end-scan window's frames actually contain the true break.
+    winning_times = [f.timestamp_s for f in provider.calls[-2].frames]
     assert min(winning_times) <= zahn_video.truth["flow_end_s"] <= max(winning_times)
     assert outcome.end_scan_responses  # every scan call's diagnostics preserved
+    assert outcome.end_validation_responses  # every validation call's diagnostics preserved
     assert outcome.end_scan_responses[-1].model_id == outcome.verdict.model_id
 
 
@@ -541,6 +571,8 @@ def test_pipeline_end_scan_stops_at_the_first_break_ignoring_a_later_resumed_flo
             # Start-only pass now: reports the confirmed start as a
             # degenerate point, never the (discarded) end.
             return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            return _confirm_validation(request)
         end_scan_calls.append(request)
         window_times = [f.timestamp_s for f in request.frames]
         for candidate in (first_break_s, resumed_break_s):
@@ -574,7 +606,10 @@ def test_pipeline_end_scan_stops_at_the_first_break_ignoring_a_later_resumed_flo
         window_times = [f.timestamp_s for f in call.frames]
         assert max(window_times) < resumed_break_s
     assert len(outcome.end_scan_responses) == len(end_scan_calls)
-    assert end_scan_calls[-1] is provider.calls[-1]
+    # The winning end-scan window is immediately followed by its (accepted)
+    # trend-validation call.
+    assert end_scan_calls[-1] is provider.calls[-2]
+    assert provider.calls[-1].pass_name == "end_validate"
 
 
 def test_pipeline_end_scan_abstains_with_no_break_found_when_the_stream_never_breaks(zahn_video):
@@ -636,6 +671,8 @@ def test_pipeline_start_confirmation_is_independent_of_a_stale_coarse_end_estima
                 end_s=zahn_video.truth["flow_start_s"],
                 confidence=0.9,
             )
+        if request.pass_name == "end_validate":
+            return _confirm_validation(request)
         # end_scan
         window_times = [f.timestamp_s for f in request.frames]
         true_end_s = zahn_video.truth["flow_end_s"]
@@ -701,6 +738,8 @@ def test_pipeline_end_scan_never_considers_the_onset_transition_as_a_candidate_b
                 end_s=zahn_video.truth["flow_start_s"],
                 confidence=0.9,
             )
+        if request.pass_name == "end_validate":
+            return _confirm_validation(request)
         end_scan_calls.append(request)
         window_times = [f.timestamp_s for f in request.frames]
         for candidate in (false_onset_break_s, true_break_s):
@@ -735,6 +774,196 @@ def test_pipeline_end_scan_never_considers_the_onset_transition_as_a_candidate_b
     for call in end_scan_calls:
         window_times = [f.timestamp_s for f in call.frames]
         assert min(window_times) > false_onset_break_s
+
+
+# --------------------------------------------------------------------------- #
+# Trend validation (supervisor-directed generalization of the onset fix
+# above): a real break is the onset of a *sustained* shortening trend, not
+# a single frame that happens to look shorter. Every end-scan candidate
+# must pass a bounded follow-up trend check before the scan stops.
+# --------------------------------------------------------------------------- #
+
+
+def test_pipeline_rejects_a_candidate_that_fully_recovers_and_keeps_scanning(zahn_video):
+    """A candidate break that looked plausible in isolation (one window)
+    but fully recovers back toward the established baseline afterward - a
+    visual/camera/contrast artifact, not a real break - must be rejected by
+    trend validation, and the chronological scan must keep going and find
+    the later, true break instead."""
+    false_candidate_s = 10.0
+    true_break_s = 16.0
+    validation_calls: list[ProviderRequest] = []
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=true_break_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            validation_calls.append(request)
+            candidate_ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+            if candidate_ts == false_candidate_s:
+                # Shortened briefly, then recovered back to the baseline
+                # reach and stayed there - reject.
+                return RawProviderResponse(
+                    model_id="stub-model",
+                    raw_text='{"status": "abstain", "reason_codes": ["trend_not_sustained"]}',
+                    latency_s=0.01,
+                )
+            return canned_json_response(
+                start_s=candidate_ts,
+                end_s=candidate_ts,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(candidate_ts,),
+            )
+        # end_scan
+        window_times = [f.timestamp_s for f in request.frames]
+        for candidate in (false_candidate_s, true_break_s):
+            if window_times and min(window_times) <= candidate <= max(window_times):
+                return canned_json_response(
+                    start_s=candidate,
+                    end_s=candidate,
+                    confidence=0.9,
+                    evidence_frame_timestamps_s=(candidate,),
+                )
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.end_s == pytest.approx(true_break_s)
+    assert outcome.event.end_s != pytest.approx(false_candidate_s)
+    # The rejected candidate really was checked and rejected, not skipped
+    # over by the scan.
+    assert any(
+        frame.timestamp_s == false_candidate_s
+        for call in validation_calls
+        for frame in call.frames
+        if frame.is_candidate
+    )
+    assert len(outcome.end_validation_responses) >= 2
+
+
+def test_pipeline_accepts_a_validated_candidate_reporting_its_own_t_not_a_later_point(zahn_video):
+    """When a candidate is validated, the final result must report the
+    candidate's OWN timestamp T - the first onset frame - never a later
+    point from within the validation window, even if the validation call's
+    own answer names a different (also-plausible) timestamp - e.g. a brief
+    re-extension followed by continued, deeper shortening that a real model
+    might cite as "where it's now clearly shorter"."""
+    candidate_s = 10.0
+    deeper_point_s = 11.5  # inside the validation horizon, later than candidate_s
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            # Validates the candidate, but (unrealistically, to prove the
+            # pipeline does not just trust this call's own numbers) echoes
+            # back a later, deeper timestamp instead of the candidate's own.
+            return canned_json_response(
+                start_s=deeper_point_s,
+                end_s=deeper_point_s,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(deeper_point_s,),
+            )
+        # end_scan
+        window_times = [f.timestamp_s for f in request.frames]
+        if window_times and min(window_times) <= candidate_s <= max(window_times):
+            return canned_json_response(
+                start_s=candidate_s,
+                end_s=candidate_s,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(candidate_s,),
+            )
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.end_s == pytest.approx(candidate_s)
+    assert outcome.event.end_s != pytest.approx(deeper_point_s)
+
+
+def test_pipeline_accepts_a_candidate_with_sustained_per_second_shortening(zahn_video):
+    """The straightforward positive case: a candidate break whose
+    post-candidate frames show a clear, sustained shortening trend -
+    evidence cited at the candidate itself plus later per-checkpoint
+    frames - is accepted on the first candidate checked, no rejection or
+    further scanning needed."""
+    candidate_s = 12.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            candidate_ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+            later_frames = sorted(
+                f.timestamp_s for f in request.frames if f.timestamp_s > candidate_ts
+            )
+            # Cite the candidate plus two later checkpoints - a stand-in for
+            # "checked roughly per second through the validation horizon".
+            checkpoints = (
+                (candidate_ts, later_frames[len(later_frames) // 2], later_frames[-1])
+                if later_frames
+                else (candidate_ts,)
+            )
+            return canned_json_response(
+                start_s=candidate_ts,
+                end_s=candidate_ts,
+                confidence=0.95,
+                evidence_frame_timestamps_s=checkpoints,
+            )
+        # end_scan
+        window_times = [f.timestamp_s for f in request.frames]
+        if window_times and min(window_times) <= candidate_s <= max(window_times):
+            return canned_json_response(
+                start_s=candidate_s,
+                end_s=candidate_s,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(candidate_s,),
+            )
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.end_s == pytest.approx(candidate_s)
+    assert len(outcome.end_validation_responses) == 1  # validated immediately, no rejects
 
 
 def test_pipeline_config_rejects_invalid_bounds():

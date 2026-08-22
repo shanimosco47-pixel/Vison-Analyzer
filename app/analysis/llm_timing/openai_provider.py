@@ -130,9 +130,10 @@ class OpenAITimingProvider:
         """
         parts = _build_parts(request)
         # pass_name/frame_timestamps_s let the real client (only) constrain
-        # the response schema for an end-scan window - see
-        # _response_schema_for_pass. Harmless additions for any other
-        # client (a fake test double just ignores unused dict keys).
+        # the response schema for an end-scan window or a trend-validation
+        # request - see _response_schema_for_pass. Harmless additions for
+        # any other client (a fake test double just ignores unused dict
+        # keys).
         generation_config = {
             "temperature": self._temperature,
             "pass_name": request.pass_name,
@@ -191,10 +192,12 @@ def _build_parts(request: ProviderRequest) -> list[dict]:
     """The same generic ``{"text": ...}``/``{"inline_data": {...}}`` shape
     ``gemini_provider._build_parts`` uses - translated into the Responses
     API's actual part shapes only inside
-    :func:`build_default_openai_client`, never here."""
+    :func:`build_default_openai_client`, never here. See that function's
+    docstring for why a candidate frame gets a distinguishing label."""
     parts: list[dict] = [{"text": request.prompt_text}]
     for frame in request.frames:
-        parts.append({"text": f"[frame at t={frame.timestamp_s:.3f}s]"})
+        label = "CANDIDATE frame" if frame.is_candidate else "frame"
+        parts.append({"text": f"[{label} at t={frame.timestamp_s:.3f}s]"})
         parts.append(
             {"inline_data": {"mime_type": frame.media_type, "image_bytes": frame.image_bytes}}
         )
@@ -267,21 +270,25 @@ def _response_schema_for_pass(pass_name: str, frame_timestamps_s: list[float]) -
     """The JSON schema passed as OpenAI's Structured Outputs
     ``text.format.schema``.
 
-    Identical for "coarse"/"fine" to every prior round. For "end_scan", a
-    live gate-1 run against gpt-4.1-mini against a real clip returned
-    ``start_s=end_s=5.533`` for a submitted window of ``[20.000,
-    23.000]``s - a value matching none of the frames actually shown.
-    ``pipeline._validate_grounding``'s ``out_of_bounds`` check safely
-    rejected it (exactly what "never confidently wrong" requires), but the
-    call itself was wasted - ~40.7s of provider latency and 134,152 tokens
-    for an answer the pipeline could never have accepted. Prompt wording
-    alone asks the model to copy a shown timestamp; this constrains the
-    *schema* so the API can only ever emit one of the timestamps actually
-    submitted for this window (or ``null``, for abstain) - OpenAI's
-    Structured Outputs (``strict: True``) validates this before the
-    response is ever returned, so a value the pipeline could never accept
-    anyway becomes structurally impossible to receive, not just something
-    the pipeline detects after paying for the call.
+    Identical for "coarse"/"fine" to every prior round. For "end_scan" and
+    "end_validate", a live gate-1 run against gpt-4.1-mini against a real
+    clip returned ``start_s=end_s=5.533`` for a submitted window of
+    ``[20.000, 23.000]``s - a value matching none of the frames actually
+    shown. ``pipeline._validate_grounding``'s ``out_of_bounds`` check
+    safely rejected it (exactly what "never confidently wrong" requires),
+    but the call itself was wasted - ~40.7s of provider latency and
+    134,152 tokens for an answer the pipeline could never have accepted.
+    Prompt wording alone asks the model to copy a shown timestamp; this
+    constrains the *schema* so the API can only ever emit one of the
+    timestamps actually submitted for this window (or ``null``, for
+    abstain) - OpenAI's Structured Outputs (``strict: True``) validates
+    this before the response is ever returned, so a value the pipeline
+    could never accept anyway becomes structurally impossible to receive,
+    not just something the pipeline detects after paying for the call.
+    "end_validate" (the trend-validation follow-up request) reuses the
+    exact same contract for the same reason: it too must echo back one
+    submitted timestamp verbatim (the CANDIDATE frame's own) rather than
+    compute one.
 
     Uses ``anyOf: [{type: number, enum: [...]}, {type: null}]`` for the
     nullable-and-constrained case rather than mixing ``null`` directly into
@@ -295,7 +302,7 @@ def _response_schema_for_pass(pass_name: str, frame_timestamps_s: list[float]) -
     ``tests/test_llm_timing_openai_provider.py``.
     """
     start_end_property: dict = {"type": ["number", "null"]}
-    if pass_name == "end_scan" and frame_timestamps_s:
+    if pass_name in ("end_scan", "end_validate") and frame_timestamps_s:
         allowed = sorted(set(frame_timestamps_s))
         start_end_property = {"anyOf": [{"type": "number", "enum": allowed}, {"type": "null"}]}
     return {

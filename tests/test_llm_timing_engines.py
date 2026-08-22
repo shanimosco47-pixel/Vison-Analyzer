@@ -100,6 +100,16 @@ def _confirms_at(start_s: float, end_s: float):
             # Start-only pass: reports the confirmed start as a degenerate
             # point, never the (discarded) end.
             return canned_json_response(start_s=start_s, end_s=start_s, confidence=0.9)
+        if request.pass_name == "end_validate":
+            # Perfect trend-validation stub: always confirms whichever
+            # candidate the pipeline flagged.
+            candidate_ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+            return canned_json_response(
+                start_s=candidate_ts,
+                end_s=candidate_ts,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(candidate_ts,),
+            )
         window_times = [f.timestamp_s for f in request.frames]
         if window_times and min(window_times) <= end_s <= max(window_times):
             return canned_json_response(

@@ -867,7 +867,7 @@ start itself, so it still showed the onset transition (nothing visible ->
 stream visible), and the model misread that transition as the break it
 was asked to find.
 
-Fixed structurally, not by prompt wording alone (commit TBD): the
+Fixed structurally, not by prompt wording alone (commit `594889f`): the
 end-scan now begins no earlier than `start_hi` - the far edge of the
 grounded start-refinement window - rather than at `locked_start_s`
 itself. Concretely, `pipeline.run_llm_timing` computes
@@ -897,3 +897,132 @@ change), green.
 
 Still an experiment. No UI, no additional providers, no unrelated
 cleanup. PR #5 stays draft - ready for the next rerun.
+
+## 17. Trend validation: a break is a sustained shortening trend, not a single frame
+
+The onset fix above (§16) closed one specific failure - the scan's own
+first window seeing the onset transition - but the supervisor's own
+follow-up authorization generalizes the lesson it exposed: a single
+window's local judgement is not enough on its own for *any* candidate,
+anywhere in the scan, because a momentary contrast/camera artifact can
+look exactly like a genuine break in one frame, wherever it happens to
+occur. The fix: a chronological end-scan window CONFIRMING is now only a
+*candidate*; before the scan stops, every candidate must also pass a
+bounded trend-validation follow-up request (commit TBD).
+
+**Contract** (verbatim from the authorization): before a candidate `T`,
+at least ~1s of frames must show an already-established, continuous,
+outlet-connected stream at a roughly stable reach (the baseline); `T`
+itself is the first clear shortening away from that baseline; frames
+after `T` (a ~2s validation horizon) are *mandatory* evidence, not
+optional - the connected reach must show sustained net shortening,
+checkpoint by checkpoint, through to the end of the horizon; a brief
+re-extension is tolerated only if later frames shorten again past the
+deepest point already seen; shortening that instead recovers back to the
+baseline and stays there is a visual/camera/contrast artifact and must be
+rejected; drops already detached from the connected stream's tip don't
+count as stream length; insufficient future context or a genuinely
+ambiguous trend must abstain rather than guess; and when validated, the
+pipeline must report `T` itself - the first onset frame - never a later
+point the validation call's own answer might name.
+
+**Implementation** (`pipeline.py`, all in `run_llm_timing`'s end-scan
+loop plus the new `_build_validation_frames` helper):
+
+- Every CONFIRMED end-scan window becomes `candidate_ts =
+  window_verdict.end_s`, not an immediate `end_candidate`. A validation
+  window `[max(locked_start_s, candidate_ts - end_validation_baseline_s),
+  min(duration_s, candidate_ts + end_validation_horizon_s)]` (new
+  `PipelineConfig` fields, default 1.0s/2.0s per the authorization's own
+  floors) is built, densely sampled the same way every other pass is, with
+  the candidate's own frame timestamp always included (unioned into the
+  dense timestamp set before extraction) and always surviving
+  budget-fitting even if thinning would otherwise have dropped it
+  (`_build_validation_frames` re-inserts it via `_merge_frames_sorted` if
+  needed) - a validation request with no labelled candidate frame at all
+  would be useless, not just imprecise.
+- The candidate frame is marked `TimedFrame.is_candidate=True`, a new
+  field threaded through unchanged for every other frame/pass. Both
+  `gemini_provider._build_parts` and `openai_provider._build_parts` label
+  it `"[CANDIDATE frame at t=...s]"` instead of the plain `"[frame at
+  t=...s]"` every other frame gets - this is how the model is told *which*
+  submitted frame is the proposed break, without putting a numeric value
+  into the (version-pinned, otherwise-static) prompt text itself, keeping
+  every prompt's own wording exactly reproducible from its
+  `prompt_version` alone, same discipline as every prompt before it.
+- The request is sent via a new prompt, `PROMPT_END_VALIDATE_V1`, with
+  `pass_name="end_validate"`, reusing `schema.TimingVerdict`'s existing
+  degenerate-point shape exactly like `PROMPT_END_SCAN_V2`/
+  `PROMPT_START_REFINE_V1` (CONFIRMED means validated - echo the
+  candidate's own timestamp back; ABSTAIN means rejected or unable to
+  judge). Grounded with the same single-region `_validate_grounding` every
+  other pass uses - no changes to that function or `_GroundingRegion`.
+  `openai_provider._response_schema_for_pass` extends its existing
+  enum-of-submitted-timestamps constraint (originally added for
+  `"end_scan"`, see §14) to also cover `"end_validate"`, for the same
+  reason: this pass must also echo one submitted timestamp verbatim, and
+  the schema makes fabricating a different one structurally impossible for
+  OpenAI's Structured Outputs to return, not just something grounding
+  detects after paying for the call.
+- On a validated candidate, `end_candidate` is set to the *original*
+  end-scan `window_verdict` - never to the validation call's own
+  verdict - so the final `start_s`/`end_s` always reports `T`, the
+  candidate's own timestamp, regardless of what the validation call itself
+  answered (per the authorization's point 7). The validation verdict's
+  confidence/reason_codes/evidence still fold into the final result for
+  audit purposes (`min()` of all three passes' confidence, union of all
+  three passes' reason_codes/evidence).
+- On a rejected or unvalidatable candidate (trend didn't hold,
+  insufficient future context, ambiguous, malformed, ungrounded, or the
+  validation request itself couldn't fit the byte budget), the pipeline
+  does **not** abstain the whole run - it keeps scanning chronologically
+  forward for a later candidate, exactly mirroring how a single window's
+  own abstain was already handled before this round. Only exhausting every
+  scan window without a validated candidate converges on the existing
+  `no_break_found` ABSTAIN.
+- `PipelineOutcome` gained `end_validation_responses` (a new tuple field,
+  parallel to `end_scan_responses`, default `()` for backward
+  compatibility), folded into `total_retries`/`total_latency_s`/
+  `total_tokens`/`estimated_cost_usd()`/`to_dict()` exactly like every
+  other pass - kept as its own field (not merged into
+  `end_scan_responses`) so `end_scan_window_count` keeps meaning "how many
+  scan windows were tried", not conflated with how many candidates were
+  checked for a sustained trend; `to_dict()` gained the parallel
+  `end_validation_call_count`/`end_validation_total_retries`/
+  `end_validation_total_latency_s` keys.
+
+**Tests**: every existing stub that scripted an "end_scan" pass with no
+"end_validate" branch would otherwise hit its own `assert
+request.pass_name == "end_scan"` or fall through to unrelated logic
+(mass test-double breakage, the same shape as every architectural round
+before this one) - fixed across `test_llm_timing_pipeline.py`,
+`test_llm_timing_frame_budget.py`, `test_llm_timing_pricing.py`,
+`test_llm_timing_engines.py`, and `test_llm_timing_eval_provider_wiring.py`
+by adding a perfect trend-validation branch (always confirms whichever
+candidate the pipeline flagged) to each. Three new regressions in
+`test_llm_timing_pipeline.py` cover exactly the three scenarios named in
+the authorization:
+`test_pipeline_rejects_a_candidate_that_fully_recovers_and_keeps_scanning`
+(transient shortening + full recovery - rejected, scan continues and
+finds the later true break),
+`test_pipeline_accepts_a_validated_candidate_reporting_its_own_t_not_a_later_point`
+(the validation call itself names a different, later "deeper" timestamp -
+proves the final result still reports the original candidate `T`, not
+that later point),
+`test_pipeline_accepts_a_candidate_with_sustained_per_second_shortening`
+(the straightforward positive case, evidence cited at per-checkpoint
+timestamps). Two more targeted provider-level tests
+(`test_a_candidate_marked_frame_gets_a_distinguishing_label`, one per
+provider) prove the CANDIDATE frame label, and one more
+(`test_response_schema_for_end_validate_constrains_start_and_end_to_submitted_timestamps`)
+proves the extended OpenAI schema constraint.
+
+**Gates**: `pytest -q` - green (464 tests total across the full repo);
+`ruff check .` / `ruff format --check .` - clean; `mypy app` - clean
+except the same pre-existing, unrelated `app/web/routes.py` finding noted
+in §11; `node --test tests_js/*.test.js` - 44/44, unaffected (Python-only
+change).
+
+Still an experiment. No UI, no additional providers, no unrelated
+cleanup beyond what this round's authorization directly required. PR #5
+stays draft - ready for the next rerun.

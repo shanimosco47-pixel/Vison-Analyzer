@@ -195,11 +195,16 @@ def _build_parts(request: ProviderRequest) -> list[dict]:
 
     One text label per frame, immediately before that frame's image, so the
     model can cite a timestamp back at us without having to infer frame
-    order from position alone.
+    order from position alone. A frame with ``is_candidate=True`` (only the
+    end-scan trend-validation pass sets this) gets a distinguishing
+    "CANDIDATE" label instead of the plain one, so the (version-pinned,
+    otherwise-static) prompt text can refer to "the CANDIDATE frame" without
+    needing to embed a numeric timestamp of its own.
     """
     parts: list[dict] = [{"text": request.prompt_text}]
     for frame in request.frames:
-        parts.append({"text": f"[frame at t={frame.timestamp_s:.3f}s]"})
+        label = "CANDIDATE frame" if frame.is_candidate else "frame"
+        parts.append({"text": f"[{label} at t={frame.timestamp_s:.3f}s]"})
         parts.append(
             {
                 "inline_data": {

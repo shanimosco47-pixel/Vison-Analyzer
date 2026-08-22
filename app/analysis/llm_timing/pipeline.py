@@ -17,7 +17,7 @@ wrong" contract this whole application is built under.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -31,6 +31,8 @@ from .pricing import PRICING_TABLE_VERSION, ModelPricing, estimate_cost_usd
 from .prompts import (
     PROMPT_END_SCAN_V2,
     PROMPT_END_SCAN_V2_ID,
+    PROMPT_END_VALIDATE_V1,
+    PROMPT_END_VALIDATE_V1_ID,
     PROMPT_START_REFINE_V1,
     PROMPT_START_REFINE_V1_ID,
 )
@@ -100,6 +102,18 @@ class PipelineConfig:
             a request that still can't fit at that floor aborts with
             ``request_too_large`` rather than sending fewer frames than the
             gate needs, or a request the provider would reject anyway.
+        end_validation_baseline_s: how much clip, immediately before a
+            chronological end-scan candidate, gets sent along with a
+            trend-validation follow-up request as the "already established,
+            continuous stream" baseline the model checks the candidate
+            against - see ``_build_validation_frames`` and ``run_llm_timing``'s
+            trend-validation follow-up request below. Supervisor-specified
+            floor is "~1s"; this is that default.
+        end_validation_horizon_s: how much clip, immediately after a
+            chronological end-scan candidate, gets sent along with the same
+            follow-up request as the evidence a sustained shortening trend
+            must hold across before the candidate is accepted.
+            Supervisor-specified floor is "~2s"; this is that default.
     """
 
     coarse_step_s: float = 0.5
@@ -112,6 +126,8 @@ class PipelineConfig:
     max_frame_dimension_px: int = 768
     jpeg_quality: int = 80
     max_request_bytes: int = 18_000_000
+    end_validation_baseline_s: float = 1.0
+    end_validation_horizon_s: float = 2.0
 
     def validate(self) -> None:
         if self.coarse_step_s <= 0:
@@ -132,6 +148,10 @@ class PipelineConfig:
             raise ConfigurationError("max_frame_dimension_px must be positive.")
         if not 1 <= self.jpeg_quality <= 100:
             raise ConfigurationError("jpeg_quality must be between 1 and 100.")
+        if self.end_validation_baseline_s <= 0:
+            raise ConfigurationError("end_validation_baseline_s must be positive.")
+        if self.end_validation_horizon_s <= 0:
+            raise ConfigurationError("end_validation_horizon_s must be positive.")
         if self.max_request_bytes <= 0:
             raise ConfigurationError("max_request_bytes must be positive.")
 
@@ -157,6 +177,14 @@ class PipelineOutcome:
     ``fine_response`` (which still holds the start-confirming call) so
     every pass's cost/latency/retries is individually inspectable, not
     collapsed into one number."""
+    end_validation_responses: tuple[RawProviderResponse, ...] = ()
+    """Every trend-validation follow-up call - one per end-scan candidate
+    that reached validation, whether it was accepted or rejected - see
+    ``_build_validation_frames``. Kept separate from ``end_scan_responses``
+    (which holds the chronological scan's own window calls) so
+    ``end_scan_window_count`` keeps meaning "how many scan windows were
+    tried", not conflated with how many candidates were checked for a
+    sustained trend."""
 
     @property
     def total_retries(self) -> int:
@@ -164,6 +192,7 @@ class PipelineOutcome:
             self.coarse_response.retries
             + (self.fine_response.retries if self.fine_response else 0)
             + sum(r.retries for r in self.end_scan_responses)
+            + sum(r.retries for r in self.end_validation_responses)
         )
 
     @property
@@ -172,12 +201,18 @@ class PipelineOutcome:
             self.coarse_response.latency_s
             + (self.fine_response.latency_s if self.fine_response else 0.0)
             + sum(r.latency_s for r in self.end_scan_responses)
+            + sum(r.latency_s for r in self.end_validation_responses)
         )
 
     @property
     def total_tokens(self) -> int | None:
         """``None`` (unknown) unless every pass that ran reported usage."""
-        parts = [self.coarse_response, self.fine_response, *self.end_scan_responses]
+        parts = [
+            self.coarse_response,
+            self.fine_response,
+            *self.end_scan_responses,
+            *self.end_validation_responses,
+        ]
         counts = []
         for response in parts:
             if response is None:
@@ -193,7 +228,12 @@ class PipelineOutcome:
         Deliberately not "sum the known ones and ignore the rest" - a
         partial total would understate cost silently. See ``pricing.py``.
         """
-        responses = [self.coarse_response, self.fine_response, *self.end_scan_responses]
+        responses = [
+            self.coarse_response,
+            self.fine_response,
+            *self.end_scan_responses,
+            *self.end_validation_responses,
+        ]
         total = 0.0
         for response in responses:
             if response is None:
@@ -228,6 +268,11 @@ class PipelineOutcome:
             "end_scan_window_count": len(self.end_scan_responses),
             "end_scan_total_retries": sum(r.retries for r in self.end_scan_responses),
             "end_scan_total_latency_s": sum(r.latency_s for r in self.end_scan_responses),
+            "end_validation_call_count": len(self.end_validation_responses),
+            "end_validation_total_retries": sum(r.retries for r in self.end_validation_responses),
+            "end_validation_total_latency_s": sum(
+                r.latency_s for r in self.end_validation_responses
+            ),
             "total_latency_s": self.total_latency_s,
             "total_retries": self.total_retries,
             "total_tokens": self.total_tokens,
@@ -435,6 +480,54 @@ def _end_scan_windows(
             break
         lo += step_s
     return windows
+
+
+def _build_validation_frames(
+    reader: VideoReader,
+    *,
+    candidate_ts: float,
+    validation_lo: float,
+    validation_hi: float,
+    fine_step_s: float,
+    max_dimension_px: int,
+    jpeg_quality: int,
+    prompt_text: str,
+    max_request_bytes: int,
+    target_tolerance_s: float,
+) -> list[TimedFrame] | None:
+    """Dense frames spanning one end-scan candidate's trend-validation
+    window - baseline before it, evidence after it - with the candidate's
+    own frame always present and marked (see ``TimedFrame.is_candidate``),
+    even if budget-fitting would otherwise have thinned it away: a
+    validation request with no labelled CANDIDATE frame at all is useless,
+    not merely imprecise, since the prompt has nothing else to point the
+    model at.
+
+    Returns ``None`` - same contract as ``_fit_frames_to_budget`` - if even
+    the sparsest allowed selection still doesn't fit the budget.
+    """
+    dense_times = sorted(
+        set(_dense_timestamps(validation_lo, validation_hi, fine_step_s)) | {candidate_ts}
+    )
+    frames_dense = _extract_frames(
+        reader, dense_times, max_dimension_px=max_dimension_px, jpeg_quality=jpeg_quality
+    )
+    min_frames = _min_frames_for_window(validation_hi - validation_lo, target_tolerance_s)
+    frames = _fit_frames_to_budget(
+        frames_dense,
+        prompt_text=prompt_text,
+        max_request_bytes=max_request_bytes,
+        min_frames=min_frames,
+    )
+    if frames is None:
+        return None
+    if not any(frame.timestamp_s == candidate_ts for frame in frames):
+        candidate_frame = next(f for f in frames_dense if f.timestamp_s == candidate_ts)
+        frames = _merge_frames_sorted(frames, [candidate_frame])
+    return [
+        replace(frame, is_candidate=True) if frame.timestamp_s == candidate_ts else frame
+        for frame in frames
+    ]
 
 
 def _coarse_timestamps(duration_s: float, step_s: float) -> list[float]:
@@ -810,12 +903,20 @@ def run_llm_timing(
             )
 
         # The end is searched for chronologically instead of asked about
-        # here, one small window at a time, stopping at the first grounded
-        # candidate - real gate-1 runs across four models found that asking
-        # for both boundaries over one wide end window let the model's own
-        # end-of-stream judgement drift toward a late final-disappearance/
-        # thinning event rather than the first genuine break. See
-        # _end_scan_windows and PROMPT_END_SCAN_V2.
+        # here, one small window at a time - real gate-1 runs across four
+        # models found that asking for both boundaries over one wide end
+        # window let the model's own end-of-stream judgement drift toward a
+        # late final-disappearance/thinning event rather than the first
+        # genuine break. See _end_scan_windows and PROMPT_END_SCAN_V2.
+        #
+        # A window CONFIRMING is only a *candidate*, not yet accepted: a
+        # single window's own local judgement is not enough on its own (a
+        # momentary contrast/camera artifact can look exactly like a break
+        # in one frame), so every candidate must also pass a bounded
+        # trend-validation follow-up - see PROMPT_END_VALIDATE_V1 below -
+        # before the scan stops. Must not stop/confirm on the first local
+        # shortening alone (supervisor-directed generalization, see
+        # diagnostics/llm_spike/DESIGN.md).
         #
         # The scan must not start at locked_start_s itself: a real gate-1
         # rerun showed the first end-scan window built that way still
@@ -842,7 +943,9 @@ def run_llm_timing(
         )
 
         end_scan_responses: list[RawProviderResponse] = []
+        end_validation_responses: list[RawProviderResponse] = []
         end_candidate: TimingVerdict | None = None
+        validation_verdict: TimingVerdict | None = None
         window_lo = window_hi = scan_from_s
         for window_lo, window_hi in scan_windows:
             window_times = _dense_timestamps(window_lo, window_hi, fine_step_s)
@@ -876,6 +979,7 @@ def run_llm_timing(
                     coarse_response=coarse_response,
                     fine_response=fine_response,
                     end_scan_responses=tuple(end_scan_responses),
+                    end_validation_responses=tuple(end_validation_responses),
                 )
 
             window_request = ProviderRequest(
@@ -903,23 +1007,105 @@ def run_llm_timing(
                 end_region=window_region,
                 max_uncertainty_s=cfg.max_uncertainty_s,
             )
-            if window_verdict.status is TimingStatus.CONFIRMED:
-                end_candidate = window_verdict
-                break
-            # ABSTAIN for this window only (no break here, ungrounded, or
-            # malformed) - the break may simply be later; keep scanning.
-            # Never treat one window's abstain as the whole run's abstain.
+            if window_verdict.status is not TimingStatus.CONFIRMED:
+                # ABSTAIN for this window only (no break here, ungrounded,
+                # or malformed) - the break may simply be later; keep
+                # scanning. Never treat one window's abstain as the whole
+                # run's abstain.
+                continue
 
-        if end_candidate is None:
+            # A single window's own local judgement is not enough on its
+            # own - a momentary contrast/camera artifact can look exactly
+            # like a genuine break in one frame. Before accepting this
+            # candidate, check it against what actually happens afterward:
+            # a bounded follow-up request with the established baseline
+            # before it and a validation horizon after it, asking whether
+            # the connected stream's reach keeps a sustained net-shortening
+            # trend rather than recovering back toward the baseline
+            # (supervisor-directed generalization of the onset fix above,
+            # see diagnostics/llm_spike/DESIGN.md). Must not stop/confirm
+            # on the first local shortening alone.
+            assert window_verdict.end_s is not None
+            candidate_ts = window_verdict.end_s
+            validation_lo = max(locked_start_s, candidate_ts - cfg.end_validation_baseline_s)
+            validation_hi = min(duration_s, candidate_ts + cfg.end_validation_horizon_s)
+            validation_frames = _build_validation_frames(
+                reader,
+                candidate_ts=candidate_ts,
+                validation_lo=validation_lo,
+                validation_hi=validation_hi,
+                fine_step_s=fine_step_s,
+                max_dimension_px=cfg.max_frame_dimension_px,
+                jpeg_quality=cfg.jpeg_quality,
+                prompt_text=PROMPT_END_VALIDATE_V1,
+                max_request_bytes=cfg.max_request_bytes,
+                target_tolerance_s=cfg.target_tolerance_s,
+            )
+            if validation_frames is None:
+                # This specific candidate's validation request doesn't fit
+                # the budget - does not mean no valid break exists later;
+                # treat it the same as a rejected candidate and keep
+                # scanning, recording an unsent placeholder for diagnostics.
+                end_validation_responses.append(
+                    _unsent_response(
+                        f"candidate at t={candidate_ts:.2f}s: validation window "
+                        f"[{validation_lo:.2f}, {validation_hi:.2f}]s still exceeds the "
+                        f"request byte budget even at the sparsest sampling that meets "
+                        f"the target tolerance"
+                    )
+                )
+                continue
+
+            validation_request = ProviderRequest(
+                prompt_version=PROMPT_END_VALIDATE_V1_ID,
+                prompt_text=PROMPT_END_VALIDATE_V1,
+                frames=tuple(validation_frames),
+                pass_name="end_validate",
+            )
+            validation_response = provider.analyze(validation_request)
+            end_validation_responses.append(validation_response)
+            candidate_verdict = parse_raw_response(
+                validation_response,
+                prompt_version=PROMPT_END_VALIDATE_V1_ID,
+                min_confidence=cfg.min_confidence,
+            )
+            validation_submitted = [frame.timestamp_s for frame in validation_frames]
+            validation_region = _GroundingRegion(
+                bounds=(validation_lo, validation_hi),
+                submitted_timestamps_s=tuple(validation_submitted),
+                time_tolerance_s=_effective_tolerance_s(validation_submitted, fine_step_s),
+            )
+            candidate_verdict = _validate_grounding(
+                candidate_verdict,
+                start_region=validation_region,
+                end_region=validation_region,
+                max_uncertainty_s=cfg.max_uncertainty_s,
+            )
+            if candidate_verdict.status is TimingStatus.CONFIRMED:
+                end_candidate = window_verdict
+                validation_verdict = candidate_verdict
+                break
+            # Rejected (trend didn't hold) or couldn't be validated at all
+            # (insufficient future context, ambiguous, malformed, or
+            # ungrounded) - this candidate does not stand; keep scanning
+            # chronologically forward for a later one.
+
+        if end_candidate is None or validation_verdict is None:
             abstain = TimingVerdict.abstain(
                 reason_codes=("no_break_found",),
-                model_id=end_scan_responses[-1].model_id if end_scan_responses else "",
+                model_id=(
+                    end_validation_responses[-1].model_id
+                    if end_validation_responses
+                    else (end_scan_responses[-1].model_id if end_scan_responses else "")
+                ),
                 prompt_version=PROMPT_END_SCAN_V2_ID,
                 raw_notes=(
                     f"scanned forward from t={scan_from_s:.2f}s (end of the grounded "
                     f"start-refinement window) to the end of the clip "
-                    f"(t={duration_s:.2f}s) in {len(end_scan_responses)} window(s); "
-                    f"no grounded break of the continuous stream was found"
+                    f"(t={duration_s:.2f}s) in {len(end_scan_responses)} window(s), "
+                    f"with {len(end_validation_responses)} candidate(s) checked for a "
+                    f"sustained trend via {PROMPT_END_VALIDATE_V1_ID}; no candidate break "
+                    f"both occurred and validated"
                 ),
             )
             return PipelineOutcome(
@@ -928,10 +1114,13 @@ def run_llm_timing(
                 coarse_response=coarse_response,
                 fine_response=fine_response,
                 end_scan_responses=tuple(end_scan_responses),
+                end_validation_responses=tuple(end_validation_responses),
             )
 
         assert end_candidate.end_s is not None
-        final_confidence = min(fine_verdict.confidence, end_candidate.confidence)
+        final_confidence = min(
+            fine_verdict.confidence, end_candidate.confidence, validation_verdict.confidence
+        )
         final_verdict = TimingVerdict(
             status=TimingStatus.CONFIRMED,
             start_s=locked_start_s,
@@ -940,18 +1129,28 @@ def run_llm_timing(
             end_uncertainty_s=end_candidate.end_uncertainty_s,
             confidence=final_confidence,
             reason_codes=tuple(
-                sorted(set(fine_verdict.reason_codes) | set(end_candidate.reason_codes))
+                sorted(
+                    set(fine_verdict.reason_codes)
+                    | set(end_candidate.reason_codes)
+                    | set(validation_verdict.reason_codes)
+                )
             ),
             evidence_frame_timestamps_s=tuple(
-                sorted(set(start_side_evidence) | set(end_candidate.evidence_frame_timestamps_s))
+                sorted(
+                    set(start_side_evidence)
+                    | set(end_candidate.evidence_frame_timestamps_s)
+                    | set(validation_verdict.evidence_frame_timestamps_s)
+                )
             ),
             model_id=end_candidate.model_id,
             prompt_version=PROMPT_END_SCAN_V2_ID,
             raw_notes=(
-                f"start confirmed via {PROMPT_START_REFINE_V1_ID}; end confirmed via "
-                f"chronological end-scan ({PROMPT_END_SCAN_V2_ID}) after "
-                f"{len(end_scan_responses) - 1} earlier window(s) with no break, "
-                f"winning window [{window_lo:.2f}, {window_hi:.2f}]s"
+                f"start confirmed via {PROMPT_START_REFINE_V1_ID}; candidate break found "
+                f"via chronological end-scan ({PROMPT_END_SCAN_V2_ID}) after "
+                f"{len(end_scan_responses) - 1} earlier window(s) with no break, at "
+                f"t={end_candidate.end_s:.3f}s in window [{window_lo:.2f}, {window_hi:.2f}]s; "
+                f"validated as a sustained trend via {PROMPT_END_VALIDATE_V1_ID} after "
+                f"{len(end_validation_responses) - 1} earlier candidate(s) rejected"
             ),
         )
 
@@ -975,9 +1174,11 @@ def run_llm_timing(
                 "model_id": final_verdict.model_id,
                 "start_prompt_version": PROMPT_START_REFINE_V1_ID,
                 "end_prompt_version": PROMPT_END_SCAN_V2_ID,
+                "end_validate_prompt_version": PROMPT_END_VALIDATE_V1_ID,
                 "coarse_start_s": coarse_verdict.start_s,
                 "coarse_end_s": coarse_verdict.end_s,
                 "end_scan_window_count": len(end_scan_responses),
+                "end_validation_call_count": len(end_validation_responses),
             },
         )
         return PipelineOutcome(
@@ -986,4 +1187,5 @@ def run_llm_timing(
             coarse_response=coarse_response,
             fine_response=fine_response,
             end_scan_responses=tuple(end_scan_responses),
+            end_validation_responses=tuple(end_validation_responses),
         )

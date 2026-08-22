@@ -66,11 +66,20 @@ class TimedFrame:
     ``video.reader.encode_jpeg``), not a raw ndarray, so this dataclass is
     safe to log, hash and replay without an OpenCV dependency at the call
     site.
+
+    ``is_candidate`` distinguishes one specific frame within a batch as the
+    subject of the request - currently only the end-scan trend-validation
+    pass (``pipeline._build_validation_frames``) uses this, to identify
+    which submitted frame is the break a prior pass proposed, without
+    putting a numeric value into the (version-pinned, otherwise-static)
+    prompt text itself. See ``gemini_provider._build_parts``/
+    ``openai_provider._build_parts`` for the resulting frame label.
     """
 
     timestamp_s: float
     image_bytes: bytes
     media_type: str = "image/jpeg"
+    is_candidate: bool = False
 
 
 @dataclass(frozen=True)

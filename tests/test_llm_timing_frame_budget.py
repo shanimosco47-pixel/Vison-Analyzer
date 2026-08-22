@@ -165,6 +165,16 @@ def _stub_matching_truth(truth: dict[str, float]):
                 confidence=0.9,
                 evidence_frame_timestamps_s=(truth["flow_start_s"],),
             )
+        if request.pass_name == "end_validate":
+            # Perfect trend-validation stub: always confirms whichever
+            # candidate the pipeline flagged.
+            candidate_ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+            return canned_json_response(
+                start_s=candidate_ts,
+                end_s=candidate_ts,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(candidate_ts,),
+            )
         assert request.pass_name == "end_scan"
         window_times = [f.timestamp_s for f in request.frames]
         end_s = truth["flow_end_s"]

@@ -35,7 +35,12 @@ from app.analysis.llm_timing.openai_provider import (
     OpenAICallResult,
     OpenAITimingProvider,
 )
-from app.analysis.llm_timing.prompts import PROMPT_END_SCAN_V2, PROMPT_START_REFINE_V1, PROMPT_V1
+from app.analysis.llm_timing.prompts import (
+    PROMPT_END_SCAN_V2,
+    PROMPT_END_VALIDATE_V1,
+    PROMPT_START_REFINE_V1,
+    PROMPT_V1,
+)
 from app.analysis.llm_timing.provider import PermanentProviderError, ProviderRequest, TimedFrame
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "llm_timing_eval.py"
@@ -68,6 +73,7 @@ _CONFIRMED_JSON = json.dumps(
 _ResponseText = str | Callable[[list[dict]], str]
 
 _FRAME_LABEL_RE = re.compile(r"\[frame at t=([\d.]+)s\]")
+_CANDIDATE_LABEL_RE = re.compile(r"\[CANDIDATE frame at t=([\d.]+)s\]")
 
 
 def _truth_aware_response(true_start_s: float, true_end_s: float) -> Callable[[list[dict]], str]:
@@ -100,6 +106,15 @@ def _truth_aware_response(true_start_s: float, true_end_s: float) -> Callable[[l
                 start_s, end_s, evidence = true_end_s, true_end_s, (true_end_s,)
             else:
                 return json.dumps({"status": "abstain", "reason_codes": ["no_break_found"]})
+        elif prompt_text == PROMPT_END_VALIDATE_V1:
+            # Perfect trend-validation stub: always confirms whichever
+            # candidate the pipeline flagged (these synthetic truths have a
+            # single genuine, sustained break with no recovery to reject).
+            candidate_text = " ".join(p.get("text", "") for p in parts[1:])
+            candidate_matches = _CANDIDATE_LABEL_RE.findall(candidate_text)
+            assert candidate_matches, "end-validate request missing a CANDIDATE frame label"
+            candidate_ts = float(candidate_matches[0])
+            start_s, end_s, evidence = candidate_ts, candidate_ts, (candidate_ts,)
         else:  # pragma: no cover - would mean a new pass was added and this helper wasn't updated
             raise AssertionError(f"unrecognized prompt text: {prompt_text[:80]!r}")
         return json.dumps(

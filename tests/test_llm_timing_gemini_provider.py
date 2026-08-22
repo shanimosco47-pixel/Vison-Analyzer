@@ -112,6 +112,29 @@ def test_sends_one_text_and_one_image_part_per_frame_plus_the_prompt():
     assert parts[2]["inline_data"]["mime_type"] == "image/jpeg"
 
 
+def test_a_candidate_marked_frame_gets_a_distinguishing_label():
+    client = _FakeClient(lambda model, parts, cfg: GeminiCallResult(text=CONFIRMED_JSON))
+    provider = GeminiTimingProvider(client, sleep_fn=_RecordingSleep())
+    request = ProviderRequest(
+        prompt_version="test-v1",
+        prompt_text="analyze this",
+        frames=(
+            _frame(4.0),
+            TimedFrame(
+                timestamp_s=10.0,
+                image_bytes=b"\xff\xd8\xff\xe0fakejpeg",
+                media_type="image/jpeg",
+                is_candidate=True,
+            ),
+        ),
+        pass_name="end_validate",
+    )
+    provider.analyze(request)
+    parts = client.calls[0]["parts"]
+    assert parts[1]["text"] == "[frame at t=4.000s]"
+    assert parts[3]["text"] == "[CANDIDATE frame at t=10.000s]"
+
+
 def test_response_round_trips_through_parse_raw_response_to_confirmed():
     client = _FakeClient(lambda model, parts, cfg: GeminiCallResult(text=CONFIRMED_JSON))
     provider = GeminiTimingProvider(client, sleep_fn=_RecordingSleep())
