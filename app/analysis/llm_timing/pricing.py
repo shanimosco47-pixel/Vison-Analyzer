@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-PRICING_TABLE_VERSION = "2026-08-22-v1"
+PRICING_TABLE_VERSION = "2026-08-22-v2"
 
 
 @dataclass(frozen=True)
@@ -50,10 +50,18 @@ class ModelPricing:
 # with a different preview model, and has been removed.) Anyone who can
 # reach those pages directly should still treat this as worth a periodic
 # recheck, not a permanently-settled fact.
+#
+# gpt-5-mini: $0.25 / 1M input tokens, $2.00 / 1M output tokens, per the
+# supervisor's authorization for the OpenAI adapter (official model record:
+# https://developers.openai.com/api/docs/models/gpt-5-mini) - this figure
+# was supplied directly by the supervisor, not independently fetched here
+# (this sandbox's network egress to developers.openai.com is blocked, same
+# as ai.google.dev above).
 PRICING_TABLE: dict[str, ModelPricing] = {
     "gemini-2.5-flash-lite": ModelPricing(
         input_usd_per_1k_tokens=0.0001, output_usd_per_1k_tokens=0.0004
     ),
+    "gpt-5-mini": ModelPricing(input_usd_per_1k_tokens=0.00025, output_usd_per_1k_tokens=0.002),
 }
 
 

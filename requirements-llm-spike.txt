@@ -1,16 +1,23 @@
-# Optional dependency for the LLM timing spike (app/analysis/llm_timing).
+# Optional dependencies for the LLM timing spike (app/analysis/llm_timing).
 #
 # Not part of requirements.txt: the spike is not wired into the main
 # application (see diagnostics/llm_spike/DESIGN.md), and nothing in it -
-# including the full test suite - imports this package at module load time.
-# gemini_provider.build_default_gemini_client is the ONLY place that needs
-# it, imported lazily inside that one function, and nothing in this spike
-# calls that function yet.
+# including the full test suite - imports either package at module load
+# time. gemini_provider.build_default_gemini_client /
+# openai_provider.build_default_openai_client are the ONLY places that need
+# them, each imported lazily inside its own one function, and nothing in
+# this spike calls either function yet.
 #
-# Install only if you're actually going to construct a live Gemini client:
+# Install only the one(s) you're actually going to construct a live client
+# for:
 #     pip install -r requirements-llm-spike.txt
 #
 # google-genai is the current GA SDK (https://pypi.org/project/google-genai/).
 # The older google-generativeai package is deprecated by Google and is
 # deliberately not used here.
 google-genai>=1.0,<2
+
+# openai is the official Python SDK (https://pypi.org/project/openai/),
+# used here only via the Responses API (client.responses.create) - never
+# the older Chat Completions API.
+openai>=1.0,<2

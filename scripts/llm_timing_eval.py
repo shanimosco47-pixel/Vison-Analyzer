@@ -12,18 +12,22 @@ how this script's output maps onto them.
 exists ONLY to prove the harness's plumbing works end-to-end. Its numbers are
 not evidence of anything about real accuracy and the report says so loudly.
 
-``--provider gemini`` is the first real provider: it lazily constructs
-``app.analysis.llm_timing.gemini_provider.build_default_gemini_client()`` (and
-therefore the real ``google-genai`` SDK - see ``requirements-llm-spike.txt``)
-only when actually selected, reading ``GEMINI_API_KEY`` from the environment
-only - never a CLI argument, a file, or anything that could end up logged or
-committed. Pass ``--model-id`` to override the pinned default
-(``gemini_provider.DEFAULT_GEMINI_MODEL_ID``).
+``--provider gemini`` and ``--provider openai`` are real providers: each
+lazily constructs its own SDK-backed client
+(``gemini_provider.build_default_gemini_client()`` /
+``openai_provider.build_default_openai_client()`` - see
+``requirements-llm-spike.txt`` for both optional SDK dependencies) only when
+actually selected, reading ``GEMINI_API_KEY``/``OPENAI_API_KEY`` from the
+environment only - never a CLI argument, a file, or anything that could end
+up logged or committed. Pass ``--model-id`` to override either one's pinned
+default (``gemini_provider.DEFAULT_GEMINI_MODEL_ID`` /
+``openai_provider.DEFAULT_OPENAI_MODEL_ID``).
 
 Usage:
     python scripts/llm_timing_eval.py manifest.json --provider stub-perfect
     python scripts/llm_timing_eval.py manifest.json --provider gemini
-    python scripts/llm_timing_eval.py manifest.json --provider gemini --model-id gemini-2.5-pro \
+    python scripts/llm_timing_eval.py manifest.json --provider openai
+    python scripts/llm_timing_eval.py manifest.json --provider openai --model-id gpt-5 \
         --json out.json
 
 Manifest format (JSON array):
@@ -119,15 +123,18 @@ def _build_provider(
     *,
     model_id: str | None = None,
     gemini_client_factory: Callable[[], Any] | None = None,
+    openai_client_factory: Callable[[], Any] | None = None,
 ) -> TimingProvider:
     """Construct the provider for one clip.
 
-    ``gemini_client_factory`` defaults to the real
-    ``gemini_provider.build_default_gemini_client`` - imported lazily, here,
-    inside this branch, so nothing in this script (or its tests) requires
-    ``google-genai`` to be installed or ``GEMINI_API_KEY`` to be set unless
-    ``--provider gemini`` is actually selected. Tests inject a fake factory
-    to verify this routing without a real key or SDK - see
+    ``gemini_client_factory``/``openai_client_factory`` default to the real
+    ``gemini_provider.build_default_gemini_client`` /
+    ``openai_provider.build_default_openai_client`` - imported lazily, here,
+    inside their own branch, so nothing in this script (or its tests)
+    requires ``google-genai``/``openai`` to be installed or
+    ``GEMINI_API_KEY``/``OPENAI_API_KEY`` to be set unless that provider is
+    actually selected. Tests inject a fake factory to verify this routing
+    without a real key or SDK - see
     ``tests/test_llm_timing_eval_provider_wiring.py``.
     """
     if name == "stub-perfect":
@@ -142,12 +149,22 @@ def _build_provider(
         factory = gemini_client_factory or build_default_gemini_client
         client = factory()
         return GeminiTimingProvider(client, model_id=model_id or DEFAULT_GEMINI_MODEL_ID)
-    # Another real provider (OpenAI / Anthropic / ...) goes here behind the
-    # same TimingProvider.analyze(ProviderRequest) -> RawProviderResponse
+    if name == "openai":
+        from app.analysis.llm_timing.openai_provider import (
+            DEFAULT_OPENAI_MODEL_ID,
+            OpenAITimingProvider,
+            build_default_openai_client,
+        )
+
+        factory = openai_client_factory or build_default_openai_client
+        client = factory()
+        return OpenAITimingProvider(client, model_id=model_id or DEFAULT_OPENAI_MODEL_ID)
+    # Another real provider (Anthropic / ...) goes here behind the same
+    # TimingProvider.analyze(ProviderRequest) -> RawProviderResponse
     # contract - not implemented in this spike.
     raise ValueError(
         f"Unknown or not-yet-implemented provider {name!r}. "
-        "'stub-perfect' (harness self-test) and 'gemini' (real provider) exist."
+        "'stub-perfect' (harness self-test), 'gemini', and 'openai' (real providers) exist."
     )
 
 
@@ -158,9 +175,14 @@ def _evaluate_clip(
     *,
     model_id: str | None = None,
     gemini_client_factory: Callable[[], Any] | None = None,
+    openai_client_factory: Callable[[], Any] | None = None,
 ) -> ClipResult:
     provider = _build_provider(
-        provider_name, entry, model_id=model_id, gemini_client_factory=gemini_client_factory
+        provider_name,
+        entry,
+        model_id=model_id,
+        gemini_client_factory=gemini_client_factory,
+        openai_client_factory=openai_client_factory,
     )
     started = time.monotonic()
     outcome = run_llm_timing(
@@ -296,13 +318,13 @@ def main() -> int:
     parser.add_argument(
         "--provider",
         default="stub-perfect",
-        choices=("stub-perfect", "gemini"),
-        help="provider to evaluate: 'stub-perfect' (harness self-test) or 'gemini' (real)",
+        choices=("stub-perfect", "gemini", "openai"),
+        help="provider to evaluate: 'stub-perfect' (harness self-test), 'gemini', or 'openai'",
     )
     parser.add_argument(
         "--model-id",
         default=None,
-        help="override the pinned default model ID (--provider gemini only)",
+        help="override the pinned default model ID (--provider gemini/openai only)",
     )
     parser.add_argument("--json", type=Path, default=None, help="also write full results as JSON")
     args = parser.parse_args()

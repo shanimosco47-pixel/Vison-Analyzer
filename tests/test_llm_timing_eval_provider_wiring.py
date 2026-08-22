@@ -1,14 +1,16 @@
-"""Offline tests for scripts/llm_timing_eval.py's ``--provider gemini`` wiring.
+"""Offline tests for scripts/llm_timing_eval.py's ``--provider gemini`` and
+``--provider openai`` wiring.
 
-These verify routing only: that selecting "gemini" builds a
-``GeminiTimingProvider`` with the right model ID, via whichever client
-factory is injected. None of this needs the real ``google-genai`` SDK
-installed or a ``GEMINI_API_KEY`` set - ``_build_provider`` takes the client
-factory as a parameter specifically so this is testable without either (see
-its own docstring in the script). Real-provider behaviour (retries, parsing,
-grounding, ...) is already covered by ``test_llm_timing_gemini_provider.py``
-and ``test_llm_timing_pipeline.py`` - this file only proves the CLI/harness
-plumbing routes to it correctly.
+These verify routing only: that selecting a real provider name builds the
+right ``TimingProvider`` with the right model ID, via whichever client
+factory is injected. None of this needs the real ``google-genai``/``openai``
+SDK installed or ``GEMINI_API_KEY``/``OPENAI_API_KEY`` set -
+``_build_provider`` takes each client factory as a parameter specifically so
+this is testable without either (see its own docstring in the script).
+Real-provider behaviour (retries, parsing, grounding, ...) is already
+covered by ``test_llm_timing_gemini_provider.py``,
+``test_llm_timing_openai_provider.py``, and ``test_llm_timing_pipeline.py``
+- this file only proves the CLI/harness plumbing routes to each correctly.
 """
 
 from __future__ import annotations
@@ -24,6 +26,11 @@ from app.analysis.llm_timing.gemini_provider import (
     DEFAULT_GEMINI_MODEL_ID,
     GeminiCallResult,
     GeminiTimingProvider,
+)
+from app.analysis.llm_timing.openai_provider import (
+    DEFAULT_OPENAI_MODEL_ID,
+    OpenAICallResult,
+    OpenAITimingProvider,
 )
 from app.analysis.llm_timing.provider import PermanentProviderError, ProviderRequest, TimedFrame
 
@@ -141,6 +148,83 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_gemini(zahn_
     assert result.coarse_model_id == DEFAULT_GEMINI_MODEL_ID
     assert result.fine_model_id == DEFAULT_GEMINI_MODEL_ID
     assert client.calls == [DEFAULT_GEMINI_MODEL_ID, DEFAULT_GEMINI_MODEL_ID]
+
+
+# --------------------------------------------------------------------------- #
+# --provider openai routing - mirrors the gemini routing tests above.
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingFakeOpenAIClient:
+    """Stands in for the real openai-SDK-backed client - records which model
+    each call requested, no network or SDK involved."""
+
+    def __init__(self, response_text: str) -> None:
+        self._response_text = response_text
+        self.calls: list[str] = []
+
+    def generate_content(self, *, model, parts, generation_config):
+        self.calls.append(model)
+        return OpenAICallResult(text=self._response_text)
+
+
+def test_build_provider_openai_routes_to_openaitimingprovider_with_default_model_id():
+    client = _RecordingFakeOpenAIClient(_CONFIRMED_JSON)
+    provider = llm_timing_eval._build_provider(
+        "openai", {}, model_id=None, openai_client_factory=lambda: client
+    )
+    assert isinstance(provider, OpenAITimingProvider)
+    response = provider.analyze(_dummy_request())
+    assert response.model_id == DEFAULT_OPENAI_MODEL_ID
+    assert client.calls == [DEFAULT_OPENAI_MODEL_ID]
+
+
+def test_build_provider_openai_honors_an_explicit_model_id():
+    client = _RecordingFakeOpenAIClient(_CONFIRMED_JSON)
+    provider = llm_timing_eval._build_provider(
+        "openai", {}, model_id="gpt-5", openai_client_factory=lambda: client
+    )
+    response = provider.analyze(_dummy_request())
+    assert response.model_id == "gpt-5"
+    assert client.calls == ["gpt-5"]
+
+
+def test_build_provider_openai_calls_the_injected_factory_lazily_not_the_real_one():
+    # No OPENAI_API_KEY is set in this test environment and openai may not
+    # even be installed - if this routed to the real
+    # build_default_openai_client it would raise before this test could
+    # observe anything. It must not.
+    calls = {"n": 0}
+
+    def fake_factory():
+        calls["n"] += 1
+        return _RecordingFakeOpenAIClient(_CONFIRMED_JSON)
+
+    llm_timing_eval._build_provider("openai", {}, model_id=None, openai_client_factory=fake_factory)
+    assert calls["n"] == 1
+
+
+def test_evaluate_clip_routes_through_the_full_harness_offline_with_openai(zahn_video):
+    """End-to-end proof the wiring works through the actual harness path
+    (_evaluate_clip -> run_llm_timing -> OpenAITimingProvider), entirely
+    offline against the existing synthetic zahn_video fixture."""
+    entry = {
+        "clip_id": "offline-routing-check-openai",
+        "video_path": str(zahn_video.path),
+        "true_start_s": zahn_video.truth["flow_start_s"],
+        "true_end_s": zahn_video.truth["flow_end_s"],
+    }
+    client = _RecordingFakeOpenAIClient(_CONFIRMED_JSON)
+    result = llm_timing_eval._evaluate_clip(
+        entry,
+        "openai",
+        llm_timing_eval.PipelineConfig(),
+        model_id=None,
+        openai_client_factory=lambda: client,
+    )
+    assert result.coarse_model_id == DEFAULT_OPENAI_MODEL_ID
+    assert result.fine_model_id == DEFAULT_OPENAI_MODEL_ID
+    assert client.calls == [DEFAULT_OPENAI_MODEL_ID, DEFAULT_OPENAI_MODEL_ID]
 
 
 # --------------------------------------------------------------------------- #
