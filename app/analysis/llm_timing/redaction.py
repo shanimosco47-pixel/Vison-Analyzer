@@ -26,6 +26,22 @@ MAX_UNTRUSTED_TEXT_LENGTH = 2000
 # larger free-text string (an error message, a model's raw_notes) rather
 # than only matching a string that is *nothing but* a secret-shaped token.
 _RAW_SECRET_SCAN_PATTERNS = (
+    # A masked/fingerprinted credential: some vendor SDKs (observed:
+    # OpenAI's own invalid-key error text) echo a key back partially
+    # masked, e.g. "sk-proj-AbCd********WxYz" - visible prefix, a run of
+    # literal asterisks standing in for the hidden middle, visible suffix.
+    # The two patterns below both require a single *contiguous* run of
+    # 10+/32+ alnum characters, so the asterisks splitting the token in two
+    # short halves let this shape slip past both of them untouched - a real
+    # gap found in a live gate-1 run (Codex/supervisor security review).
+    # Redact the *entire* matched span, prefix and suffix included: even a
+    # handful of visible characters on each side narrows a real key enough
+    # to be worth treating as sensitive, not just the masked middle. This
+    # MUST run first: if the prefix pattern below ran first, it could
+    # redact e.g. "sk-proj-AbCd1234" on its own, leaving "[redacted]"
+    # immediately before the asterisks - breaking this pattern's
+    # prefix-adjacency requirement and letting the suffix leak through.
+    re.compile(r"[A-Za-z0-9_-]{2,}\*{2,}[A-Za-z0-9_-]{2,}"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
     re.compile(r"\b[A-Za-z0-9_-]{32,}\b"),
 )

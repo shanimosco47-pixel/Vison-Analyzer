@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -292,3 +293,43 @@ def test_evaluate_clip_raw_notes_redacts_secret_shaped_text_from_a_provider_erro
     assert result.raw_notes  # present, not dropped
     assert fake_key not in result.raw_notes
     assert "[redacted]" in result.raw_notes
+
+
+def test_evaluate_clip_raw_notes_redacts_a_masked_credential_from_a_provider_error(zahn_video):
+    """Reproduces the exact gap from the first live OpenAI gate-1 run: a 401
+    invalid_api_key error whose text echoes a *masked* key
+    ("prefix********suffix") rather than one long contiguous token. Neither
+    visible fragment may reach ClipResult.raw_notes - which is exactly what
+    both the JSON output (asdict(result)) and the console "Notes:" section
+    in scripts/llm_timing_eval.py's main() print, so asserting on this one
+    field covers both surfaces."""
+    entry = {
+        "clip_id": "masked-credential-leak-check",
+        "video_path": str(zahn_video.path),
+        "true_start_s": zahn_video.truth["flow_start_s"],
+        "true_end_s": zahn_video.truth["flow_end_s"],
+    }
+    visible_prefix = "sk-proj-AbCd1234"
+    visible_suffix = "WxYz9876"
+    message = (
+        f"Error code: 401 - invalid_api_key: Incorrect API key provided: "
+        f"{visible_prefix}********{visible_suffix}."
+    )
+    client = _RaisingFakeClient(message)
+    result = llm_timing_eval._evaluate_clip(
+        entry,
+        "openai",
+        llm_timing_eval.PipelineConfig(),
+        model_id=None,
+        openai_client_factory=lambda: client,
+    )
+    assert result.status == "abstain"
+    assert result.raw_notes
+    assert visible_prefix not in result.raw_notes
+    assert visible_suffix not in result.raw_notes
+    assert "[redacted]" in result.raw_notes
+    # Same field feeds --json output directly (asdict(result)) - proves the
+    # JSON surface is safe too, not just the in-memory field.
+    serialized = json.dumps(asdict(result))
+    assert visible_prefix not in serialized
+    assert visible_suffix not in serialized
