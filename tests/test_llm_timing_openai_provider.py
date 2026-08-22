@@ -421,6 +421,23 @@ def test_response_schema_for_end_validate_constrains_start_and_end_to_submitted_
         assert numeric_branch["enum"] == window_timestamps
 
 
+def test_response_schema_for_end_coarse_constrains_start_and_end_to_submitted_timestamps():
+    # The whole-clip candidate-nomination request carries the identical
+    # timestamp-fabrication risk as end_scan/end_validate (the model must
+    # copy a shown frame label verbatim) - a gap a Codex review caught
+    # before any live rerun exercised it: this pass was missed when it
+    # replaced the chronological end-scan.
+    sparse_timestamps = [5.5, 6.0, 6.5, 15.0, 20.0, 25.9]
+    schema = _response_schema_for_pass("end_coarse", sparse_timestamps)
+    for field in ("start_s", "end_s"):
+        prop = schema["properties"][field]
+        assert "anyOf" in prop
+        numeric_branch = next(b for b in prop["anyOf"] if b.get("type") == "number")
+        null_branch = next(b for b in prop["anyOf"] if b.get("type") == "null")
+        assert numeric_branch["enum"] == sorted(sparse_timestamps)
+        assert null_branch == {"type": "null"}
+
+
 def test_response_schema_for_coarse_and_fine_is_unconstrained():
     for pass_name in ("coarse", "fine"):
         schema = _response_schema_for_pass(pass_name, [20.0, 21.0, 22.0])

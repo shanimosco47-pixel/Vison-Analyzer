@@ -1048,7 +1048,7 @@ more (787,182 tokens/~7 minutes) than one coherent request needed
 (~17,000 tokens/~22s). One coherent request with the same trend contract
 correctly confirmed the true break; 13 isolated ones did not.
 
-**Replacement** (commit TBD): the chronological end-scan (`PROMPT_END_SCAN_V1`/
+**Replacement** (commit `66b2996`): the chronological end-scan (`PROMPT_END_SCAN_V1`/
 `PROMPT_END_SCAN_V2`, `_end_scan_windows`) is retired - `pipeline.py` no
 longer builds or sends any `end_scan` request at all - replaced by a
 bounded two-stage strategy, targeting 2-3 total provider calls for the
@@ -1128,3 +1128,48 @@ Still an experiment. No UI, no additional providers, no unrelated
 cleanup beyond what this round's authorization directly required. Model
 configurability and `gpt-4.1-mini` preserved for the next rerun, per the
 authorization. PR #5 stays draft - ready for one real whole-clip rerun.
+
+## 19. Codex review of §18: OpenAI schema gap for "end_coarse", and future-context enforced structurally
+
+A Codex review of commit `66b2996` (before any live rerun) caught two
+gaps in the two-stage replacement, both fixed here (commit TBD):
+
+**OpenAI enum constraint missed the new pass.**
+`openai_provider._response_schema_for_pass` still special-cased only
+`"end_scan"` and `"end_validate"` - the new `"end_coarse"` request (the
+whole-clip candidate-nomination call) carried the exact same
+timestamp-fabrication risk the enum constraint exists to close (§14/§17),
+but was never added to the check when it replaced the chronological scan.
+Fixed by adding `"end_coarse"` to the constrained-pass tuple; grounding
+would have safely caught a fabricated candidate anyway, but the whole
+point of the schema-level fix was to make the failure structurally
+impossible rather than merely detected after paying for the call - this
+closes that gap for the pass that actually runs now. New regression:
+`test_response_schema_for_end_coarse_constrains_start_and_end_to_submitted_timestamps`.
+
+**The "~2s future context" rule was prompt-only, not structural.**
+`validation_hi` was computed as `min(duration_s, candidate_ts +
+end_validation_horizon_s)` - a candidate close enough to the end of the
+clip silently got a *shorter* validation horizon than the authorized
+minimum, relying entirely on the model itself noticing and self-abstaining
+(`PROMPT_END_VALIDATE_V1`'s own "insufficient_future_context" instruction)
+rather than any code-level guarantee. Fixed by checking `candidate_ts +
+cfg.end_validation_horizon_s > duration_s` *before* building the
+validation request at all: a candidate that can't receive the full
+horizon now abstains immediately (`insufficient_future_context`), and the
+validation call is never sent. Once past that check, `validation_hi` is
+no longer clamped by `duration_s` at all (the check already guarantees it
+fits) - every validation request that does get sent now receives the
+authorized horizon in full, never a silently-shortened one. New
+regression:
+`test_pipeline_abstains_when_the_candidate_has_no_room_for_the_full_validation_horizon`,
+proving both the immediate ABSTAIN and that the validation request is
+never sent.
+
+**Gates**: `pytest -q` - green (465 tests total across the full repo);
+`ruff check .` / `ruff format --check .` - clean; `mypy app` - clean
+except the same pre-existing, unrelated `app/web/routes.py:261` finding
+noted since §11; `node --test tests_js/*.test.js` - 44/44, unaffected.
+
+No other changes. PR #5 stays draft - ready for one real whole-clip
+rerun.

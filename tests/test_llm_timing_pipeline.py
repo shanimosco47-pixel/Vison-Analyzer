@@ -766,6 +766,51 @@ def test_pipeline_abstains_when_the_only_candidate_fails_trend_validation(zahn_v
     ]
 
 
+def test_pipeline_abstains_when_the_candidate_has_no_room_for_the_full_validation_horizon(
+    zahn_video,
+):
+    """The "at least ~2s future context" rule is enforced structurally, not
+    left to the model noticing a silently-shortened horizon and
+    self-abstaining per the prompt: a candidate close enough to the end of
+    the clip that it cannot receive the full mandatory validation horizon
+    must abstain immediately, and the validation request must never even
+    be sent (Codex review finding, see diagnostics/llm_spike/DESIGN.md)."""
+    # duration_s is 26.0 and the default end_validation_horizon_s is 2.0 -
+    # a candidate at 25.0s would need frames up to 27.0s, past the clip.
+    near_end_candidate_s = 25.0
+    validate_calls: list[ProviderRequest] = []
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=near_end_candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            validate_calls.append(request)
+            return _confirm_validation(request)
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(
+            start_s=near_end_candidate_s,
+            end_s=near_end_candidate_s,
+            confidence=0.9,
+            evidence_frame_timestamps_s=(near_end_candidate_s,),
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "insufficient_future_context" in outcome.verdict.reason_codes
+    assert validate_calls == []  # the validation request was never sent
+    assert [c.pass_name for c in provider.calls] == ["coarse", "fine", "end_coarse"]
+    assert outcome.end_validation_response is None
+
+
 def test_pipeline_accepts_a_validated_candidate_reporting_its_own_t_not_a_later_point(zahn_video):
     """When a candidate is validated, the final result must report the
     candidate's OWN timestamp T - the first onset frame - never a later

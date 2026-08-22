@@ -270,25 +270,32 @@ def _response_schema_for_pass(pass_name: str, frame_timestamps_s: list[float]) -
     """The JSON schema passed as OpenAI's Structured Outputs
     ``text.format.schema``.
 
-    Identical for "coarse"/"fine" to every prior round. For "end_scan" and
-    "end_validate", a live gate-1 run against gpt-4.1-mini against a real
-    clip returned ``start_s=end_s=5.533`` for a submitted window of
-    ``[20.000, 23.000]``s - a value matching none of the frames actually
-    shown. ``pipeline._validate_grounding``'s ``out_of_bounds`` check
-    safely rejected it (exactly what "never confidently wrong" requires),
-    but the call itself was wasted - ~40.7s of provider latency and
-    134,152 tokens for an answer the pipeline could never have accepted.
-    Prompt wording alone asks the model to copy a shown timestamp; this
-    constrains the *schema* so the API can only ever emit one of the
-    timestamps actually submitted for this window (or ``null``, for
-    abstain) - OpenAI's Structured Outputs (``strict: True``) validates
-    this before the response is ever returned, so a value the pipeline
-    could never accept anyway becomes structurally impossible to receive,
-    not just something the pipeline detects after paying for the call.
-    "end_validate" (the trend-validation follow-up request) reuses the
-    exact same contract for the same reason: it too must echo back one
-    submitted timestamp verbatim (the CANDIDATE frame's own) rather than
-    compute one.
+    Identical for "coarse"/"fine" to every prior round. For "end_scan" (the
+    now-retired chronological end-scan window, kept constrained here only
+    because ``_response_schema_for_pass`` is a pure pass_name -> schema
+    function with no opinion on which passes ``pipeline.py`` currently
+    calls) and "end_validate", a live gate-1 run against gpt-4.1-mini
+    against a real clip returned ``start_s=end_s=5.533`` for a submitted
+    window of ``[20.000, 23.000]``s - a value matching none of the frames
+    actually shown. ``pipeline._validate_grounding``'s ``out_of_bounds``
+    check safely rejected it (exactly what "never confidently wrong"
+    requires), but the call itself was wasted - ~40.7s of provider latency
+    and 134,152 tokens for an answer the pipeline could never have
+    accepted. Prompt wording alone asks the model to copy a shown
+    timestamp; this constrains the *schema* so the API can only ever emit
+    one of the timestamps actually submitted for this window (or
+    ``null``, for abstain) - OpenAI's Structured Outputs (``strict:
+    True``) validates this before the response is ever returned, so a
+    value the pipeline could never accept anyway becomes structurally
+    impossible to receive, not just something the pipeline detects after
+    paying for the call. "end_validate" (the trend-validation follow-up
+    request) reuses the exact same contract for the same reason: it too
+    must echo back one submitted timestamp verbatim (the CANDIDATE
+    frame's own) rather than compute one. "end_coarse" (the whole-clip
+    candidate-nomination request that replaced the chronological scan -
+    see ``pipeline.PROMPT_END_COARSE_V1``) carries the identical
+    fabrication risk and was missed in the round that introduced it; a
+    Codex review caught the gap before any live rerun exercised it.
 
     Uses ``anyOf: [{type: number, enum: [...]}, {type: null}]`` for the
     nullable-and-constrained case rather than mixing ``null`` directly into
@@ -302,7 +309,7 @@ def _response_schema_for_pass(pass_name: str, frame_timestamps_s: list[float]) -
     ``tests/test_llm_timing_openai_provider.py``.
     """
     start_end_property: dict = {"type": ["number", "null"]}
-    if pass_name in ("end_scan", "end_validate") and frame_timestamps_s:
+    if pass_name in ("end_scan", "end_coarse", "end_validate") and frame_timestamps_s:
         allowed = sorted(set(frame_timestamps_s))
         start_end_property = {"anyOf": [{"type": "number", "enum": allowed}, {"type": "null"}]}
     return {

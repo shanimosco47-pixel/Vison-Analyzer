@@ -1024,8 +1024,38 @@ def run_llm_timing(
         # diagnostics/llm_spike/DESIGN.md).
         assert end_coarse_verdict.end_s is not None
         candidate_ts = end_coarse_verdict.end_s
+
+        # The "at least ~2s future context" rule is enforced structurally
+        # here, not left to the model noticing a silently-shortened horizon
+        # and self-abstaining per the prompt: a candidate this close to the
+        # end of the clip can never receive the full mandatory validation
+        # horizon, so the pipeline refuses to even attempt the follow-up
+        # (supervisor-directed, see diagnostics/llm_spike/DESIGN.md).
+        if candidate_ts + cfg.end_validation_horizon_s > duration_s:
+            abstain = TimingVerdict.abstain(
+                reason_codes=("insufficient_future_context",),
+                model_id=end_coarse_verdict.model_id,
+                prompt_version=PROMPT_END_COARSE_V1_ID,
+                raw_notes=(
+                    f"candidate at t={candidate_ts:.2f}s needs "
+                    f"{cfg.end_validation_horizon_s:.2f}s of future context to validate, "
+                    f"but the clip ends at t={duration_s:.2f}s "
+                    f"({duration_s - candidate_ts:.2f}s available)"
+                ),
+            )
+            return PipelineOutcome(
+                verdict=abstain,
+                event=None,
+                coarse_response=coarse_response,
+                fine_response=fine_response,
+                end_coarse_response=end_coarse_response,
+            )
+
         validation_lo = max(locked_start_s, candidate_ts - cfg.end_validation_baseline_s)
-        validation_hi = min(duration_s, candidate_ts + cfg.end_validation_horizon_s)
+        # Never clamped by duration_s here - the check above already
+        # guarantees the full horizon fits, so every validation request
+        # gets the mandatory horizon in full, never a silently-shortened one.
+        validation_hi = candidate_ts + cfg.end_validation_horizon_s
         validation_frames = _build_validation_frames(
             reader,
             candidate_ts=candidate_ts,
