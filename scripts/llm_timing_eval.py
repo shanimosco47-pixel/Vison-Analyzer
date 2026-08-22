@@ -8,18 +8,23 @@ CONFIRMED verdict that was actually wrong by more than the tolerance), and
 latency. See ``diagnostics/llm_spike/DESIGN.md`` for gates 1-3 in full and
 how this script's output maps onto them.
 
-No real provider is implemented in this spike (needs a vendor API key,
-explicitly deferred - see the design doc). Right now the only selectable
-provider is ``--provider stub-perfect``, which answers with the manifest's
-own ground truth and exists ONLY to prove the harness's plumbing works
-end-to-end. Its numbers are not evidence of anything about real accuracy and
-the report says so loudly. Wiring in a real provider is a matter of adding
-one more branch to ``_build_provider`` behind the same ``TimingProvider``
-interface - nothing else in this file should need to change.
+``--provider stub-perfect`` answers with the manifest's own ground truth and
+exists ONLY to prove the harness's plumbing works end-to-end. Its numbers are
+not evidence of anything about real accuracy and the report says so loudly.
+
+``--provider gemini`` is the first real provider: it lazily constructs
+``app.analysis.llm_timing.gemini_provider.build_default_gemini_client()`` (and
+therefore the real ``google-genai`` SDK - see ``requirements-llm-spike.txt``)
+only when actually selected, reading ``GEMINI_API_KEY`` from the environment
+only - never a CLI argument, a file, or anything that could end up logged or
+committed. Pass ``--model-id`` to override the pinned default
+(``gemini_provider.DEFAULT_GEMINI_MODEL_ID``).
 
 Usage:
     python scripts/llm_timing_eval.py manifest.json --provider stub-perfect
-    python scripts/llm_timing_eval.py manifest.json --provider stub-perfect --json out.json
+    python scripts/llm_timing_eval.py manifest.json --provider gemini
+    python scripts/llm_timing_eval.py manifest.json --provider gemini --model-id gemini-2.5-pro \
+        --json out.json
 
 Manifest format (JSON array):
     [
@@ -35,8 +40,10 @@ import json
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -105,22 +112,55 @@ class _PerfectStubProvider:
         )
 
 
-def _build_provider(name: str, entry: dict) -> TimingProvider:
+def _build_provider(
+    name: str,
+    entry: dict,
+    *,
+    model_id: str | None = None,
+    gemini_client_factory: Callable[[], Any] | None = None,
+) -> TimingProvider:
+    """Construct the provider for one clip.
+
+    ``gemini_client_factory`` defaults to the real
+    ``gemini_provider.build_default_gemini_client`` - imported lazily, here,
+    inside this branch, so nothing in this script (or its tests) requires
+    ``google-genai`` to be installed or ``GEMINI_API_KEY`` to be set unless
+    ``--provider gemini`` is actually selected. Tests inject a fake factory
+    to verify this routing without a real key or SDK - see
+    ``tests/test_llm_timing_eval_provider_wiring.py``.
+    """
     if name == "stub-perfect":
         return _PerfectStubProvider(entry["true_start_s"], entry["true_end_s"])
-    # A real provider (OpenAI / Anthropic / Google) goes here behind the same
-    # TimingProvider.analyze(ProviderRequest) -> RawProviderResponse contract.
-    # Not implemented in this spike: needs an API key (deferred - see the
-    # design doc) and must not depend on an interactive chat/Code Interpreter
-    # session per the supervisor's authorization.
+    if name == "gemini":
+        from app.analysis.llm_timing.gemini_provider import (
+            DEFAULT_GEMINI_MODEL_ID,
+            GeminiTimingProvider,
+            build_default_gemini_client,
+        )
+
+        factory = gemini_client_factory or build_default_gemini_client
+        client = factory()
+        return GeminiTimingProvider(client, model_id=model_id or DEFAULT_GEMINI_MODEL_ID)
+    # Another real provider (OpenAI / Anthropic / ...) goes here behind the
+    # same TimingProvider.analyze(ProviderRequest) -> RawProviderResponse
+    # contract - not implemented in this spike.
     raise ValueError(
         f"Unknown or not-yet-implemented provider {name!r}. "
-        "Only 'stub-perfect' (harness self-test) exists in this spike."
+        "'stub-perfect' (harness self-test) and 'gemini' (real provider) exist."
     )
 
 
-def _evaluate_clip(entry: dict, provider_name: str, config: PipelineConfig) -> ClipResult:
-    provider = _build_provider(provider_name, entry)
+def _evaluate_clip(
+    entry: dict,
+    provider_name: str,
+    config: PipelineConfig,
+    *,
+    model_id: str | None = None,
+    gemini_client_factory: Callable[[], Any] | None = None,
+) -> ClipResult:
+    provider = _build_provider(
+        provider_name, entry, model_id=model_id, gemini_client_factory=gemini_client_factory
+    )
     started = time.monotonic()
     outcome = run_llm_timing(
         Path(entry["video_path"]),
@@ -253,7 +293,13 @@ def main() -> int:
     parser.add_argument(
         "--provider",
         default="stub-perfect",
-        help="provider to evaluate (only 'stub-perfect' exists until a real one is wired in)",
+        choices=("stub-perfect", "gemini"),
+        help="provider to evaluate: 'stub-perfect' (harness self-test) or 'gemini' (real)",
+    )
+    parser.add_argument(
+        "--model-id",
+        default=None,
+        help="override the pinned default model ID (--provider gemini only)",
     )
     parser.add_argument("--json", type=Path, default=None, help="also write full results as JSON")
     args = parser.parse_args()
@@ -269,7 +315,9 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    results = [_evaluate_clip(entry, args.provider, config) for entry in entries]
+    results = [
+        _evaluate_clip(entry, args.provider, config, model_id=args.model_id) for entry in entries
+    ]
     summary = _summarize(results)
 
     header = (
