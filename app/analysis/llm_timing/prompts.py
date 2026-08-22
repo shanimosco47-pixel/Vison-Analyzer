@@ -13,28 +13,32 @@ strict JSON matching ``schema.TimingVerdict`` instead of a conversational
 report, since a production caller cannot ask a human to re-copy the answer
 into the right shape.
 
-``PROMPT_END_SCAN_V1`` (superseded by V2 below, kept only as the historical
-record of what a real gate-1 run was actually scored against) is used only
-by the chronological end-scan phase in ``pipeline.py`` (real gate-1 runs
-across four models converged on one shared failure: the single wide
-fine-pass window let the model's own end-of-stream judgement drift to a
-late final-disappearance/thinning event rather than the first genuine
-break). It asks a narrower question - "does the stream break for the first
-time within this specific short window" - about one small window at a
-time, reusing ``schema.TimingVerdict``'s existing shape by reporting the
-break as a degenerate point (``start_s == end_s``) rather than an interval.
-
-``PROMPT_END_SCAN_V2`` is the live end-scan prompt - identical to V1 except
-for one added "TIMESTAMP RULE" paragraph. A real gate-1 run against
-gpt-4.1-mini returned ``start_s=end_s=5.533`` for a submitted window of
-``[20.000, 23.000]``s - a value matching no frame actually shown (grounding
-safely abstained, but the call was wasted). V2 explicitly instructs the
-model to copy a labelled frame timestamp verbatim rather than compute one.
-This is defense-in-depth, prompt-level, alongside an adapter-level fix in
-``openai_provider._response_schema_for_pass``, which constrains the OpenAI
-Structured Outputs schema so a value outside the submitted window's actual
-timestamps is structurally impossible to receive back, not just something
-the pipeline detects after paying for the call.
+``PROMPT_END_SCAN_V1`` and ``PROMPT_END_SCAN_V2`` (both superseded, kept
+only as the historical record of what real gate-1 runs were actually
+scored against - ``pipeline.py`` no longer calls either) drove the
+chronological end-scan phase: real gate-1 runs across four models had
+converged on one shared failure with the *original* single wide end
+window (the model's own end-of-stream judgement drifting to a late
+final-disappearance/thinning event rather than the first genuine break),
+so V1/V2 instead asked a narrower question - "does the stream break for
+the first time within this specific short window" - about one small
+window at a time, chronologically, reusing ``schema.TimingVerdict``'s
+existing shape by reporting the break as a degenerate point
+(``start_s == end_s``). V2 added a "TIMESTAMP RULE" paragraph after a real
+gate-1 run against gpt-4.1-mini returned ``start_s=end_s=5.533`` for a
+submitted window of ``[20.000, 23.000]``s - a value matching no frame
+actually shown (grounding safely abstained, but the call was wasted) -
+instructing the model to copy a labelled frame timestamp verbatim rather
+than compute one; this is why ``openai_provider._response_schema_for_pass``
+still constrains the Structured Outputs schema the same way for the
+passes below, even though V1/V2 themselves are retired. The chronological
+scan itself was later replaced entirely: it decomposed the search into
+too many narrow, isolated windows, each missing the temporal context
+needed to judge a *sustained* trend - a real rerun let a 13-window scan
+find and then wrongly reject the true break, while one coherent request
+covering the same span with the same trend contract succeeded (see
+``PROMPT_END_COARSE_V1``/``PROMPT_END_VALIDATE_V1`` below, and
+``diagnostics/llm_spike/DESIGN.md``).
 
 ``PROMPT_START_REFINE_V1`` is used only by the fine (start-refinement) pass
 in ``pipeline.py``. It replaces the earlier design, which sent one combined
@@ -52,23 +56,29 @@ asks only about the start, over only a start window, reusing
 grounding then only has one boundary's claim to check, independent of
 anything about the end.
 
-``PROMPT_END_VALIDATE_V1`` is a follow-up, used only after a chronological
-end-scan window has already produced a CONFIRMED candidate break (see
+``PROMPT_END_VALIDATE_V1`` is a follow-up, used only after a candidate end
+has already been nominated (originally by the chronological end-scan
+above; now by ``PROMPT_END_COARSE_V1`` below - see
 ``pipeline._build_validation_frames`` and ``pipeline.run_llm_timing``'s
-trend-validation follow-up request). A real gate-1 run showed that a
-single window's own judgement is not enough on its own: the first
-end-scan window (starting right at the confirmed start, before the onset
-fix above existed) still saw the stream's own onset transition and
-mistook it for a break. The onset fix keeps that specific case from
-recurring structurally, but the supervisor's own follow-up authorization
-generalizes the underlying lesson: a real break is the onset of a
-*sustained* shortening trend, not a single frame that happens to look
-shorter - a momentary contrast/camera artifact can look identical to a
-genuine break in one frame alone. This prompt asks the model to check ONE
-already-proposed candidate timestamp against the frames that come after
-it (a bounded validation horizon), rather than accepting the first
-plausible-looking window on its own. The candidate frame is identified by
-a distinguishing frame label ("CANDIDATE frame" vs plain "frame" - see
+trend-validation follow-up request). Its own motivation predates the
+end-scan's replacement: a real gate-1 run showed that a single window's
+own judgement is not enough on its own - the first end-scan window
+(starting right at the confirmed start, before the onset fix existed)
+still saw the stream's own onset transition and mistook it for a break.
+The onset fix kept that specific case from recurring structurally, but
+the supervisor's own follow-up authorization generalizes the underlying
+lesson: a real break is the onset of a *sustained* shortening trend, not
+a single frame that happens to look shorter - a momentary contrast/camera
+artifact can look identical to a genuine break in one frame alone. This
+prompt asks the model to check ONE already-proposed candidate timestamp
+against the frames that come after it (a bounded validation horizon),
+rather than accepting the first plausible-looking answer on its own - and
+a real, isolated experiment against this exact prompt (one coherent
+request, dense frames, ~1s baseline + ~2s horizon around a known-good
+candidate) confirmed the true break within the gate-1 tolerance, which is
+what motivated retiring the chronological scan around it (see
+``PROMPT_END_COARSE_V1`` below). The candidate frame is identified by a
+distinguishing frame label ("CANDIDATE frame" vs plain "frame" - see
 ``gemini_provider._build_parts``/``openai_provider._build_parts``) rather
 than a number embedded in the prompt text itself, so this prompt's own
 wording stays static and version-pinned like every other one here. Reuses
@@ -76,6 +86,27 @@ wording stays static and version-pinned like every other one here. Reuses
 ``PROMPT_END_SCAN_V2``/``PROMPT_START_REFINE_V1`` - CONFIRMED means the
 candidate is validated (echo its own timestamp back), ABSTAIN means it is
 rejected (the trend didn't hold) or there isn't enough evidence to judge.
+
+``PROMPT_END_COARSE_V1`` is the single whole-clip (post-start), sparsely
+sampled request that nominates the one candidate ``PROMPT_END_VALIDATE_V1``
+then checks - together replacing the chronological end-scan entirely
+(``pipeline.run_llm_timing`` no longer builds or sends any
+``PROMPT_END_SCAN_V2`` window at all). The real experiment referenced
+above diagnosed *why* the 13-window chronological scan failed: decomposing
+the search into many narrow, isolated windows lost the temporal context a
+model needs to judge a sustained trend, and cost far more (787,182 tokens
+across 13 windows plus one validation call) than one coherent request
+needs. This prompt explicitly uses the sustained-shortening-onset framing
+(never the single-frame "first frame that looks shorter, do not wait for
+confirmation" framing ``PROMPT_V1`` still uses for its own end_s, which is
+never acted on downstream - see ``pipeline.run_llm_timing``) over sparse,
+uniformly-spaced frames spanning from the confirmed start to the end of
+the clip, explicitly warning against reporting the stream's final
+disappearance instead of the true onset. Reuses
+``schema.TimingVerdict``'s existing degenerate-point shape the same way
+every prompt below ``PROMPT_END_SCAN_V1`` does. Its own candidate is never
+trusted on its own - ``PROMPT_END_VALIDATE_V1`` must still confirm it -
+so this prompt only has to localize roughly, not prove anything.
 """
 
 from __future__ import annotations
@@ -468,12 +499,101 @@ not invent a confident-sounding validation when the evidence does not
 support one.
 """
 
+PROMPT_END_COARSE_V1_ID = "zahn-efflux-end-coarse-v1"
+
+PROMPT_END_COARSE_V1 = """\
+You are analyzing a Zahn cup viscosity test video. The stream's start has
+already been confirmed by an earlier pass; you are given a SPARSE batch of
+frames, spread across the rest of the clip, and asked to nominate ONE
+candidate location for where the continuous stream first begins a
+sustained shortening trend - the beginning of the real break. A later,
+much denser pass will re-examine your candidate closely and confirm or
+reject it, so your job here is coarse localization, not final proof:
+report your single best candidate even if you cannot fully confirm a
+sustained trend from these sparse samples alone.
+
+Each frame is labelled with its exact timestamp in seconds. Frame
+selection was done deterministically by the calling pipeline, not by you;
+rely only on the timestamps given - these are sparse, spread across a
+much longer span than a normal video frame rate, so consecutive labelled
+frames may be a full second or more apart.
+
+MEASUREMENT RULE (use exactly this rule, do not invent your own):
+- The connected, outlet-attached stream has an established, roughly
+  stable reach earlier in this batch - use that as the baseline.
+- Your candidate is the EARLIEST frame in this batch where the connected
+  stream's reach looks genuinely, durably shorter than that baseline -
+  not a frame where it happens to look momentarily thinner from noise,
+  contrast, or camera shake, and not the point where the stream is
+  already gone or reduced to occasional drops. If several later frames
+  also look shorter still, that is expected (a real break usually keeps
+  progressing) - report the EARLIEST one that already looks like a real,
+  ongoing narrowing, not the last one you can see.
+- Do NOT report the stream's final disappearance or the point where it
+  has already broken into intermittent drops - by then the real break
+  happened earlier, at the first frame that already showed a genuine
+  narrowing. Look for the ONSET of the narrowing, not its endpoint.
+- If nothing in this batch looks like a genuine, ongoing narrowing (the
+  stream looks equally full throughout, or you cannot tell), report
+  "abstain" with reason_codes including "no_break_found" - do not guess a
+  plausible-looking frame just because one must exist.
+
+TIMESTAMP RULE (read this carefully): start_s and end_s must be COPIED
+EXACTLY, character-for-character, from one of the "[frame at t=...s]"
+labels shown above - never computed, estimated, rounded, or interpolated
+between two labelled frames.
+
+HAZARDS SPECIFIC TO THIS FOOTAGE:
+- The cup, stream and background are often close to the same pale/dusty
+  colour (industrial environment) - contrast can be very low. A drop in
+  raw pixel brightness alone is not evidence of narrowing: look for the
+  connected stream's own geometric reach, not an absolute brightness
+  threshold.
+- The footage is handheld - there is camera shake. Do not confuse
+  whole-frame motion (camera movement) with real motion of the stream
+  itself.
+- Because these frames are sparse, a plausible-looking narrowing you see
+  in one frame might just be that frame's own noise/contrast, not a real
+  trend - the later, dense pass exists specifically to check this, so
+  when genuinely torn between two nearby candidates, prefer the EARLIER
+  one (a later pass can still reject it; missing the true onset by
+  reporting a too-late candidate cannot be corrected downstream).
+
+OUTPUT: reply with a single JSON object and nothing else (no prose before
+or after it), matching exactly this shape. This search reports a single
+moment (your candidate), not an interval - set start_s and end_s to the
+SAME timestamp, and start_uncertainty_s/end_uncertainty_s to the same
+value:
+
+{
+  "status": "confirmed" | "abstain",
+  "start_s": <float seconds, copied exactly from one of the frame labels
+              above - identical to end_s; or null if abstaining>,
+  "end_s": <float seconds, copied exactly from one of the frame labels
+            above - identical to start_s; or null if abstaining>,
+  "start_uncertainty_s": <float, your own +/- bound on the timestamp>,
+  "end_uncertainty_s": <float, the same +/- bound as start_uncertainty_s>,
+  "confidence": <float 0..1>,
+  "reason_codes": [<short machine-readable strings, e.g. "weak_contrast",
+                     "camera_motion", "no_break_found", "ambiguous_evidence">],
+  "evidence_frame_timestamps_s": [<frame timestamps you actually inspected
+                                     around your candidate and the baseline
+                                     you compared it to>],
+  "raw_notes": "<short free-text explanation, for a human audit log only>"
+}
+
+If you are not confident, set "status" to "abstain", leave start_s/end_s
+null, and explain why in reason_codes. Do not invent a confident-sounding
+timestamp when the evidence does not support one.
+"""
+
 PROMPTS: dict[str, str] = {
     PROMPT_V1_ID: PROMPT_V1,
     PROMPT_END_SCAN_V1_ID: PROMPT_END_SCAN_V1,
     PROMPT_END_SCAN_V2_ID: PROMPT_END_SCAN_V2,
     PROMPT_START_REFINE_V1_ID: PROMPT_START_REFINE_V1,
     PROMPT_END_VALIDATE_V1_ID: PROMPT_END_VALIDATE_V1,
+    PROMPT_END_COARSE_V1_ID: PROMPT_END_COARSE_V1,
 }
 
 

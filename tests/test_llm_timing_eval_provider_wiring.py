@@ -36,7 +36,7 @@ from app.analysis.llm_timing.openai_provider import (
     OpenAITimingProvider,
 )
 from app.analysis.llm_timing.prompts import (
-    PROMPT_END_SCAN_V2,
+    PROMPT_END_COARSE_V1,
     PROMPT_END_VALIDATE_V1,
     PROMPT_START_REFINE_V1,
     PROMPT_V1,
@@ -67,9 +67,10 @@ _CONFIRMED_JSON = json.dumps(
 # common case: most of these tests only care about model-ID routing, one
 # call, any well-formed CONFIRMED payload will do) or a callable taking the
 # actual ``parts`` sent for that call and returning the JSON text - needed
-# for the two full-harness tests, where the coarse/fine/end-scan passes
-# genuinely need different, window-aware answers to reach a real CONFIRMED
-# result under the chronological end-scan (see ``_truth_aware_response``).
+# for the two full-harness tests, where the coarse/fine/end-coarse/
+# end-validate passes genuinely need different answers to reach a real
+# CONFIRMED result under the two-stage end determination (see
+# ``_truth_aware_response``).
 _ResponseText = str | Callable[[list[dict]], str]
 
 _FRAME_LABEL_RE = re.compile(r"\[frame at t=([\d.]+)s\]")
@@ -79,11 +80,11 @@ _CANDIDATE_LABEL_RE = re.compile(r"\[CANDIDATE frame at t=([\d.]+)s\]")
 def _truth_aware_response(true_start_s: float, true_end_s: float) -> Callable[[list[dict]], str]:
     """Builds a ``response_text`` callable good enough to reach a real,
     grounded CONFIRMED result through the actual pipeline: it answers
-    accurately for whichever pass (coarse/fine/end-scan) the request's own
-    prompt text identifies, and - for an end-scan window - only confirms
-    the window that actually contains ``true_end_s``, abstaining
-    (``no_break_found``) for every other one, the same shape a real model's
-    answers take."""
+    accurately for whichever pass (coarse/fine/end-coarse/end-validate) the
+    request's own prompt text identifies, and - for the end-coarse call -
+    only confirms if ``true_end_s`` actually falls within the submitted
+    frames, abstaining (``no_break_found``) otherwise, the same shape a
+    real model's answer takes."""
 
     def respond(parts: list[dict]) -> str:
         prompt_text = parts[0]["text"]
@@ -99,7 +100,7 @@ def _truth_aware_response(true_start_s: float, true_end_s: float) -> Callable[[l
             start_s, end_s, evidence = true_start_s, true_end_s, (true_start_s, true_end_s)
         elif prompt_text == PROMPT_START_REFINE_V1:
             start_s, end_s, evidence = true_start_s, true_start_s, (true_start_s,)
-        elif prompt_text == PROMPT_END_SCAN_V2:
+        elif prompt_text == PROMPT_END_COARSE_V1:
             if frame_timestamps_s and min(frame_timestamps_s) <= true_end_s <= max(
                 frame_timestamps_s
             ):
@@ -226,11 +227,9 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_gemini(zahn_
     )
     assert result.coarse_model_id == DEFAULT_GEMINI_MODEL_ID
     assert result.fine_model_id == DEFAULT_GEMINI_MODEL_ID
-    # coarse, fine (start), then one or more end-scan windows, stopping at
-    # the one that actually contains the true break.
-    assert client.calls[:2] == [DEFAULT_GEMINI_MODEL_ID] * 2
-    assert len(client.calls) > 2
-    assert all(m == DEFAULT_GEMINI_MODEL_ID for m in client.calls)
+    # coarse, fine (start), one whole-clip end-coarse call, one
+    # trend-validation call - exactly four calls, not N scan windows.
+    assert client.calls == [DEFAULT_GEMINI_MODEL_ID] * 4
     assert result.status == "confirmed"
     assert result.predicted_start_s == pytest.approx(entry["true_start_s"])
     assert result.predicted_end_s == pytest.approx(entry["true_end_s"])
@@ -313,11 +312,9 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_openai(zahn_
     )
     assert result.coarse_model_id == DEFAULT_OPENAI_MODEL_ID
     assert result.fine_model_id == DEFAULT_OPENAI_MODEL_ID
-    # coarse, fine (start), then one or more end-scan windows, stopping at
-    # the one that actually contains the true break.
-    assert client.calls[:2] == [DEFAULT_OPENAI_MODEL_ID] * 2
-    assert len(client.calls) > 2
-    assert all(m == DEFAULT_OPENAI_MODEL_ID for m in client.calls)
+    # coarse, fine (start), one whole-clip end-coarse call, one
+    # trend-validation call - exactly four calls, not N scan windows.
+    assert client.calls == [DEFAULT_OPENAI_MODEL_ID] * 4
     assert result.status == "confirmed"
     assert result.predicted_start_s == pytest.approx(entry["true_start_s"])
     assert result.predicted_end_s == pytest.approx(entry["true_end_s"])

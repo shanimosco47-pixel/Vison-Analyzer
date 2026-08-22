@@ -29,8 +29,8 @@ from ...video.reader import VideoReader, encode_jpeg
 from ..base_detector import Event, EventStatus
 from .pricing import PRICING_TABLE_VERSION, ModelPricing, estimate_cost_usd
 from .prompts import (
-    PROMPT_END_SCAN_V2,
-    PROMPT_END_SCAN_V2_ID,
+    PROMPT_END_COARSE_V1,
+    PROMPT_END_COARSE_V1_ID,
     PROMPT_END_VALIDATE_V1,
     PROMPT_END_VALIDATE_V1_ID,
     PROMPT_START_REFINE_V1,
@@ -102,17 +102,17 @@ class PipelineConfig:
             a request that still can't fit at that floor aborts with
             ``request_too_large`` rather than sending fewer frames than the
             gate needs, or a request the provider would reject anyway.
-        end_validation_baseline_s: how much clip, immediately before a
-            chronological end-scan candidate, gets sent along with a
+        end_validation_baseline_s: how much clip, immediately before the
+            end-coarse pass's nominated candidate, gets sent along with a
             trend-validation follow-up request as the "already established,
             continuous stream" baseline the model checks the candidate
             against - see ``_build_validation_frames`` and ``run_llm_timing``'s
             trend-validation follow-up request below. Supervisor-specified
             floor is "~1s"; this is that default.
-        end_validation_horizon_s: how much clip, immediately after a
-            chronological end-scan candidate, gets sent along with the same
-            follow-up request as the evidence a sustained shortening trend
-            must hold across before the candidate is accepted.
+        end_validation_horizon_s: how much clip, immediately after the
+            end-coarse pass's nominated candidate, gets sent along with the
+            same follow-up request as the evidence a sustained shortening
+            trend must hold across before the candidate is accepted.
             Supervisor-specified floor is "~2s"; this is that default.
     """
 
@@ -169,30 +169,33 @@ class PipelineOutcome:
     event: Event | None
     coarse_response: RawProviderResponse
     fine_response: RawProviderResponse | None
-    end_scan_responses: tuple[RawProviderResponse, ...] = ()
-    """Every end-scan window call that came back before (and including) the
-    one that established the final end_s - see ``_end_scan_windows``. Empty
-    for a run that never reached the end-scan phase (an abstain before it,
-    or a pipeline run from before this phase existed). Kept separate from
-    ``fine_response`` (which still holds the start-confirming call) so
-    every pass's cost/latency/retries is individually inspectable, not
-    collapsed into one number."""
-    end_validation_responses: tuple[RawProviderResponse, ...] = ()
-    """Every trend-validation follow-up call - one per end-scan candidate
-    that reached validation, whether it was accepted or rejected - see
-    ``_build_validation_frames``. Kept separate from ``end_scan_responses``
-    (which holds the chronological scan's own window calls) so
-    ``end_scan_window_count`` keeps meaning "how many scan windows were
-    tried", not conflated with how many candidates were checked for a
-    sustained trend."""
+    end_coarse_response: RawProviderResponse | None = None
+    """The single whole-clip (post-start), sparsely-sampled call that
+    nominates one end candidate - see ``PROMPT_END_COARSE_V1``. ``None``
+    for a run that never reached this phase (an abstain before it). This
+    replaced a chronological multi-window scan (Codex/supervisor
+    experiment, see ``diagnostics/llm_spike/DESIGN.md``): a real gate-1
+    rerun showed that decomposing the end search into many narrow,
+    isolated windows lost the temporal context needed to judge a
+    *sustained* trend and produced a false rejection of the true break,
+    while one coherent request with the same trend contract succeeded.
+    Kept separate from ``fine_response`` so every pass's cost/latency/
+    retries is individually inspectable, not collapsed into one number."""
+    end_validation_response: RawProviderResponse | None = None
+    """The single dense, bounded trend-validation follow-up call that
+    confirms or rejects ``end_coarse_response``'s candidate - see
+    ``_build_validation_frames``. ``None`` for a run that never reached
+    this phase. A rejected or unvalidatable candidate now converges
+    directly on ABSTAIN (never confidently wrong) rather than searching
+    for another candidate - see ``run_llm_timing``."""
 
     @property
     def total_retries(self) -> int:
         return (
             self.coarse_response.retries
             + (self.fine_response.retries if self.fine_response else 0)
-            + sum(r.retries for r in self.end_scan_responses)
-            + sum(r.retries for r in self.end_validation_responses)
+            + (self.end_coarse_response.retries if self.end_coarse_response else 0)
+            + (self.end_validation_response.retries if self.end_validation_response else 0)
         )
 
     @property
@@ -200,8 +203,8 @@ class PipelineOutcome:
         return (
             self.coarse_response.latency_s
             + (self.fine_response.latency_s if self.fine_response else 0.0)
-            + sum(r.latency_s for r in self.end_scan_responses)
-            + sum(r.latency_s for r in self.end_validation_responses)
+            + (self.end_coarse_response.latency_s if self.end_coarse_response else 0.0)
+            + (self.end_validation_response.latency_s if self.end_validation_response else 0.0)
         )
 
     @property
@@ -210,8 +213,8 @@ class PipelineOutcome:
         parts = [
             self.coarse_response,
             self.fine_response,
-            *self.end_scan_responses,
-            *self.end_validation_responses,
+            self.end_coarse_response,
+            self.end_validation_response,
         ]
         counts = []
         for response in parts:
@@ -231,8 +234,8 @@ class PipelineOutcome:
         responses = [
             self.coarse_response,
             self.fine_response,
-            *self.end_scan_responses,
-            *self.end_validation_responses,
+            self.end_coarse_response,
+            self.end_validation_response,
         ]
         total = 0.0
         for response in responses:
@@ -265,13 +268,23 @@ class PipelineOutcome:
             "fine_completion_tokens": (
                 self.fine_response.completion_tokens if self.fine_response else None
             ),
-            "end_scan_window_count": len(self.end_scan_responses),
-            "end_scan_total_retries": sum(r.retries for r in self.end_scan_responses),
-            "end_scan_total_latency_s": sum(r.latency_s for r in self.end_scan_responses),
-            "end_validation_call_count": len(self.end_validation_responses),
-            "end_validation_total_retries": sum(r.retries for r in self.end_validation_responses),
-            "end_validation_total_latency_s": sum(
-                r.latency_s for r in self.end_validation_responses
+            "end_coarse_model_id": (
+                self.end_coarse_response.model_id if self.end_coarse_response else None
+            ),
+            "end_coarse_latency_s": (
+                self.end_coarse_response.latency_s if self.end_coarse_response else None
+            ),
+            "end_coarse_retries": (
+                self.end_coarse_response.retries if self.end_coarse_response else None
+            ),
+            "end_validation_model_id": (
+                self.end_validation_response.model_id if self.end_validation_response else None
+            ),
+            "end_validation_latency_s": (
+                self.end_validation_response.latency_s if self.end_validation_response else None
+            ),
+            "end_validation_retries": (
+                self.end_validation_response.retries if self.end_validation_response else None
             ),
             "total_latency_s": self.total_latency_s,
             "total_retries": self.total_retries,
@@ -902,255 +915,219 @@ def run_llm_timing(
                 fine_response=fine_response,
             )
 
-        # The end is searched for chronologically instead of asked about
-        # here, one small window at a time - real gate-1 runs across four
-        # models found that asking for both boundaries over one wide end
-        # window let the model's own end-of-stream judgement drift toward a
-        # late final-disappearance/thinning event rather than the first
-        # genuine break. See _end_scan_windows and PROMPT_END_SCAN_V2.
+        # The end is nominated by ONE whole-clip (post-start), sparsely
+        # sampled coarse request, then confirmed or rejected by ONE dense
+        # trend-validation follow-up - a bounded two-stage strategy
+        # (2 calls, not N chronological scan windows). This replaced an
+        # earlier chronological end-scan entirely: a real gate-1 experiment
+        # found that decomposing the search into many narrow, isolated
+        # windows lost the temporal context a model needs to judge a
+        # *sustained* trend - a 13-window scan found the true break's
+        # window but then wrongly rejected it, while one coherent request
+        # covering the same span with the same trend contract correctly
+        # confirmed it (787,182 tokens/~7 minutes for the 13-window scan,
+        # versus ~16,000 tokens/~22s for the isolated single-request
+        # equivalent of stage 2 below) - supervisor-directed replacement,
+        # see diagnostics/llm_spike/DESIGN.md and PROMPT_END_COARSE_V1/
+        # PROMPT_END_VALIDATE_V1. Failed validation now falls back directly
+        # to ABSTAIN (assisted/manual workflow) rather than searching for
+        # another candidate - single-shot, not a search.
         #
-        # A window CONFIRMING is only a *candidate*, not yet accepted: a
-        # single window's own local judgement is not enough on its own (a
-        # momentary contrast/camera artifact can look exactly like a break
-        # in one frame), so every candidate must also pass a bounded
-        # trend-validation follow-up - see PROMPT_END_VALIDATE_V1 below -
-        # before the scan stops. Must not stop/confirm on the first local
-        # shortening alone (supervisor-directed generalization, see
-        # diagnostics/llm_spike/DESIGN.md).
-        #
-        # The scan must not start at locked_start_s itself: a real gate-1
-        # rerun showed the first end-scan window built that way still
-        # contains the onset transition (nothing visible -> stream visible),
-        # and a model can misread that transition as a "break" (both
-        # stream_start_visible and first_break_in_window in its own reason
-        # codes) - a false-confirmed end just a fraction of a second after
-        # the true start. The fix is structural, not a prompt-wording
-        # request: the scan begins no earlier than start_hi, the far edge of
-        # the grounded start-refinement window, so no onset/pre-flow frame
-        # is ever eligible to be submitted as a candidate end timestamp in
-        # the first place (supervisor-directed fix, see
+        # The coarse candidate search must not start at locked_start_s
+        # itself: a real gate-1 rerun (against the old chronological scan)
+        # showed the first end-scan window built that way still contained
+        # the onset transition (nothing visible -> stream visible), and a
+        # model can misread that transition as a "break" - a false-
+        # confirmed end just a fraction of a second after the true start.
+        # The fix is structural, not a prompt-wording request, and applies
+        # equally here: sampling begins no earlier than start_hi, the far
+        # edge of the grounded start-refinement window, so no onset/
+        # pre-flow frame is ever eligible to be submitted as a candidate
+        # end timestamp in the first place (supervisor-directed fix, see
         # diagnostics/llm_spike/DESIGN.md).
         assert fine_verdict.start_s is not None
         locked_start_s: float = fine_verdict.start_s
         locked_start_uncertainty_s = fine_verdict.start_uncertainty_s
         start_side_evidence = fine_verdict.evidence_frame_timestamps_s
 
-        end_window_width_s = 2.0 * cfg.fine_margin_s
-        end_window_step_s = max(cfg.fine_margin_s, 1e-3)  # overlapping windows
         scan_from_s = min(max(start_hi, locked_start_s), duration_s)
-        scan_windows = _end_scan_windows(
-            scan_from_s, duration_s, end_window_width_s, end_window_step_s
+
+        end_coarse_times = _dense_timestamps(scan_from_s, duration_s, cfg.coarse_step_s)
+        end_coarse_frames_dense = _extract_frames(
+            reader,
+            end_coarse_times,
+            max_dimension_px=cfg.max_frame_dimension_px,
+            jpeg_quality=cfg.jpeg_quality,
         )
-
-        end_scan_responses: list[RawProviderResponse] = []
-        end_validation_responses: list[RawProviderResponse] = []
-        end_candidate: TimingVerdict | None = None
-        validation_verdict: TimingVerdict | None = None
-        window_lo = window_hi = scan_from_s
-        for window_lo, window_hi in scan_windows:
-            window_times = _dense_timestamps(window_lo, window_hi, fine_step_s)
-            window_frames_dense = _extract_frames(
-                reader,
-                window_times,
-                max_dimension_px=cfg.max_frame_dimension_px,
-                jpeg_quality=cfg.jpeg_quality,
-            )
-            window_min_frames = _min_frames_for_window(
-                window_hi - window_lo, cfg.target_tolerance_s
-            )
-            window_frames = _fit_frames_to_budget(
-                window_frames_dense,
-                prompt_text=PROMPT_END_SCAN_V2,
-                max_request_bytes=cfg.max_request_bytes,
-                min_frames=window_min_frames,
-            )
-            if window_frames is None:
-                abstain = _oversized_abstain(
-                    PROMPT_END_SCAN_V2_ID,
-                    "end_scan",
-                    f"window [{window_lo:.2f}, {window_hi:.2f}]s: "
-                    f"{len(window_frames_dense)} frames still exceed the request byte "
-                    f"budget even at the sparsest sampling ({window_min_frames} frames) "
-                    f"that meets the target tolerance",
-                )
-                return PipelineOutcome(
-                    verdict=abstain,
-                    event=None,
-                    coarse_response=coarse_response,
-                    fine_response=fine_response,
-                    end_scan_responses=tuple(end_scan_responses),
-                    end_validation_responses=tuple(end_validation_responses),
-                )
-
-            window_request = ProviderRequest(
-                prompt_version=PROMPT_END_SCAN_V2_ID,
-                prompt_text=PROMPT_END_SCAN_V2,
-                frames=tuple(window_frames),
-                pass_name="end_scan",
-            )
-            window_response = provider.analyze(window_request)
-            end_scan_responses.append(window_response)
-            window_verdict = parse_raw_response(
-                window_response,
-                prompt_version=PROMPT_END_SCAN_V2_ID,
-                min_confidence=cfg.min_confidence,
-            )
-            window_submitted = [frame.timestamp_s for frame in window_frames]
-            window_region = _GroundingRegion(
-                bounds=(window_lo, window_hi),
-                submitted_timestamps_s=tuple(window_submitted),
-                time_tolerance_s=_effective_tolerance_s(window_submitted, fine_step_s),
-            )
-            window_verdict = _validate_grounding(
-                window_verdict,
-                start_region=window_region,
-                end_region=window_region,
-                max_uncertainty_s=cfg.max_uncertainty_s,
-            )
-            if window_verdict.status is not TimingStatus.CONFIRMED:
-                # ABSTAIN for this window only (no break here, ungrounded,
-                # or malformed) - the break may simply be later; keep
-                # scanning. Never treat one window's abstain as the whole
-                # run's abstain.
-                continue
-
-            # A single window's own local judgement is not enough on its
-            # own - a momentary contrast/camera artifact can look exactly
-            # like a genuine break in one frame. Before accepting this
-            # candidate, check it against what actually happens afterward:
-            # a bounded follow-up request with the established baseline
-            # before it and a validation horizon after it, asking whether
-            # the connected stream's reach keeps a sustained net-shortening
-            # trend rather than recovering back toward the baseline
-            # (supervisor-directed generalization of the onset fix above,
-            # see diagnostics/llm_spike/DESIGN.md). Must not stop/confirm
-            # on the first local shortening alone.
-            assert window_verdict.end_s is not None
-            candidate_ts = window_verdict.end_s
-            validation_lo = max(locked_start_s, candidate_ts - cfg.end_validation_baseline_s)
-            validation_hi = min(duration_s, candidate_ts + cfg.end_validation_horizon_s)
-            validation_frames = _build_validation_frames(
-                reader,
-                candidate_ts=candidate_ts,
-                validation_lo=validation_lo,
-                validation_hi=validation_hi,
-                fine_step_s=fine_step_s,
-                max_dimension_px=cfg.max_frame_dimension_px,
-                jpeg_quality=cfg.jpeg_quality,
-                prompt_text=PROMPT_END_VALIDATE_V1,
-                max_request_bytes=cfg.max_request_bytes,
-                target_tolerance_s=cfg.target_tolerance_s,
-            )
-            if validation_frames is None:
-                # This specific candidate's validation request doesn't fit
-                # the budget - does not mean no valid break exists later;
-                # treat it the same as a rejected candidate and keep
-                # scanning, recording an unsent placeholder for diagnostics.
-                end_validation_responses.append(
-                    _unsent_response(
-                        f"candidate at t={candidate_ts:.2f}s: validation window "
-                        f"[{validation_lo:.2f}, {validation_hi:.2f}]s still exceeds the "
-                        f"request byte budget even at the sparsest sampling that meets "
-                        f"the target tolerance"
-                    )
-                )
-                continue
-
-            validation_request = ProviderRequest(
-                prompt_version=PROMPT_END_VALIDATE_V1_ID,
-                prompt_text=PROMPT_END_VALIDATE_V1,
-                frames=tuple(validation_frames),
-                pass_name="end_validate",
-            )
-            validation_response = provider.analyze(validation_request)
-            end_validation_responses.append(validation_response)
-            candidate_verdict = parse_raw_response(
-                validation_response,
-                prompt_version=PROMPT_END_VALIDATE_V1_ID,
-                min_confidence=cfg.min_confidence,
-            )
-            validation_submitted = [frame.timestamp_s for frame in validation_frames]
-            validation_region = _GroundingRegion(
-                bounds=(validation_lo, validation_hi),
-                submitted_timestamps_s=tuple(validation_submitted),
-                time_tolerance_s=_effective_tolerance_s(validation_submitted, fine_step_s),
-            )
-            candidate_verdict = _validate_grounding(
-                candidate_verdict,
-                start_region=validation_region,
-                end_region=validation_region,
-                max_uncertainty_s=cfg.max_uncertainty_s,
-            )
-            if candidate_verdict.status is TimingStatus.CONFIRMED:
-                end_candidate = window_verdict
-                validation_verdict = candidate_verdict
-                break
-            # Rejected (trend didn't hold) or couldn't be validated at all
-            # (insufficient future context, ambiguous, malformed, or
-            # ungrounded) - this candidate does not stand; keep scanning
-            # chronologically forward for a later one.
-
-        if end_candidate is None or validation_verdict is None:
-            abstain = TimingVerdict.abstain(
-                reason_codes=("no_break_found",),
-                model_id=(
-                    end_validation_responses[-1].model_id
-                    if end_validation_responses
-                    else (end_scan_responses[-1].model_id if end_scan_responses else "")
-                ),
-                prompt_version=PROMPT_END_SCAN_V2_ID,
-                raw_notes=(
-                    f"scanned forward from t={scan_from_s:.2f}s (end of the grounded "
-                    f"start-refinement window) to the end of the clip "
-                    f"(t={duration_s:.2f}s) in {len(end_scan_responses)} window(s), "
-                    f"with {len(end_validation_responses)} candidate(s) checked for a "
-                    f"sustained trend via {PROMPT_END_VALIDATE_V1_ID}; no candidate break "
-                    f"both occurred and validated"
-                ),
+        # Same coverage guarantee _min_coarse_frames already gives the
+        # start-side coarse pass, applied to the (shorter) post-start span.
+        end_coarse_min_frames = _min_coarse_frames(duration_s - scan_from_s, cfg.fine_margin_s)
+        end_coarse_frames = _fit_frames_to_budget(
+            end_coarse_frames_dense,
+            prompt_text=PROMPT_END_COARSE_V1,
+            max_request_bytes=cfg.max_request_bytes,
+            min_frames=end_coarse_min_frames,
+        )
+        if end_coarse_frames is None:
+            abstain = _oversized_abstain(
+                PROMPT_END_COARSE_V1_ID,
+                "end_coarse",
+                f"{len(end_coarse_frames_dense)} frames still exceed the request byte "
+                f"budget even at the sparsest sampling ({end_coarse_min_frames} frames) "
+                f"that guarantees coverage within fine_margin_s of the true transition",
             )
             return PipelineOutcome(
                 verdict=abstain,
                 event=None,
                 coarse_response=coarse_response,
                 fine_response=fine_response,
-                end_scan_responses=tuple(end_scan_responses),
-                end_validation_responses=tuple(end_validation_responses),
             )
 
-        assert end_candidate.end_s is not None
+        end_coarse_request = ProviderRequest(
+            prompt_version=PROMPT_END_COARSE_V1_ID,
+            prompt_text=PROMPT_END_COARSE_V1,
+            frames=tuple(end_coarse_frames),
+            pass_name="end_coarse",
+        )
+        end_coarse_response = provider.analyze(end_coarse_request)
+        end_coarse_verdict = parse_raw_response(
+            end_coarse_response,
+            prompt_version=PROMPT_END_COARSE_V1_ID,
+            min_confidence=cfg.min_confidence,
+        )
+        end_coarse_submitted = [frame.timestamp_s for frame in end_coarse_frames]
+        end_coarse_region = _GroundingRegion(
+            bounds=(scan_from_s, duration_s),
+            submitted_timestamps_s=tuple(end_coarse_submitted),
+            time_tolerance_s=_effective_tolerance_s(end_coarse_submitted, cfg.coarse_step_s),
+        )
+        end_coarse_verdict = _validate_grounding(
+            end_coarse_verdict,
+            start_region=end_coarse_region,
+            end_region=end_coarse_region,
+            max_uncertainty_s=cfg.max_uncertainty_s,
+        )
+        if end_coarse_verdict.status is not TimingStatus.CONFIRMED:
+            return PipelineOutcome(
+                verdict=end_coarse_verdict,
+                event=None,
+                coarse_response=coarse_response,
+                fine_response=fine_response,
+                end_coarse_response=end_coarse_response,
+            )
+
+        # A sparse coarse candidate is never trusted on its own - it must
+        # still pass a dense, bounded trend-validation check before being
+        # accepted (supervisor-directed generalization: a real break is a
+        # *sustained* shortening trend, not a single frame that happens to
+        # look shorter - see PROMPT_END_VALIDATE_V1 and
+        # diagnostics/llm_spike/DESIGN.md).
+        assert end_coarse_verdict.end_s is not None
+        candidate_ts = end_coarse_verdict.end_s
+        validation_lo = max(locked_start_s, candidate_ts - cfg.end_validation_baseline_s)
+        validation_hi = min(duration_s, candidate_ts + cfg.end_validation_horizon_s)
+        validation_frames = _build_validation_frames(
+            reader,
+            candidate_ts=candidate_ts,
+            validation_lo=validation_lo,
+            validation_hi=validation_hi,
+            fine_step_s=fine_step_s,
+            max_dimension_px=cfg.max_frame_dimension_px,
+            jpeg_quality=cfg.jpeg_quality,
+            prompt_text=PROMPT_END_VALIDATE_V1,
+            max_request_bytes=cfg.max_request_bytes,
+            target_tolerance_s=cfg.target_tolerance_s,
+        )
+        if validation_frames is None:
+            abstain = _oversized_abstain(
+                PROMPT_END_VALIDATE_V1_ID,
+                "end_validate",
+                f"candidate at t={candidate_ts:.2f}s: validation window "
+                f"[{validation_lo:.2f}, {validation_hi:.2f}]s still exceeds the request "
+                f"byte budget even at the sparsest sampling that meets the target "
+                f"tolerance",
+            )
+            return PipelineOutcome(
+                verdict=abstain,
+                event=None,
+                coarse_response=coarse_response,
+                fine_response=fine_response,
+                end_coarse_response=end_coarse_response,
+            )
+
+        validation_request = ProviderRequest(
+            prompt_version=PROMPT_END_VALIDATE_V1_ID,
+            prompt_text=PROMPT_END_VALIDATE_V1,
+            frames=tuple(validation_frames),
+            pass_name="end_validate",
+        )
+        validation_response = provider.analyze(validation_request)
+        validation_verdict = parse_raw_response(
+            validation_response,
+            prompt_version=PROMPT_END_VALIDATE_V1_ID,
+            min_confidence=cfg.min_confidence,
+        )
+        validation_submitted = [frame.timestamp_s for frame in validation_frames]
+        validation_region = _GroundingRegion(
+            bounds=(validation_lo, validation_hi),
+            submitted_timestamps_s=tuple(validation_submitted),
+            time_tolerance_s=_effective_tolerance_s(validation_submitted, fine_step_s),
+        )
+        validation_verdict = _validate_grounding(
+            validation_verdict,
+            start_region=validation_region,
+            end_region=validation_region,
+            max_uncertainty_s=cfg.max_uncertainty_s,
+        )
+        if validation_verdict.status is not TimingStatus.CONFIRMED:
+            # Rejected (trend didn't hold) or couldn't be validated at all
+            # (insufficient future context, ambiguous, malformed, or
+            # ungrounded) - single-shot: fall back to the assisted/manual
+            # workflow rather than hunting for another candidate
+            # (supervisor-directed, see diagnostics/llm_spike/DESIGN.md).
+            return PipelineOutcome(
+                verdict=validation_verdict,
+                event=None,
+                coarse_response=coarse_response,
+                fine_response=fine_response,
+                end_coarse_response=end_coarse_response,
+                end_validation_response=validation_response,
+            )
+
+        # Report the coarse pass's own candidate T - the first onset frame
+        # - never a later point the validation call's own answer might
+        # name (supervisor-directed, see diagnostics/llm_spike/DESIGN.md).
         final_confidence = min(
-            fine_verdict.confidence, end_candidate.confidence, validation_verdict.confidence
+            fine_verdict.confidence, end_coarse_verdict.confidence, validation_verdict.confidence
         )
         final_verdict = TimingVerdict(
             status=TimingStatus.CONFIRMED,
             start_s=locked_start_s,
-            end_s=end_candidate.end_s,
+            end_s=end_coarse_verdict.end_s,
             start_uncertainty_s=locked_start_uncertainty_s,
-            end_uncertainty_s=end_candidate.end_uncertainty_s,
+            end_uncertainty_s=end_coarse_verdict.end_uncertainty_s,
             confidence=final_confidence,
             reason_codes=tuple(
                 sorted(
                     set(fine_verdict.reason_codes)
-                    | set(end_candidate.reason_codes)
+                    | set(end_coarse_verdict.reason_codes)
                     | set(validation_verdict.reason_codes)
                 )
             ),
             evidence_frame_timestamps_s=tuple(
                 sorted(
                     set(start_side_evidence)
-                    | set(end_candidate.evidence_frame_timestamps_s)
+                    | set(end_coarse_verdict.evidence_frame_timestamps_s)
                     | set(validation_verdict.evidence_frame_timestamps_s)
                 )
             ),
-            model_id=end_candidate.model_id,
-            prompt_version=PROMPT_END_SCAN_V2_ID,
+            model_id=end_coarse_verdict.model_id,
+            prompt_version=PROMPT_END_COARSE_V1_ID,
             raw_notes=(
-                f"start confirmed via {PROMPT_START_REFINE_V1_ID}; candidate break found "
-                f"via chronological end-scan ({PROMPT_END_SCAN_V2_ID}) after "
-                f"{len(end_scan_responses) - 1} earlier window(s) with no break, at "
-                f"t={end_candidate.end_s:.3f}s in window [{window_lo:.2f}, {window_hi:.2f}]s; "
-                f"validated as a sustained trend via {PROMPT_END_VALIDATE_V1_ID} after "
-                f"{len(end_validation_responses) - 1} earlier candidate(s) rejected"
+                f"start confirmed via {PROMPT_START_REFINE_V1_ID}; candidate break "
+                f"nominated via {PROMPT_END_COARSE_V1_ID} at "
+                f"t={end_coarse_verdict.end_s:.3f}s; validated as a sustained trend via "
+                f"{PROMPT_END_VALIDATE_V1_ID}"
             ),
         )
 
@@ -1162,7 +1139,7 @@ def run_llm_timing(
         event = Event(
             label="Efflux (LLM spike)",
             start_s=locked_start_s,
-            end_s=end_candidate.end_s,
+            end_s=end_coarse_verdict.end_s,
             confidence=final_verdict.confidence,
             detector="llm_timing_spike",
             status=status,
@@ -1173,12 +1150,10 @@ def run_llm_timing(
                 "evidence_frame_timestamps_s": list(final_verdict.evidence_frame_timestamps_s),
                 "model_id": final_verdict.model_id,
                 "start_prompt_version": PROMPT_START_REFINE_V1_ID,
-                "end_prompt_version": PROMPT_END_SCAN_V2_ID,
+                "end_coarse_prompt_version": PROMPT_END_COARSE_V1_ID,
                 "end_validate_prompt_version": PROMPT_END_VALIDATE_V1_ID,
                 "coarse_start_s": coarse_verdict.start_s,
                 "coarse_end_s": coarse_verdict.end_s,
-                "end_scan_window_count": len(end_scan_responses),
-                "end_validation_call_count": len(end_validation_responses),
             },
         )
         return PipelineOutcome(
@@ -1186,6 +1161,6 @@ def run_llm_timing(
             event=event,
             coarse_response=coarse_response,
             fine_response=fine_response,
-            end_scan_responses=tuple(end_scan_responses),
-            end_validation_responses=tuple(end_validation_responses),
+            end_coarse_response=end_coarse_response,
+            end_validation_response=validation_response,
         )

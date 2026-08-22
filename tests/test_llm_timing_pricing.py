@@ -45,17 +45,17 @@ def test_estimate_cost_usd_computes_input_and_output_separately():
 def _respond_confirming_every_pass(
     *, model_id: str, latency_s: float, retries: int, prompt_tokens: int, completion_tokens: int
 ):
-    """Coarse/fine confirm against the manifest truth as usual; the very
-    first end-scan window immediately confirms against its own first
+    """Coarse/fine confirm against the manifest truth as usual; the single
+    whole-clip end-coarse call immediately confirms against its own first
     submitted frame's timestamp (trivially within its own bounds/evidence),
     and the one resulting trend-validation call immediately confirms the
-    flagged candidate too - so exactly one end-scan call and one
+    flagged candidate too - so exactly one end-coarse call and one
     end-validate call happen, deterministic, so these cost/usage tests
-    don't depend on how many scan windows a real run might take.
+    don't depend on any real model behaviour.
     """
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
-        if request.pass_name == "end_scan":
+        if request.pass_name == "end_coarse":
             ts = request.frames[0].timestamp_s
             base = canned_json_response(
                 start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
@@ -100,7 +100,7 @@ def test_pipeline_outcome_reports_none_cost_when_model_unpriced(zahn_video):
         prompt_text="irrelevant for a stub",
     )
     assert outcome.event is not None
-    assert len(provider.calls) == 4  # coarse, fine, one end-scan window, one validation call
+    assert len(provider.calls) == 4  # coarse, fine, one end-coarse call, one validation call
     # Usage is reported even though cost can't be estimated (no pricing entry).
     assert outcome.total_tokens == (1000 + 200) * 4
     assert outcome.total_retries == 4
@@ -110,8 +110,10 @@ def test_pipeline_outcome_reports_none_cost_when_model_unpriced(zahn_video):
     assert payload["estimated_cost_usd"] is None
     assert payload["total_tokens"] == outcome.total_tokens
     assert payload["pricing_table_version"]
-    assert payload["end_scan_window_count"] == 1
-    assert payload["end_validation_call_count"] == 1
+    assert payload["end_coarse_model_id"] == "unpriced-stub"
+    assert payload["end_coarse_latency_s"] == 1.5
+    assert payload["end_validation_model_id"] == "unpriced-stub"
+    assert payload["end_validation_latency_s"] == 1.5
 
 
 def test_pipeline_outcome_estimates_cost_with_an_injected_table(zahn_video):
@@ -132,7 +134,7 @@ def test_pipeline_outcome_estimates_cost_with_an_injected_table(zahn_video):
     )
     table = {"priced-stub": ModelPricing(input_usd_per_1k_tokens=0.5, output_usd_per_1k_tokens=1.5)}
     # Each pass: 1000 in @ $0.5/1k + 1000 out @ $1.5/1k = $2.00; four passes
-    # (coarse, fine, one end-scan window, one validation call) = $8.00
+    # (coarse, fine, one end-coarse call, one validation call) = $8.00
     assert outcome.estimated_cost_usd(table=table) == 8.0
 
 

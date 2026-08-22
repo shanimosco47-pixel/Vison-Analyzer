@@ -106,14 +106,14 @@ class _PerfectStubProvider:
     produced with this provider is a check that the pipeline plumbing works,
     not a measurement of anything about real-world accuracy.
 
-    Branches on ``request.pass_name`` because the pipeline's chronological
-    end-scan phase asks a different question per window ("does the break
-    fall in *this* window") - confirming the true end unconditionally,
-    regardless of which window is asked about, would never ground (the
-    scan's per-window bounds check requires both the echoed start_s and
-    end_s to fall inside that one window, which two boundaries ~seconds
-    apart never both do) and the self-test would always abstain instead of
-    proving the plumbing works end-to-end.
+    Branches on ``request.pass_name`` because the pipeline's end-coarse and
+    end-validate passes each ask a bounded question about a specific
+    window of frames ("does the break fall in *these* frames") -
+    confirming the true end unconditionally, regardless of which window is
+    asked about, would never ground (each pass's own bounds check requires
+    both the echoed start_s and end_s to fall inside that one window,
+    which two boundaries ~seconds apart never both do) and the self-test
+    would always abstain instead of proving the plumbing works end-to-end.
     """
 
     def __init__(self, true_start_s: float, true_end_s: float) -> None:

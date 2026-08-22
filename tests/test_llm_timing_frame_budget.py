@@ -175,7 +175,7 @@ def _stub_matching_truth(truth: dict[str, float]):
                 confidence=0.9,
                 evidence_frame_timestamps_s=(candidate_ts,),
             )
-        assert request.pass_name == "end_scan"
+        assert request.pass_name == "end_coarse"
         window_times = [f.timestamp_s for f in request.frames]
         end_s = truth["flow_end_s"]
         if window_times and min(window_times) <= end_s <= max(window_times):

@@ -87,11 +87,10 @@ def test_engine_config_to_dict_never_exposes_credential_ref():
 
 def _confirms_at(start_s: float, end_s: float):
     """A respond() that confirms coarse/fine against (start_s, end_s), and
-    for the chronological end-scan confirms only the window that actually
-    contains end_s (abstaining "no_break_found" for every earlier one) -
-    the same shape a real model's answers take, so the scan loop is
-    actually exercised rather than short-circuited by an always-confirm
-    stub."""
+    for the whole-clip end-coarse call confirms only if end_s actually
+    falls within the submitted frames (abstaining "no_break_found"
+    otherwise) - the same shape a real model's answer takes, rather than
+    an unconditional always-confirm stub."""
 
     def respond(request) -> RawProviderResponse:
         if request.pass_name == "coarse":

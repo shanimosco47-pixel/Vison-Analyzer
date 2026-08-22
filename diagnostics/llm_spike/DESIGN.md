@@ -908,7 +908,7 @@ anywhere in the scan, because a momentary contrast/camera artifact can
 look exactly like a genuine break in one frame, wherever it happens to
 occur. The fix: a chronological end-scan window CONFIRMING is now only a
 *candidate*; before the scan stops, every candidate must also pass a
-bounded trend-validation follow-up request (commit TBD).
+bounded trend-validation follow-up request (commit `22e1605`).
 
 **Contract** (verbatim from the authorization): before a candidate `T`,
 at least ~1s of frames must show an already-established, continuous,
@@ -1026,3 +1026,105 @@ change).
 Still an experiment. No UI, no additional providers, no unrelated
 cleanup beyond what this round's authorization directly required. PR #5
 stays draft - ready for the next rerun.
+
+## 18. Replacing the chronological end-scan with a two-stage strategy
+
+A real-clip rerun against `gpt-4.1-mini` on commit `22e1605` (the trend-
+validation round) came back a safe `no_break_found` ABSTAIN: 13 scan
+windows, one candidate, rejected by trend validation. 426.578s runtime,
+326.641s provider latency, 787,182 tokens. The supervisor then ran a
+focused, isolated experiment to diagnose why: one request, 26 timestamped
+frames at 0.2s spacing spanning the known 18.0-23.0s region, the same
+trend-validation contract (baseline before, mandatory future checkpoints,
+sustained-shortening definition, structured audit). Result: CONFIRMED
+`first_break_s=20.2` against a manual truth of ~20.5s (error -0.3s,
+inside the ±0.75s gate-1 tolerance), in 22.047s and 15,943+1,135 tokens,
+zero retries.
+
+Diagnosis: decomposing the end search into 13 narrow, isolated
+chronological windows lost the temporal context a model needs to judge a
+*sustained* trend, and the fragmentation cost two orders of magnitude
+more (787,182 tokens/~7 minutes) than one coherent request needed
+(~17,000 tokens/~22s). One coherent request with the same trend contract
+correctly confirmed the true break; 13 isolated ones did not.
+
+**Replacement** (commit TBD): the chronological end-scan (`PROMPT_END_SCAN_V1`/
+`PROMPT_END_SCAN_V2`, `_end_scan_windows`) is retired - `pipeline.py` no
+longer builds or sends any `end_scan` request at all - replaced by a
+bounded two-stage strategy, targeting 2-3 total provider calls for the
+whole end determination instead of N scan windows:
+
+1. **End-coarse** (new `PROMPT_END_COARSE_V1`, `pass_name="end_coarse"`):
+   ONE request, sparse frames uniformly sampled at `coarse_step_s` across
+   the whole post-start clip (`[start_hi, duration_s]` - the same onset-
+   safety floor the chronological scan already established, preserved
+   unchanged: an onset/pre-flow frame is still never eligible as a
+   candidate). Explicitly uses the sustained-shortening-onset framing
+   ("report the EARLIEST frame that already looks like a real, ongoing
+   narrowing, not the stream's final disappearance") rather than the
+   original `PROMPT_V1` end definition ("first frame that looks shorter,
+   do not wait for confirmation") that caused the very first late-
+   disappearance drift failure four gate-1 runs converged on (§14). Its
+   own candidate is coarse and untrusted - a later pass must still
+   validate it.
+2. **End-validate** (existing `PROMPT_END_VALIDATE_V1`, unchanged - this
+   is the exact contract the isolated experiment above validated): ONE
+   dense, bounded follow-up request around the end-coarse candidate
+   (`end_validation_baseline_s`/`end_validation_horizon_s`, unchanged
+   defaults 1.0s/2.0s), confirming or rejecting the sustained-shortening
+   trend.
+
+Unlike the old design, a rejected or unvalidatable candidate now falls
+straight through to ABSTAIN (the assisted/manual fallback) - single-shot,
+not a search for another candidate, per the authorization. `end_candidate`
+is still always the end-coarse pass's own verdict, never overwritten by
+the validation call's own answer (the "report T, not a later point" rule
+from §17 carries over unchanged).
+
+**`PipelineOutcome` reshaped**: `end_scan_responses`/
+`end_validation_responses` (tuples, sized for an unbounded scan) become
+`end_coarse_response`/`end_validation_response` (single `Optional`
+fields, matching the existing `fine_response` pattern) - honest about the
+new architecture's fixed shape, and nothing outside `pipeline.py` read
+the old tuple-shaped fields or their `to_dict()` keys (confirmed by
+inspection - `scripts/llm_timing_eval.py` only reads `coarse_response`/
+`fine_response`/the aggregate `total_*` properties), so this is a clean
+rename, not a breaking change to anything that depends on it.
+`_end_scan_windows` and `_fit_fine_windows_to_budget` are now both fully
+dead code, deliberately left in place rather than removed (same choice as
+§15) - flagged here again for the supervisor to decide on a cleanup pass.
+
+**Tests**: the full `_stub_matching_truth`-style mass update this spike's
+architectural rounds always require, across `test_llm_timing_pipeline.py`,
+`test_llm_timing_frame_budget.py`, `test_llm_timing_pricing.py`,
+`test_llm_timing_engines.py`, `test_llm_timing_eval_provider_wiring.py` -
+every stub scripting `pass_name == "end_scan"` now scripts
+`"end_coarse"` instead. One test
+(`test_pipeline_end_scan_stops_at_the_first_break_ignoring_a_later_resumed_flow_window`)
+tested a mechanism (multi-window scan-stop ordering) that no longer
+exists structurally under a single whole-clip request, and was retired
+rather than force-repurposed - retained only implicitly via the new
+`test_pipeline_confirms_event_matching_ground_truth`'s exact-call-count
+assertion (`["coarse", "fine", "end_coarse", "end_validate"]`). Two tests
+were rewritten for the new single-shot-abstain behavior: what was
+`test_pipeline_rejects_a_candidate_that_fully_recovers_and_keeps_scanning`
+is now `test_pipeline_abstains_when_the_only_candidate_fails_trend_validation`
+(rejected candidate -> immediate ABSTAIN, never a second attempt), and
+what was `test_pipeline_end_scan_abstains_with_no_break_found_when_the_stream_never_breaks`
+is now `test_pipeline_abstains_when_end_coarse_finds_no_candidate` (one
+abstaining end-coarse call, never reaching validation). The onset-safety
+regression (§17) and the stale-coarse-end-estimate regression (§15)
+carried over with only their pass-name check updated - the underlying
+disciplines are unchanged.
+
+**Gates**: `pytest -q` - green (463 tests total across the full repo, one
+fewer than before this round due to the retired test above);
+`ruff check .` / `ruff format --check .` - clean; `mypy app` - clean
+except the same pre-existing, unrelated `app/web/routes.py:261` finding
+noted since §11; `node --test tests_js/*.test.js` - 44/44, unaffected
+(Python-only change).
+
+Still an experiment. No UI, no additional providers, no unrelated
+cleanup beyond what this round's authorization directly required. Model
+configurability and `gpt-4.1-mini` preserved for the next rerun, per the
+authorization. PR #5 stays draft - ready for one real whole-clip rerun.
