@@ -25,7 +25,7 @@ from app.analysis.llm_timing.gemini_provider import (
     GeminiCallResult,
     GeminiTimingProvider,
 )
-from app.analysis.llm_timing.provider import ProviderRequest, TimedFrame
+from app.analysis.llm_timing.provider import PermanentProviderError, ProviderRequest, TimedFrame
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "llm_timing_eval.py"
 _spec = importlib.util.spec_from_file_location("llm_timing_eval", _SCRIPT_PATH)
@@ -141,3 +141,70 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_gemini(zahn_
     assert result.coarse_model_id == DEFAULT_GEMINI_MODEL_ID
     assert result.fine_model_id == DEFAULT_GEMINI_MODEL_ID
     assert client.calls == [DEFAULT_GEMINI_MODEL_ID, DEFAULT_GEMINI_MODEL_ID]
+
+
+# --------------------------------------------------------------------------- #
+# ClipResult.raw_notes: the observability gap from the first real gate-1 run
+# (a coarse-call provider_error abstained with no way to tell auth/quota/
+# request-shape/model-availability failures apart) must be visible in the
+# per-clip output, and whatever secret-shaped text a provider's own
+# exception message might echo back must stay redacted getting there.
+# --------------------------------------------------------------------------- #
+
+
+class _RaisingFakeClient:
+    """Simulates the real failure mode observed in the first gate-1 run: the
+    provider call itself raises before any structured response comes back -
+    e.g. a rejected/invalid API key, whose exception text a real SDK might
+    echo straight back including the key itself."""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def generate_content(self, *, model, parts, generation_config):
+        raise PermanentProviderError(self._message)
+
+
+def test_evaluate_clip_surfaces_raw_notes_on_a_provider_error(zahn_video):
+    entry = {
+        "clip_id": "provider-error-check",
+        "video_path": str(zahn_video.path),
+        "true_start_s": zahn_video.truth["flow_start_s"],
+        "true_end_s": zahn_video.truth["flow_end_s"],
+    }
+    client = _RaisingFakeClient("401 invalid API key")
+    result = llm_timing_eval._evaluate_clip(
+        entry,
+        "gemini",
+        llm_timing_eval.PipelineConfig(),
+        model_id=None,
+        gemini_client_factory=lambda: client,
+    )
+    assert result.status == "abstain"
+    assert "provider_error" in result.reason_codes
+    # This is the whole point of the fix: previously ClipResult dropped this
+    # entirely, leaving no way to distinguish auth/quota/schema/availability
+    # failures from the reason code alone.
+    assert "invalid API key" in result.raw_notes
+
+
+def test_evaluate_clip_raw_notes_redacts_secret_shaped_text_from_a_provider_error(zahn_video):
+    entry = {
+        "clip_id": "secret-leak-check",
+        "video_path": str(zahn_video.path),
+        "true_start_s": zahn_video.truth["flow_start_s"],
+        "true_end_s": zahn_video.truth["flow_end_s"],
+    }
+    fake_key = "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"  # 32+ chars: secret-shaped
+    client = _RaisingFakeClient(f"401 invalid API key: {fake_key}")
+    result = llm_timing_eval._evaluate_clip(
+        entry,
+        "gemini",
+        llm_timing_eval.PipelineConfig(),
+        model_id=None,
+        gemini_client_factory=lambda: client,
+    )
+    assert result.status == "abstain"
+    assert result.raw_notes  # present, not dropped
+    assert fake_key not in result.raw_notes
+    assert "[redacted]" in result.raw_notes

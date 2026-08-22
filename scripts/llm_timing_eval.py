@@ -74,6 +74,7 @@ class ClipResult:
     within_tolerance: bool | None  # None when abstained (not applicable)
     false_confident: bool  # CONFIRMED but wrong by more than tolerance
     reason_codes: list[str]
+    raw_notes: str  # sanitized, bounded (TimingVerdict.raw_notes) - see redaction.py
     harness_latency_s: float  # end-to-end wall time (frame extraction + calls + parsing)
     coarse_model_id: str
     fine_model_id: str | None
@@ -195,6 +196,7 @@ def _evaluate_clip(
             within_tolerance=None,
             false_confident=False,
             reason_codes=list(verdict.reason_codes),
+            raw_notes=verdict.raw_notes,
             harness_latency_s=harness_latency_s,
             coarse_model_id=coarse_model_id,
             fine_model_id=fine_model_id,
@@ -225,6 +227,7 @@ def _evaluate_clip(
         within_tolerance=within_tolerance,
         false_confident=not within_tolerance,
         reason_codes=list(verdict.reason_codes),
+        raw_notes=verdict.raw_notes,
         harness_latency_s=harness_latency_s,
         coarse_model_id=coarse_model_id,
         fine_model_id=fine_model_id,
@@ -330,6 +333,17 @@ def main() -> int:
             f"{r.clip_id:<24} {r.status:<10} {_fmt(r.start_error_s):>10} "
             f"{_fmt(r.end_error_s):>10} {_fmt(r.duration_error_s):>10} {ok:>4}"
         )
+
+    notes = [r for r in results if r.raw_notes]
+    if notes:
+        # Already sanitized/bounded (TimingVerdict.raw_notes - see
+        # redaction.py) before it ever reached this ClipResult, so it's safe
+        # to print - this is the diagnostic a provider_error/malformed_output
+        # abstain needs to be distinguishable (auth vs. quota vs. request
+        # shape vs. model availability) instead of just a reason code.
+        print("\nNotes:")
+        for r in notes:
+            print(f"  {r.clip_id} ({r.status}): {r.raw_notes}")
 
     print("\nSummary:")
     print(json.dumps(summary, indent=2, default=str))
