@@ -45,6 +45,10 @@ Authorized:
   tracking machinery.
 - Network dependency and per-analysis cost, for the production-floor videos
   in question, which are not considered sensitive.
+- Designing (not implementing) a multi-engine architecture: one uploaded
+  video submitted to several independently-configured engines, with
+  results shown separately - see §10. Included as a design/backend
+  requirement for this checkpoint; the interaction is not wired into a UI.
 
 Not authorized (yet):
 
@@ -53,6 +57,9 @@ Not authorized (yet):
   evaluation (§5) has actually been run.
 - Touching PR #4. It remains the historical record of the classical-CV
   attempt and stays draft/unmerged.
+- Building the Settings UI or any other web-layer wiring for multi-engine
+  configuration (§10) - the backend contract exists; the interaction
+  surface does not yet.
 
 ## 3. Architecture
 
@@ -180,12 +187,14 @@ prints says so loudly so its numbers can't be mistaken for gate evidence.
 | `pipeline.py` - coarse-to-fine orchestration, abstain propagation | Done |
 | `scripts/llm_timing_eval.py` - gate 1/3 metrics harness | Done (stub-only) |
 | Unit/integration tests against `StubTimingProvider` + synthetic fixtures | Done (19 tests, `tests/test_llm_timing_pipeline.py`) |
+| `engine_config.py` - `EngineConfig`, failure-isolated `run_llm_timing_for_engines` | Done (backend only - see §10) |
 | A real vendor provider (OpenAI / Anthropic / Google, behind `TimingProvider`) | **Not started - needs an API key, explicitly deferred** |
 | The two real hand-verified clips as committed fixtures | **Not available - real footage isn't committed to this repo; see `tests/conftest.py`'s own docstring on why** |
 | Adversarial regression fixtures (gate 2) | Not started |
 | Blinded 15-20 clip evaluation set (gate 3) | Not started - blocked on both of the above |
 | Cost/token accounting in `RawProviderResponse` | Fields exist (`prompt_tokens`, `completion_tokens`) but nothing populates them yet - depends on a real provider |
 | Prompt A/B: raw-video-with-vendor-code-execution vs. our own deterministic frame batching | Open design question - see §8 |
+| Settings UI (engine entries, `+` control, credential fields, connection validation) | **Not started - explicitly deferred until reviewed, see §10** |
 
 ## 7. Immediate next step (needs supervisor input first)
 
@@ -230,3 +239,97 @@ real provider exists, rather than assumed either way.
 - **Latency**: a full coarse+fine analysis is at least two sequential API
   round-trips, plausibly several seconds to tens of seconds depending on
   vendor and frame count - unmeasured until a real provider exists.
+
+## 10. Multi-engine architecture (approved, not yet wired into the UI)
+
+Second authorization (PR #4 comment thread): the eventual workflow should
+let a user submit one uploaded video to **multiple independently-configured
+engines** and see every engine's result separately - not a single "the
+answer is X" number. This section is the interaction/configuration contract
+requested for this checkpoint. **Nothing below is implemented in the web
+layer.** The backend pieces (`engine_config.py`) exist and are tested;
+Settings UI, HTTP routes, and any storage for engine configuration do not.
+
+### 10.1 Interaction contract (for the future Settings UI)
+
+- A Settings control opens engine configuration.
+- **One engine entry shown by default.** A clear **`+`** control adds
+  another entry; each entry can be individually removed.
+- Each entry exposes:
+  - **Provider / model selection** (which `TimingProvider` implementation,
+    which model).
+  - **Enabled** toggle - a disabled entry stays configured but is skipped at
+    run time (see `EngineRunStatus.SKIPPED`), not deleted.
+  - **Credential configuration**, entered and displayed **masked** - the UI
+    never shows a credential's actual value once set, only that a reference
+    is configured.
+  - **Connection validation** - an explicit action to check the configured
+    credential/model actually works, before it's relied on for a real run.
+  - **Remove**.
+- Submitting a video runs it against every *enabled* entry. Results are
+  presented **per engine, side by side** - including status
+  (confirmed/abstain/error), confidence, uncertainty, latency, and estimated
+  cost per engine - specifically so engines disagreeing with each other is
+  visible to the user, not hidden.
+- **No averaging, no automatic winner.** If two engines disagree, both
+  answers are shown; nothing here picks or blends them.
+- **One engine failing (bad credential, unreachable, malformed output, an
+  unexpected exception) must never prevent the other enabled engines from
+  producing their own result.**
+
+### 10.2 Backend contract (`app/analysis/llm_timing/engine_config.py`)
+
+- `EngineConfig` - `engine_id`, `provider_name`, `model_id`,
+  `credential_ref`, `enabled`, `display_name`. Validated eagerly
+  (`__post_init__`): no empty required fields, and `credential_ref` is
+  rejected outright if it looks like an actual key rather than a reference
+  (`_looks_like_a_raw_secret` - a heuristic safety net, not a substitute for
+  secret scanning elsewhere).
+- `run_llm_timing_for_engines(video_path, engines, provider_factory, ...)` -
+  runs every enabled engine through `run_llm_timing` independently, each
+  inside its own try/except (the isolation boundary the interaction
+  contract above requires), and returns `list[EngineOutcome]` in input
+  order. Disabled entries become `EngineRunStatus.SKIPPED` without ever
+  calling `provider_factory` (so no connection is attempted for a
+  configured-but-off engine). A crash becomes `EngineRunStatus.ENGINE_ERROR`
+  with a redacted message, never an exception that takes down the other
+  engines' results.
+- `provider_factory: Callable[[EngineConfig], TimingProvider]` is supplied
+  by the caller, not this module - `engine_config.py` stays vendor-free,
+  matching the "provider adapters behind the narrow interface" requirement.
+  A real factory (not implemented yet) is where `credential_ref` actually
+  gets resolved - reading an environment variable or a secret-store entry -
+  server-side, at call time.
+
+### 10.3 Secret handling policy
+
+- **Server-side only.** `EngineConfig.credential_ref` is a reference (an
+  environment variable name or secret-store key), never a credential value.
+  The dataclass has nowhere to put an actual secret.
+- **Never returned to or stored by the browser.** `EngineConfig.to_dict()`
+  only ever contains the reference, which is safe to log or send to a
+  client - there is no code path in this module that touches a resolved
+  secret value at all.
+- **Never committed, logged, or included in diagnostics.** Enforced in two
+  places: `EngineConfig.__post_init__` rejects a `credential_ref` that looks
+  like a raw key, and `run_llm_timing_for_engines` redacts anything
+  credential-shaped out of an `ENGINE_ERROR`'s message
+  (`_redact` / `_RAW_SECRET_SCAN_PATTERNS`) before it's stored on the
+  returned `EngineOutcome`.
+- Both guards are **heuristic, defense-in-depth** - they catch the easy
+  mistake of pasting a real key where a reference belongs, and scrub a
+  vendor SDK's exception text if it happens to echo one back. They are not
+  a substitute for the real provider implementation raising clean errors in
+  the first place, or for secret-scanning elsewhere in the toolchain.
+
+### 10.4 Tests
+
+`tests/test_llm_timing_engines.py` (7 tests): `EngineConfig` validation
+(empty fields, raw-secret-shaped `credential_ref` rejected, a plausible env
+var reference accepted); a disabled engine is skipped and never reaches
+`provider_factory`; one engine erroring does not block sibling engines, and
+the failing engine's error is reported without stopping the batch; a
+`RuntimeError` containing a secret-shaped substring is redacted before
+being stored; two engines confirming genuinely different, disagreeing
+answers both survive untouched in the output - proving nothing here
+merges or picks a winner.
