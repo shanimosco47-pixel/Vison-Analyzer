@@ -189,6 +189,7 @@ def app(tmp_path: Path):
     application.config.update(TESTING=True)
     yield application
     application.extensions["analysis_service"].shutdown()
+    application.extensions["llm_run_service"].shutdown()
 
 
 @pytest.fixture

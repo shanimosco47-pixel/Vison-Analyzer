@@ -1270,6 +1270,61 @@ def test_pipeline_abstains_with_request_too_large_when_the_wide_validation_windo
     assert outcome.end_validation_response is None  # never sent
 
 
+def test_pipeline_calls_on_stage_before_each_pass_it_actually_reaches(zahn_video):
+    """``on_stage`` is invoked with each pass name immediately before that
+    pass's provider call is sent, in order, and never for a pass this run
+    doesn't reach (this run aborts after "fine" never gets to end_coarse/
+    end_validate)."""
+    stages: list[str] = []
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=10.0, confidence=0.9)
+        assert request.pass_name == "fine"
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["ambiguous_evidence"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+        on_stage=stages.append,
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert stages == ["coarse", "fine"]
+
+
+def test_pipeline_on_stage_can_abort_the_run_by_raising(zahn_video):
+    """A caller that wants cooperative cancellation raises from inside
+    ``on_stage``; the exception propagates straight out of
+    ``run_llm_timing`` rather than being swallowed."""
+
+    class _Cancelled(Exception):
+        pass
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        raise AssertionError("the provider must never be called after on_stage raises")
+
+    def on_stage(stage: str) -> None:
+        if stage == "coarse":
+            raise _Cancelled()
+
+    provider = StubTimingProvider(respond)
+    with pytest.raises(_Cancelled):
+        run_llm_timing(
+            zahn_video.path,
+            provider,
+            prompt_version=PROMPT_VERSION,
+            prompt_text="irrelevant for a stub",
+            on_stage=on_stage,
+        )
+
+
 def test_pipeline_config_rejects_invalid_bounds():
     with pytest.raises(ConfigurationError):
         PipelineConfig(min_confidence=0.9, review_confidence=0.5).validate()

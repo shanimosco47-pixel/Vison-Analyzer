@@ -1370,7 +1370,7 @@ cannot be fixed by choosing a better baseline/horizon - any fixed small
 window anchored to a single point has some coarse error large enough to
 put the truth outside it.
 
-**Fix** (commit TBD): the dense validation window is now sized as one
+**Fix** (commit `c529554`): the dense validation window is now sized as one
 coherent region wide enough to contain the observed coarse error range,
 not point-anchored:
 
@@ -1463,3 +1463,213 @@ workflow.
 
 No pipeline expansion, no UI, no unrelated cleanup. PR #5 stays draft -
 ready for one real whole-clip rerun.
+
+## 23. App integration: an Experimental LLM analysis section
+
+A Codex real-clip result against commit `c529554` (gpt-4.1-mini): start
+4.033s (+0.133s error), end 19.566s (-0.934s vs manual 20.5s), duration
+error -1.067s - a usable CONFIRMED result, but missing the strict ±0.75s
+gate by 0.184s. Explicit direction: stop spending rounds on algorithm/
+prompt corrections and move to hands-on experimentation instead, with the
+result kept clearly marked Experimental / review required. This section
+adds a bounded, usable slice of that: a UI section in the existing upload
+workflow that runs the same uploaded clip through one or more
+independently-configured engines and shows every result side by side,
+with the API key entirely server-side and never round-tripped to the
+browser. Not merged, not marked ready - the PR stays draft.
+
+### Architecture
+
+Four new backend modules, kept separate from the classical-detector code
+path so nothing about it changes:
+
+- `app/services/secret_store.py` - the only module that ever touches a
+  real API key's *value*. Backed by the third-party `keyring` package
+  (optional dependency, lazily imported - see `requirements-llm-spike.txt`),
+  which auto-selects Windows Credential Manager (backed by DPAPI) on
+  Windows, Keychain on macOS, Secret Service on Linux - satisfying the
+  "OS-protected secret mechanism on Windows" requirement without this
+  application needing to know which OS it's running on. A machine with no
+  usable backend at all degrades to "can't save a key here" rather than
+  falling back to something less protected; the operator uses the
+  environment-variable path instead for that case.
+- `app/services/llm_engine_store.py` - CRUD for configured engines,
+  persisting only non-secret metadata (provider, model, display name,
+  enabled) to one JSON file under `AppConfig.data_dir`. A `credential_ref`
+  is one of two shapes: `"secret:<engine_id>"` (a saved key, resolved via
+  `SecretStore`) or `"env:<VAR_NAME>"` (the documented development
+  fallback - an operator-managed environment variable; nothing is stored
+  server-side for this path beyond the variable's own name). Building a
+  real provider still goes through the existing, unmodified
+  `build_default_openai_client`/`build_default_gemini_client` (both read a
+  credential from a *named* environment variable only, a deliberate
+  pre-existing choice - never a literal through a function argument that
+  could end up in a traceback or repr); a resolved secret is materialized
+  into a per-engine, unique process environment variable
+  (`VISION_ANALYZER_LLM_ENGINE_SECRET_<ENGINE_ID>`) immediately before
+  constructing the client, so two engines' credentials can never collide
+  even when resolved concurrently by independent runs.
+- `app/services/llm_run_service.py` - one background job per engine run,
+  mirroring `AnalysisService`'s existing shape (staged progress,
+  cooperative cancellation, retention) but calling
+  `pipeline.run_llm_timing` directly rather than through
+  `engine_config.run_llm_timing_for_engines` - that function's per-engine
+  `try/except` would misreport a user-initiated cancellation as an engine
+  crash, which this module keeps distinct. Frames-only by construction:
+  `run_llm_timing` only ever extracts individual JPEG frames from the
+  video and sends those in each `ProviderRequest` - the original video
+  file is never opened by, or passed to, a provider at all (regression:
+  `test_a_frames_only_provider_request_never_carries_the_video_file`).
+- `app/web/llm_engine_routes.py` - the REST surface
+  (`GET/POST /api/llm-engines`, `PUT/DELETE /api/llm-engines/<id>`,
+  `POST /api/llm-engines/<id>/test`,
+  `POST /api/videos/<id>/llm-runs`, `GET/POST /api/llm-runs/<id>[/cancel]`),
+  registered from `routes.create_app` alongside the existing blueprint
+  (shares its app-wide `AnalyzerError` -> JSON-message handling
+  unchanged). `EngineConfig.to_dict()` already excluded `credential_ref`
+  (pre-existing, §10) - this is the first place anything actually calls
+  it over HTTP.
+
+One small, additive change to the existing pipeline:
+`pipeline.run_llm_timing` gained an optional `on_stage: Callable[[str],
+None]` parameter, called with the pass name ("coarse"/"fine"/
+"end_coarse"/"end_validate") immediately before that pass's provider call
+is sent - and never after, and never for a pass a run doesn't reach. Two
+uses, both optional and additive: staged progress for the run service to
+report, and cooperative cancellation - the service's own callback checks
+a cancel flag and raises `RunCancelled`, which propagates straight out of
+`run_llm_timing` (no new exception type in the pipeline module itself; it
+has no opinion on what "cancelled" means to its caller).
+
+### UI
+
+A new "Experimental: LLM analysis" section in `index.html`, positioned
+right after the upload step (it only needs an uploaded video, not a
+chosen classical mode) and gated the same way the existing steps are
+(`enableStep`). Per engine: a card with Run/Cancel/Test/Edit/Delete,
+staged progress text + a settled progress bar (the server reports named
+stages, not a fraction), and a result panel that always carries an
+"Experimental - review required" badge alongside the confirmed/abstained/
+error state, start/end/duration, confidence/uncertainty, and reason
+notes. "+ Add engine" opens a form: display name, provider (OpenAI or
+Google Gemini - not a hard-coded single model, any model ID the account
+has access to), and a credential fieldset offering either "save an API
+key" (OS-protected storage) or "advanced: use an environment variable
+already set on this machine". The existing manual-correction/classical-
+analysis workflow is completely unchanged - this section is additive,
+never a replacement path.
+
+`app/web/static/app.js` gained the DOM-wiring for all of this plus four
+pure, unit-tested functions (`llmEngineSubtitle`, `llmResultBadge`,
+`llmRunStatusLine`, `validateLLMEngineForm`) - the same "pure logic
+exported via `module.exports`, DOM wiring exercised by the Flask test
+client instead" split the existing Zahn-review code already uses.
+Dynamic content (engine display names, run messages) is built via
+`document.createElement`/`.textContent` throughout, never
+`innerHTML`-with-interpolation, so a display name a user typed can never
+be interpreted as markup.
+
+### Security properties, verified by tests, not just asserted here
+
+- **Write-only secrets, all the way through**: a submitted API key is
+  handed to `LLMEngineStore.create`/`update`, saved via `SecretStore`, and
+  never appears in any HTTP response, the persisted `llm_engines.json`
+  file, or a log line (`tests/test_web_llm_engines.py::test_create_with_an_api_key_saves_it_write_only`,
+  `test_the_saved_api_key_never_appears_in_the_persisted_metadata_file`;
+  `tests/test_llm_engine_store.py::test_the_persisted_file_never_contains_the_raw_api_key`).
+- **No browser storage of any kind is used for a key** - the form field is
+  a plain `type="password"` input whose value is sent once, in the POST
+  body, over the loopback-only connection this application already runs
+  on (§9), and never written back into the DOM or `localStorage`/
+  `sessionStorage`.
+- **A machine with no OS secret backend fails safely, not silently**:
+  `SecretStore.save` raises `SecretStoreUnavailable` rather than falling
+  back to something unprotected; the route surfaces this as a clear 400,
+  and this is exactly the path exercised in this sandbox, since `keyring`
+  has no real OS backend to select here
+  (`test_create_with_an_api_key_when_no_secret_backend_exists_fails_safely`).
+- **Frames-only**: see above.
+- **Safe error handling**: a missing/unresolvable credential, an
+  unsupported provider, or an unexpected crash inside a run all converge
+  on the run's `status: "failed"` with a message safe to show
+  (`AnalyzerError.user_message` or a fixed generic sentence - the
+  technical detail goes to the server log only, matching this
+  application's existing discipline elsewhere) - never a raw exception,
+  never the credential's value
+  (`tests/test_llm_run_service.py::test_a_missing_credential_fails_the_run_with_a_safe_message`,
+  `tests/test_web_llm_engines.py::test_run_with_a_missing_credential_fails_with_a_safe_message`).
+- **Provider timeout/error -> safe UI state**: unchanged pre-existing
+  behaviour (§10) - `OpenAITimingProvider.analyze`/`GeminiTimingProvider.analyze`
+  never let a client exception escape; it becomes an `error`-carrying
+  `RawProviderResponse`, which flows through the normal ABSTAIN path
+  (`provider_error` reason code) rather than crashing the run.
+- **Cancellation**: honoured cooperatively between pipeline passes, proven
+  by asserting the *next* pass's request never reaches the provider after
+  a mid-run cancel
+  (`test_cancel_mid_run_stops_before_the_next_pass_completes`), and
+  immediately for a still-queued run
+  (`test_cancel_before_the_run_starts_marks_it_cancelled_immediately`).
+
+### What's deliberately out of scope this round
+
+- The "Test" button resolves the credential and constructs a real
+  provider client - it does **not** make a live API call (that would cost
+  real time/money on every click); `ok: true` means "this key/model is
+  configured and the client builds", not "a request round-tripped". Said
+  explicitly in the button's own result message.
+- No cross-engine rate limiting or request queuing beyond the existing
+  `MAX_CONCURRENT_RUNS = 3` worker pool.
+- No true fractional progress bar - the server reports named stages
+  (coarse/fine/end_coarse/end_validate), not a percentage, so the bar
+  settles at a fixed "in progress" fill rather than implying false
+  precision.
+- No aggregation/averaging/winner-picking across engines - unchanged from
+  the existing `EngineConfig`/`run_llm_timing_for_engines` design (§10):
+  every engine's result is shown independently, disagreement is the
+  point.
+
+### Manual test procedure
+
+1. `pip install -r requirements-llm-spike.txt` (needs `openai`,
+   `google-genai`, and/or `keyring` depending on what's being tested).
+2. `python -m app.main` (or however the app is normally started locally).
+3. Upload a video. The "Experimental: LLM analysis" section becomes
+   usable immediately (no need to pick a classical mode first).
+4. Click "+ Add engine": choose OpenAI or Gemini, enter any model ID,
+   either paste a real API key (saved via the OS-protected store on a
+   supporting machine) or switch to "use an environment variable" and
+   name one already exported in the shell the server was started from.
+   Save.
+5. Click "Test" - confirms the credential resolves and the client
+   constructs, without spending a real request.
+6. Click "Run" - staged progress text updates every ~1.2s; "Cancel"
+   appears while queued/running and stops the run before its next pass.
+7. On completion: a result card with the Experimental/review-required
+   badge, confirmed/abstained state, start/end/duration/confidence/
+   uncertainty if confirmed, and reason notes if any.
+8. Add a second engine (different provider or model) and run it against
+   the same clip - both result cards persist side by side, independently.
+9. Delete an engine - confirm it disappears from the list and a
+   subsequent "Test"/"Run" against its old ID 404s.
+10. Confirm the classical analysis workflow (upload -> mode -> configure
+    -> analyse -> results) still works exactly as before, untouched by
+    any of the above.
+
+### Gates
+
+`pytest -q` - 545 passed (up from 481; 64 new tests: 12 for
+`secret_store.py`, 24 for `llm_engine_store.py`, 7 for
+`llm_run_service.py`, 19 for the web routes, 2 for `pipeline.py`'s new
+`on_stage` parameter). `ruff check .` / `ruff format --check .` - clean.
+`mypy app` - clean except the same pre-existing, unrelated
+`app/web/routes.py` "Unused type: ignore" finding noted since §11 (line
+number shifted by the new imports/registrations, not a new issue - fixed
+once a variable-naming collision of my own between the OpenAI and Gemini
+client branches in `llm_engine_store.build_provider`, a real mypy catch).
+`node --test tests_js/*.test.js` - 69/69 (44 existing + 25 new, covering
+provider/model-selection validation, write-only-secret form behaviour,
+and the result/status-line helpers behind the comparison UI).
+
+No real vendor call was made from this sandbox (no API key here, as
+every prior round has noted) - manual verification against a real key is
+the operator's next step. PR #5 stays draft, not marked ready.

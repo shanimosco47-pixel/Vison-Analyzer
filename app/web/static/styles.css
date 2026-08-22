@@ -241,3 +241,34 @@ pre { background: #f7f8fa; border: 1px solid var(--line); border-radius: 6px; pa
 
 .hidden { display: none !important; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
+/* Badges ---------------------------------------------------------------- */
+.badge {
+  display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px;
+  font-size: 0.78rem; font-weight: 600; border: 1px solid transparent; margin-right: 0.4rem;
+}
+.badge.ok { background: #eaf6ee; border-color: #b7ddc4; color: var(--ok); }
+.badge.review { background: #fdf3e0; border-color: #ecd39a; color: var(--review); }
+.badge.bad { background: #fbeceb; border-color: #eab9b5; color: var(--bad); }
+
+/* Experimental: LLM analysis -------------------------------------------- */
+.llm-engine-list { display: flex; flex-direction: column; gap: 0.75rem; margin-top: 0.5rem; }
+.llm-engine-card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 0.85rem 1rem; background: #fbfcfd;
+}
+.llm-engine-card-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; margin-bottom: 0.6rem; }
+.llm-engine-name { font-weight: 700; }
+.llm-engine-subtitle { color: var(--muted); font-size: 0.9rem; }
+.llm-run-progress { margin-top: 0.6rem; }
+.llm-result { margin-top: 0.75rem; }
+.llm-result .details-grid { margin-top: 0.5rem; }
+.llm-test-result { margin-top: 0.5rem; }
+
+.llm-engine-form {
+  border: 1px solid var(--line); border-radius: 8px; padding: 1rem; margin-top: 0.85rem; background: #fff;
+}
+.llm-credential-fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 0.75rem 1rem; margin: 0.85rem 0; }
+.llm-credential-fieldset legend { font-weight: 600; padding: 0 0.4rem; }
+.llm-credential-option { display: block; font-weight: 400; margin: 0.4rem 0 0.25rem; }
+.llm-credential-fieldset input[type="password"],
+.llm-credential-fieldset input[type="text"] { width: 100%; max-width: 360px; }

@@ -17,6 +17,7 @@ wrong" contract this whole application is built under.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -801,6 +802,7 @@ def run_llm_timing(
     prompt_text: str,
     config: PipelineConfig | None = None,
     video_info: VideoInfo | None = None,
+    on_stage: Callable[[str], None] | None = None,
 ) -> PipelineOutcome:
     """Run the coarse-then-fine timing pass and return a full outcome.
 
@@ -810,6 +812,16 @@ def run_llm_timing(
     fall back to the assisted/manual workflow. Genuine programming errors
     (a bad config, an unreadable video) still raise, per the rest of this
     codebase's error conventions.
+
+    ``on_stage``, if given, is called with the pass name ("coarse", "fine",
+    "end_coarse", "end_validate") immediately before that pass's provider
+    call is sent - never after, and never for a pass this run never reaches
+    (an early abstain or budget failure). Two purposes, both additive and
+    optional: staged progress for a caller with a UI to update, and
+    cooperative cancellation - a caller that wants to abort between passes
+    can raise from inside the callback, and that exception propagates
+    naturally out of this function (no new exception type here; this
+    module has no opinion on what "cancelled" means to its caller).
     """
     cfg = config or PipelineConfig()
     cfg.validate()
@@ -857,6 +869,8 @@ def run_llm_timing(
             frames=tuple(coarse_frames),
             pass_name="coarse",
         )
+        if on_stage is not None:
+            on_stage("coarse")
         coarse_response = provider.analyze(coarse_request)
         coarse_verdict = parse_raw_response(
             coarse_response, prompt_version=prompt_version, min_confidence=cfg.min_confidence
@@ -950,6 +964,8 @@ def run_llm_timing(
             frames=tuple(start_frames),
             pass_name="fine",
         )
+        if on_stage is not None:
+            on_stage("fine")
         fine_response = provider.analyze(fine_request)
         fine_verdict = parse_raw_response(
             fine_response,
@@ -1057,6 +1073,8 @@ def run_llm_timing(
             frames=tuple(end_coarse_frames),
             pass_name="end_coarse",
         )
+        if on_stage is not None:
+            on_stage("end_coarse")
         end_coarse_response = provider.analyze(end_coarse_request)
         end_coarse_verdict = parse_raw_response(
             end_coarse_response,
@@ -1147,6 +1165,8 @@ def run_llm_timing(
             frames=tuple(validation_frames),
             pass_name="end_validate",
         )
+        if on_stage is not None:
+            on_stage("end_validate")
         validation_response = provider.analyze(validation_request)
         validation_verdict = parse_raw_response(
             validation_response,
