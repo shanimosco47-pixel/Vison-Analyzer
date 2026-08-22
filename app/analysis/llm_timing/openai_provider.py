@@ -129,7 +129,15 @@ class OpenAITimingProvider:
         ``gemini_provider.GeminiTimingProvider.analyze``.
         """
         parts = _build_parts(request)
-        generation_config = {"temperature": self._temperature}
+        # pass_name/frame_timestamps_s let the real client (only) constrain
+        # the response schema for an end-scan window - see
+        # _response_schema_for_pass. Harmless additions for any other
+        # client (a fake test double just ignores unused dict keys).
+        generation_config = {
+            "temperature": self._temperature,
+            "pass_name": request.pass_name,
+            "frame_timestamps_s": [frame.timestamp_s for frame in request.frames],
+        }
 
         retries_so_far = 0
         last_error: Exception | None = None
@@ -242,6 +250,72 @@ def _retry_after_s(exc: Exception) -> float | None:
         return None
 
 
+_BASE_RESPONSE_SCHEMA_REQUIRED = (
+    "status",
+    "start_s",
+    "end_s",
+    "start_uncertainty_s",
+    "end_uncertainty_s",
+    "confidence",
+    "reason_codes",
+    "evidence_frame_timestamps_s",
+    "raw_notes",
+)
+
+
+def _response_schema_for_pass(pass_name: str, frame_timestamps_s: list[float]) -> dict:
+    """The JSON schema passed as OpenAI's Structured Outputs
+    ``text.format.schema``.
+
+    Identical for "coarse"/"fine" to every prior round. For "end_scan", a
+    live gate-1 run against gpt-4.1-mini against a real clip returned
+    ``start_s=end_s=5.533`` for a submitted window of ``[20.000,
+    23.000]``s - a value matching none of the frames actually shown.
+    ``pipeline._validate_grounding``'s ``out_of_bounds`` check safely
+    rejected it (exactly what "never confidently wrong" requires), but the
+    call itself was wasted - ~40.7s of provider latency and 134,152 tokens
+    for an answer the pipeline could never have accepted. Prompt wording
+    alone asks the model to copy a shown timestamp; this constrains the
+    *schema* so the API can only ever emit one of the timestamps actually
+    submitted for this window (or ``null``, for abstain) - OpenAI's
+    Structured Outputs (``strict: True``) validates this before the
+    response is ever returned, so a value the pipeline could never accept
+    anyway becomes structurally impossible to receive, not just something
+    the pipeline detects after paying for the call.
+
+    Uses ``anyOf: [{type: number, enum: [...]}, {type: null}]`` for the
+    nullable-and-constrained case rather than mixing ``null`` directly into
+    one ``enum`` array - both ``anyOf``-for-nullable and
+    ``enum``-of-numbers are individually well-documented Structured Outputs
+    features; mixing ``null`` into a single ``enum`` alongside numbers is
+    not, so this sticks to the confirmed-supported combination.
+
+    Standalone (not inlined in :func:`build_default_openai_client`) so this
+    policy is unit-testable without the real SDK or a key - see
+    ``tests/test_llm_timing_openai_provider.py``.
+    """
+    start_end_property: dict = {"type": ["number", "null"]}
+    if pass_name == "end_scan" and frame_timestamps_s:
+        allowed = sorted(set(frame_timestamps_s))
+        start_end_property = {"anyOf": [{"type": "number", "enum": allowed}, {"type": "null"}]}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": list(_BASE_RESPONSE_SCHEMA_REQUIRED),
+        "properties": {
+            "status": {"type": "string", "enum": ["confirmed", "abstain"]},
+            "start_s": start_end_property,
+            "end_s": start_end_property,
+            "start_uncertainty_s": {"type": ["number", "null"]},
+            "end_uncertainty_s": {"type": ["number", "null"]},
+            "confidence": {"type": "number"},
+            "reason_codes": {"type": "array", "items": {"type": "string"}},
+            "evidence_frame_timestamps_s": {"type": "array", "items": {"type": "number"}},
+            "raw_notes": {"type": "string"},
+        },
+    }
+
+
 def build_default_openai_client(api_key_env_var: str = "OPENAI_API_KEY") -> OpenAIClient:
     """Construct the real OpenAI SDK-backed client. Not exercised by tests.
 
@@ -290,33 +364,6 @@ def build_default_openai_client(api_key_env_var: str = "OPENAI_API_KEY") -> Open
 
     client = OpenAI(api_key=api_key, max_retries=0)
 
-    _RESPONSE_SCHEMA = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": [
-            "status",
-            "start_s",
-            "end_s",
-            "start_uncertainty_s",
-            "end_uncertainty_s",
-            "confidence",
-            "reason_codes",
-            "evidence_frame_timestamps_s",
-            "raw_notes",
-        ],
-        "properties": {
-            "status": {"type": "string", "enum": ["confirmed", "abstain"]},
-            "start_s": {"type": ["number", "null"]},
-            "end_s": {"type": ["number", "null"]},
-            "start_uncertainty_s": {"type": ["number", "null"]},
-            "end_uncertainty_s": {"type": ["number", "null"]},
-            "confidence": {"type": "number"},
-            "reason_codes": {"type": "array", "items": {"type": "string"}},
-            "evidence_frame_timestamps_s": {"type": "array", "items": {"type": "number"}},
-            "raw_notes": {"type": "string"},
-        },
-    }
-
     def _to_openai_part(part: dict) -> dict:
         if "text" in part:
             return {"type": "input_text", "text": part["text"]}
@@ -333,6 +380,10 @@ def build_default_openai_client(api_key_env_var: str = "OPENAI_API_KEY") -> Open
             self, *, model: str, parts: list[dict], generation_config: dict
         ) -> OpenAICallResult:
             openai_parts = [_to_openai_part(part) for part in parts]
+            schema = _response_schema_for_pass(
+                generation_config.get("pass_name", ""),
+                generation_config.get("frame_timestamps_s", []),
+            )
             try:
                 response = client.responses.create(
                     model=model,
@@ -342,7 +393,7 @@ def build_default_openai_client(api_key_env_var: str = "OPENAI_API_KEY") -> Open
                         "format": {
                             "type": "json_schema",
                             "name": "timing_verdict",
-                            "schema": _RESPONSE_SCHEMA,
+                            "schema": schema,
                             "strict": True,
                         }
                     },

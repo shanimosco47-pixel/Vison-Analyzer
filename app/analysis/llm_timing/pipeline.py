@@ -28,7 +28,7 @@ from ...video.metadata import VideoInfo
 from ...video.reader import VideoReader, encode_jpeg
 from ..base_detector import Event, EventStatus
 from .pricing import PRICING_TABLE_VERSION, ModelPricing, estimate_cost_usd
-from .prompts import PROMPT_END_SCAN_V1, PROMPT_END_SCAN_V1_ID
+from .prompts import PROMPT_END_SCAN_V2, PROMPT_END_SCAN_V2_ID
 from .provider import (
     ProviderRequest,
     RawProviderResponse,
@@ -842,7 +842,7 @@ def run_llm_timing(
         # (supervisor-directed experiment, see diagnostics/llm_spike/DESIGN.md).
         # The end is searched for chronologically instead, one small
         # window at a time, stopping at the first grounded candidate - see
-        # _end_scan_windows and PROMPT_END_SCAN_V1.
+        # _end_scan_windows and PROMPT_END_SCAN_V2.
         assert fine_verdict.start_s is not None and fine_verdict.end_s is not None
         locked_start_s: float = fine_verdict.start_s
         locked_start_uncertainty_s = fine_verdict.start_uncertainty_s
@@ -883,13 +883,13 @@ def run_llm_timing(
             )
             window_frames = _fit_frames_to_budget(
                 window_frames_dense,
-                prompt_text=PROMPT_END_SCAN_V1,
+                prompt_text=PROMPT_END_SCAN_V2,
                 max_request_bytes=cfg.max_request_bytes,
                 min_frames=window_min_frames,
             )
             if window_frames is None:
                 abstain = _oversized_abstain(
-                    PROMPT_END_SCAN_V1_ID,
+                    PROMPT_END_SCAN_V2_ID,
                     "end_scan",
                     f"window [{window_lo:.2f}, {window_hi:.2f}]s: "
                     f"{len(window_frames_dense)} frames still exceed the request byte "
@@ -905,8 +905,8 @@ def run_llm_timing(
                 )
 
             window_request = ProviderRequest(
-                prompt_version=PROMPT_END_SCAN_V1_ID,
-                prompt_text=PROMPT_END_SCAN_V1,
+                prompt_version=PROMPT_END_SCAN_V2_ID,
+                prompt_text=PROMPT_END_SCAN_V2,
                 frames=tuple(window_frames),
                 pass_name="end_scan",
             )
@@ -914,7 +914,7 @@ def run_llm_timing(
             end_scan_responses.append(window_response)
             window_verdict = parse_raw_response(
                 window_response,
-                prompt_version=PROMPT_END_SCAN_V1_ID,
+                prompt_version=PROMPT_END_SCAN_V2_ID,
                 min_confidence=cfg.min_confidence,
             )
             window_submitted = [frame.timestamp_s for frame in window_frames]
@@ -940,7 +940,7 @@ def run_llm_timing(
             abstain = TimingVerdict.abstain(
                 reason_codes=("no_break_found",),
                 model_id=end_scan_responses[-1].model_id if end_scan_responses else "",
-                prompt_version=PROMPT_END_SCAN_V1_ID,
+                prompt_version=PROMPT_END_SCAN_V2_ID,
                 raw_notes=(
                     f"scanned forward from t={locked_start_s:.2f}s to the end of the "
                     f"clip (t={duration_s:.2f}s) in {len(end_scan_responses)} window(s); "
@@ -971,10 +971,10 @@ def run_llm_timing(
                 sorted(set(start_side_evidence) | set(end_candidate.evidence_frame_timestamps_s))
             ),
             model_id=end_candidate.model_id,
-            prompt_version=PROMPT_END_SCAN_V1_ID,
+            prompt_version=PROMPT_END_SCAN_V2_ID,
             raw_notes=(
                 f"start confirmed via {prompt_version}; end confirmed via chronological "
-                f"end-scan ({PROMPT_END_SCAN_V1_ID}) after {len(end_scan_responses) - 1} "
+                f"end-scan ({PROMPT_END_SCAN_V2_ID}) after {len(end_scan_responses) - 1} "
                 f"earlier window(s) with no break, winning window "
                 f"[{window_lo:.2f}, {window_hi:.2f}]s"
             ),
@@ -999,7 +999,7 @@ def run_llm_timing(
                 "evidence_frame_timestamps_s": list(final_verdict.evidence_frame_timestamps_s),
                 "model_id": final_verdict.model_id,
                 "start_prompt_version": prompt_version,
-                "end_prompt_version": PROMPT_END_SCAN_V1_ID,
+                "end_prompt_version": PROMPT_END_SCAN_V2_ID,
                 "coarse_start_s": coarse_verdict.start_s,
                 "coarse_end_s": coarse_verdict.end_s,
                 "end_scan_window_count": len(end_scan_responses),

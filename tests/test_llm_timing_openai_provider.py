@@ -20,6 +20,7 @@ from app.analysis.llm_timing.openai_provider import (
     OpenAICallResult,
     OpenAITimingProvider,
     _classify_status_error,
+    _response_schema_for_pass,
 )
 from app.analysis.llm_timing.provider import (
     PermanentProviderError,
@@ -350,3 +351,75 @@ def test_analyze_honors_a_server_suggested_retry_after_over_computed_backoff():
     response = provider.analyze(_request())
     assert response.error is None
     assert sleep.delays == [9.0]
+
+
+# --------------------------------------------------------------------------- #
+# _response_schema_for_pass / analyze()'s generation_config: a live gate-1
+# run against gpt-4.1-mini returned start_s=end_s=5.533 for a submitted
+# window of [20.000, 23.000]s - a value matching none of the frames shown.
+# Grounding safely rejected it, but the call was wasted. Constrain the
+# Structured Outputs schema so this is structurally impossible for OpenAI to
+# return, for exactly that shape of window (nonzero-based, not starting at
+# t=0 - the real failure was against a mid-clip window, not an edge case
+# only visible near the start of a video).
+# --------------------------------------------------------------------------- #
+
+
+def test_response_schema_for_end_scan_constrains_start_and_end_to_submitted_timestamps():
+    window_timestamps = [20.0, 20.6, 21.2, 21.8, 22.4, 23.0]
+    schema = _response_schema_for_pass("end_scan", window_timestamps)
+    for field in ("start_s", "end_s"):
+        prop = schema["properties"][field]
+        assert "anyOf" in prop
+        numeric_branch = next(b for b in prop["anyOf"] if b.get("type") == "number")
+        null_branch = next(b for b in prop["anyOf"] if b.get("type") == "null")
+        assert numeric_branch["enum"] == window_timestamps
+        assert null_branch == {"type": "null"}
+    # The fabricated value from the real run must not be a legal answer.
+    assert 5.533 not in schema["properties"]["start_s"]["anyOf"][0]["enum"]
+
+
+def test_response_schema_for_end_scan_deduplicates_and_sorts_timestamps():
+    schema = _response_schema_for_pass("end_scan", [21.8, 20.0, 21.8, 23.0, 20.6])
+    enum = schema["properties"]["start_s"]["anyOf"][0]["enum"]
+    assert enum == [20.0, 20.6, 21.8, 23.0]
+
+
+def test_response_schema_for_coarse_and_fine_is_unconstrained():
+    for pass_name in ("coarse", "fine"):
+        schema = _response_schema_for_pass(pass_name, [20.0, 21.0, 22.0])
+        assert schema["properties"]["start_s"] == {"type": ["number", "null"]}
+        assert schema["properties"]["end_s"] == {"type": ["number", "null"]}
+
+
+def test_response_schema_for_end_scan_with_no_timestamps_falls_back_unconstrained():
+    # Defensive: an empty frame list should never happen in practice (the
+    # pipeline always sends at least the budget floor), but the schema
+    # builder must not crash or emit an empty (unsatisfiable) enum.
+    schema = _response_schema_for_pass("end_scan", [])
+    assert schema["properties"]["start_s"] == {"type": ["number", "null"]}
+
+
+def test_analyze_passes_pass_name_and_frame_timestamps_through_generation_config():
+    seen_configs = []
+
+    def respond(model, parts, cfg):
+        seen_configs.append(cfg)
+        return OpenAICallResult(text=CONFIRMED_JSON)
+
+    client = _FakeClient(respond)
+    provider = OpenAITimingProvider(client, sleep_fn=_RecordingSleep())
+    window_frames = (
+        TimedFrame(timestamp_s=20.0, image_bytes=b"\xff\xd8fake1"),
+        TimedFrame(timestamp_s=21.5, image_bytes=b"\xff\xd8fake2"),
+        TimedFrame(timestamp_s=23.0, image_bytes=b"\xff\xd8fake3"),
+    )
+    request = ProviderRequest(
+        prompt_version="test-v1",
+        prompt_text="analyze this window",
+        frames=window_frames,
+        pass_name="end_scan",
+    )
+    provider.analyze(request)
+    assert seen_configs[0]["pass_name"] == "end_scan"
+    assert seen_configs[0]["frame_timestamps_s"] == [20.0, 21.5, 23.0]
