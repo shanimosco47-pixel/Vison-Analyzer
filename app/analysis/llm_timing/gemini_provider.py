@@ -281,15 +281,61 @@ def _client_error_retry_after_s(exc: Exception) -> float | None:
     return None
 
 
-def build_default_gemini_client(api_key_env_var: str = "GEMINI_API_KEY") -> GeminiClient:
+DEFAULT_REQUEST_TIMEOUT_S = 120.0
+
+
+def _looks_like_a_timeout(exc: Exception) -> bool:
+    """Best-effort, class-name-based check for whether ``exc`` represents a
+    request that exceeded its configured timeout - not an ``isinstance``
+    check against a confirmed exception type, since this sandbox's network
+    access to ai.google.dev is blocked and the google-genai SDK's exact
+    timeout exception shape has not been verified against live
+    documentation, same caveat as every other SDK-shape note in this
+    module. Matches ``httpx.TimeoutException``/``ReadTimeout``/
+    ``ConnectTimeout`` and the stdlib ``TimeoutError`` alike, which cover
+    every plausible shape without depending on which one the installed
+    SDK version actually raises."""
+    return "timeout" in type(exc).__name__.lower()
+
+
+def build_default_gemini_client(
+    api_key_env_var: str = "GEMINI_API_KEY",
+    *,
+    api_key: str | None = None,
+    timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+) -> GeminiClient:
     """Construct the real Gemini SDK-backed client. Not exercised by tests.
 
     Imports the SDK lazily, inside this function body, so nothing in this
     package requires it to be installed unless this specific factory is
-    actually called - which nothing in this spike does yet. Reads the key
-    from the named environment variable only (never a literal), matching
-    the "server-side environment/secret store only, never committed"
-    requirement.
+    actually called - which nothing in this spike does yet.
+
+    ``api_key``, if given, is used directly instead of reading
+    ``api_key_env_var`` from the environment - the resolved value from an
+    OS-protected secret store (see ``app/services/secret_store.py``),
+    handed straight to the SDK client constructor and never round-tripped
+    through ``os.environ`` (a Codex review of the app-integration slice
+    caught the earlier design doing exactly that: it left a saved key
+    process-wide for the server's entire lifetime with no cleanup - the
+    opposite of the OS-secret-store boundary the key was saved to protect
+    in the first place). The environment-variable path is unchanged: when
+    ``api_key`` is not given, this still reads ``api_key_env_var`` from
+    ``os.environ`` exactly as before, matching the "server-side
+    environment/secret store only, never committed" requirement - an
+    operator-managed environment-variable reference keeps working exactly
+    as it did.
+
+    ``timeout_s`` bounds every request via ``HttpOptions.timeout``
+    (milliseconds, per the SDK - UNVERIFIED against live documentation
+    like the rest of this function's SDK-shape notes, for the same reason;
+    confirm the unit against the installed SDK version before depending on
+    it precisely). Without an explicit timeout a stalled request can hang
+    indefinitely despite the caller's own staged-progress UI. Whatever
+    exception type a timeout actually raises,
+    ``GeminiTimingProvider.analyze``'s own catch-all already converges any
+    unclassified exception on a safe, non-crashing failed state - see
+    :func:`_looks_like_a_timeout` for the best-effort message improvement
+    layered on top of that existing guarantee, not a precondition for it.
 
     Built against the current GA ``google-genai`` SDK
     (``pip install google-genai`` - see ``requirements-llm-spike.txt``),
@@ -297,8 +343,8 @@ def build_default_gemini_client(api_key_env_var: str = "GEMINI_API_KEY") -> Gemi
     """
     import os
 
-    api_key = os.environ.get(api_key_env_var)
-    if not api_key:
+    resolved_key = api_key if api_key is not None else os.environ.get(api_key_env_var)
+    if not resolved_key:
         raise ConfigurationError(
             f"No Gemini API key found in the {api_key_env_var} environment variable.",
             detail="set it server-side before constructing a live Gemini client",
@@ -308,7 +354,10 @@ def build_default_gemini_client(api_key_env_var: str = "GEMINI_API_KEY") -> Gemi
     from google.genai import errors as genai_errors
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=resolved_key,
+        http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),
+    )
 
     def _to_genai_part(part: dict):
         if "text" in part:
@@ -339,6 +388,21 @@ def build_default_gemini_client(api_key_env_var: str = "GEMINI_API_KEY") -> Gemi
             except genai_errors.ServerError as exc:
                 # 5xx - worth a bounded retry.
                 raise TransientProviderError(str(exc)) from exc
+            except Exception as exc:
+                # A request that exceeded http_options.timeout above raises
+                # from the SDK's own transport layer, not a genai_errors
+                # subclass - see _looks_like_a_timeout's own docstring for
+                # why this is a best-effort name check rather than a
+                # confirmed isinstance check. Non-timeout-shaped exceptions
+                # re-raise completely unchanged; GeminiTimingProvider.analyze's
+                # own catch-all already handles those safely, exactly as it
+                # did before this branch existed.
+                if _looks_like_a_timeout(exc):
+                    raise TransientProviderError(
+                        f"The request to Gemini did not complete within {timeout_s:.0f}s "
+                        "and was abandoned."
+                    ) from exc
+                raise
 
             usage = getattr(response, "usage_metadata", None)
             return GeminiCallResult(

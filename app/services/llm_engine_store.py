@@ -14,22 +14,26 @@ metadata (provider, model, display name, enabled) to one JSON file under
   manages themselves (the documented development fallback); nothing is
   stored server-side for this path beyond the variable's own name.
 
-Building a real provider still goes through the existing
-``build_default_openai_client``/``build_default_gemini_client`` factories
-unchanged - both read a credential from a *named* environment variable
-only, a deliberate pre-existing choice (never accept a literal key through
-a function argument that might end up in a traceback or a repr). A
-resolved secret is therefore materialized into a per-engine, unique
-process environment variable immediately before constructing the client -
-see :func:`_env_var_for_secret` - so two engines' credentials, even
-resolved concurrently by two independent runs, can never collide on the
-same variable name.
+Building a real provider goes through the existing
+``build_default_openai_client``/``build_default_gemini_client`` factories,
+each of which accepts an ``api_key`` keyword argument (in addition to
+their original ``api_key_env_var`` positional one): a resolved
+``"secret:<key>"`` credential is passed straight through as ``api_key``,
+never written into ``os.environ`` - a Codex review of an earlier version
+of this module caught it doing exactly that (materializing the secret
+into a process-wide environment variable before building the client),
+which left a saved key readable by the whole process for the server's
+entire lifetime with no cleanup, the opposite of the OS-secret-store
+boundary the key was saved to protect in the first place. An
+``"env:<VAR_NAME>"`` credential is unaffected by any of this: it is still
+passed as the plain ``api_key_env_var`` positional argument, so the
+factory reads it from ``os.environ`` itself, exactly as before - this
+module never touches ``os.environ`` for either credential shape.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import threading
 import uuid
@@ -54,16 +58,6 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 def _looks_like_an_env_var_name(value: str) -> bool:
     return bool(_ENV_VAR_NAME_RE.match(value))
-
-
-def _env_var_for_secret(engine_id: str) -> str:
-    """A per-engine, deterministic, unique process environment variable
-    name - purely an implementation detail of handing a resolved secret to
-    the existing vendor client factories, which read a *named* environment
-    variable only. Never persisted, never shown to a client; only ever set
-    in this process's own ``os.environ`` right before constructing a
-    client for this specific engine."""
-    return f"VISION_ANALYZER_LLM_ENGINE_SECRET_{engine_id.upper()}"
 
 
 class LLMEngineStore:
@@ -261,15 +255,27 @@ class LLMEngineStore:
         """Resolve ``engine``'s credential and construct a real
         ``TimingProvider`` for it. Raises :class:`AnalyzerError` (a message
         safe to show a user - never the credential's value) if the
-        credential can't be resolved or the provider is unsupported."""
-        api_key_env_var = self._materialize_credential(engine)
+        credential can't be resolved or the provider is unsupported.
+
+        Never touches ``os.environ``: a ``"secret:<key>"`` credential's
+        resolved value is passed straight into the vendor client factory's
+        ``api_key`` keyword argument; a ``"env:<VAR_NAME>"`` credential is
+        passed as the factory's ``api_key_env_var`` positional argument
+        unchanged, so the factory reads it from the environment itself,
+        exactly as it always has - see :meth:`_resolve_credential`.
+        """
+        api_key, api_key_env_var = self._resolve_credential(engine)
         if engine.provider_name == "openai":
             from ..analysis.llm_timing.openai_provider import (
                 OpenAITimingProvider,
                 build_default_openai_client,
             )
 
-            openai_client = build_default_openai_client(api_key_env_var)
+            if api_key is not None:
+                openai_client = build_default_openai_client(api_key=api_key)
+            else:
+                assert api_key_env_var is not None  # _resolve_credential's own contract
+                openai_client = build_default_openai_client(api_key_env_var)
             return OpenAITimingProvider(openai_client, model_id=engine.model_id)
         if engine.provider_name == "gemini":
             from ..analysis.llm_timing.gemini_provider import (
@@ -277,14 +283,25 @@ class LLMEngineStore:
                 build_default_gemini_client,
             )
 
-            gemini_client = build_default_gemini_client(api_key_env_var)
+            if api_key is not None:
+                gemini_client = build_default_gemini_client(api_key=api_key)
+            else:
+                assert api_key_env_var is not None  # _resolve_credential's own contract
+                gemini_client = build_default_gemini_client(api_key_env_var)
             return GeminiTimingProvider(gemini_client, model_id=engine.model_id)
         raise AnalyzerError(f"Unsupported provider '{engine.provider_name}'.")  # pragma: no cover
 
-    def _materialize_credential(self, engine: EngineConfig) -> str:
+    def _resolve_credential(self, engine: EngineConfig) -> tuple[str | None, str | None]:
+        """Returns ``(api_key, api_key_env_var)`` - exactly one is not
+        ``None``. A ``"secret:<key>"`` reference resolves to the actual
+        key value (``api_key``); an ``"env:<VAR_NAME>"`` reference resolves
+        to the variable's own *name* only (``api_key_env_var``) - this
+        method itself never reads or writes ``os.environ``, that stays the
+        vendor client factory's job for the env-var path, unchanged from
+        before."""
         ref = engine.credential_ref
         if ref.startswith(_ENV_REF_PREFIX):
-            return ref[len(_ENV_REF_PREFIX) :]
+            return None, ref[len(_ENV_REF_PREFIX) :]
         if ref.startswith(_SECRET_REF_PREFIX):
             secret_key = ref[len(_SECRET_REF_PREFIX) :]
             value = self._secret_store.resolve(secret_key)
@@ -293,9 +310,7 @@ class LLMEngineStore:
                     "This engine's saved API key could not be found. Re-enter "
                     "it in the engine's settings."
                 )
-            env_var = _env_var_for_secret(engine.engine_id)
-            os.environ[env_var] = value
-            return env_var
+            return value, None
         raise AnalyzerError("This engine's credential reference is not valid.")  # pragma: no cover
 
     def test(self, engine_id: str) -> dict:

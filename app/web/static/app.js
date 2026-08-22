@@ -1229,6 +1229,8 @@ async function runLLMEngine(engine) {
 
   runBtn.disabled = true;
   cancelBtn.classList.remove("hidden");
+  cancelBtn.disabled = false;
+  cancelBtn.textContent = "Cancel";
   progress.classList.remove("hidden");
   resultEl.classList.add("hidden");
   message.textContent = "Starting...";
@@ -1361,9 +1363,22 @@ function renderLLMResult(container, job) {
 function cancelLLMRun(engineId) {
   const runInfo = llmState.runs[engineId];
   if (!runInfo) return;
-  getJSON(`/api/llm-runs/${runInfo.runId}/cancel`, { method: "POST" }).catch((err) =>
-    showError(err.message)
-  );
+  const card = findLLMCard(engineId);
+  if (card) {
+    // Disable immediately, before the round trip - a provider request
+    // already in flight cannot be interrupted mid-request (only the
+    // *next* pipeline pass is prevented from starting), so a repeated
+    // click here would not do anything faster; it would only confuse
+    // whether the first click registered.
+    const cancelBtn = card.querySelector(".llm-cancel-btn");
+    cancelBtn.disabled = true;
+    cancelBtn.textContent = "Cancelling...";
+    card.querySelector(".progress-message").textContent =
+      "Cancel requested - stopping after the current provider request finishes";
+  }
+  getJSON(`/api/llm-runs/${runInfo.runId}/cancel`, { method: "POST" }).catch((err) => {
+    showError(err.message);
+  });
 }
 
 function openLLMEngineForm(engine) {

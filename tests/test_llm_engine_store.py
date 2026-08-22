@@ -227,21 +227,28 @@ def test_delete_of_an_env_var_engine_does_not_touch_the_secret_store(
 # --------------------------------------------------------------------------- #
 
 
-def test_build_provider_materializes_a_saved_secret_into_a_unique_env_var_then_builds(
+def test_build_provider_passes_a_saved_secret_directly_never_via_os_environ(
     store: LLMEngineStore, monkeypatch: pytest.MonkeyPatch
 ):
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-abc123")
+    """A saved API key must reach the vendor client factory through its
+    ``api_key`` keyword argument, never by way of ``os.environ`` - an
+    earlier version of this module materialized it into a process-wide
+    environment variable with no cleanup, which a Codex review flagged as
+    leaving the key readable by the whole process for the server's entire
+    lifetime, defeating the point of the OS-protected secret store."""
+    import os
 
-    seen_env_var: dict[str, str] = {}
+    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-abc123")
+    env_snapshot_before = dict(os.environ)
+
+    seen: dict[str, object] = {}
 
     class _FakeClient:
         pass
 
-    def fake_build_default_openai_client(api_key_env_var: str):
-        import os
-
-        seen_env_var["name"] = api_key_env_var
-        seen_env_var["value"] = os.environ.get(api_key_env_var)
+    def fake_build_default_openai_client(api_key_env_var: str = "OPENAI_API_KEY", **kwargs):
+        seen["api_key_env_var_positional"] = api_key_env_var
+        seen["kwargs"] = kwargs
         return _FakeClient()
 
     monkeypatch.setattr(
@@ -251,8 +258,15 @@ def test_build_provider_materializes_a_saved_secret_into_a_unique_env_var_then_b
 
     provider = store.build_provider(engine)
     assert provider is not None
-    assert seen_env_var["value"] == "sk-abc123"
-    assert engine.engine_id.upper() in seen_env_var["name"]
+    assert seen["kwargs"] == {"api_key": "sk-abc123"}
+    # The positional api_key_env_var was never touched by this call - the
+    # factory was invoked with only the api_key keyword.
+    assert seen["api_key_env_var_positional"] == "OPENAI_API_KEY"
+
+    # And no new or changed environment variable anywhere carries the secret.
+    env_snapshot_after = dict(os.environ)
+    assert env_snapshot_after == env_snapshot_before
+    assert not any("sk-abc123" in value for value in os.environ.values())
 
 
 def test_build_provider_uses_the_operators_own_env_var_for_the_env_reference(
@@ -300,7 +314,7 @@ def test_test_endpoint_helper_reports_ok_when_the_client_builds(
 
     monkeypatch.setattr(
         "app.analysis.llm_timing.openai_provider.build_default_openai_client",
-        lambda api_key_env_var: _FakeClient(),
+        lambda *args, **kwargs: _FakeClient(),
     )
     result = store.test(engine.engine_id)
     assert result["ok"] is True

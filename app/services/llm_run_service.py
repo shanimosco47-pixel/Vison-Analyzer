@@ -166,6 +166,16 @@ class LLMRunService:
         return job
 
     def cancel(self, run_id: str) -> LLMRunJob:
+        """Request cancellation. Honest about what this can and can't stop:
+        cancellation is checked cooperatively, only *between* pipeline
+        passes (see ``on_stage`` below) - a provider request already in
+        flight when Cancel is clicked keeps running until it returns, and
+        only the *next* pass is prevented from starting. A still-queued
+        run stops immediately, with nothing ever having been sent; a
+        running one gets an honest "stopping after the current request"
+        message instead of implying an in-flight vendor call was aborted
+        (a Codex review flagged the earlier version of this message as
+        overclaiming immediacy)."""
         job = self.get(run_id)
         job._cancel.set()
         if job.status == "queued":
@@ -173,6 +183,11 @@ class LLMRunService:
             job.finished_at = time.time()
             job.stage = "cancelled"
             job.message = "Cancelled before it started"
+        elif job.status == "running":
+            job.message = (
+                "Cancel requested - stopping after the current provider "
+                "request finishes (it cannot be interrupted mid-request)"
+            )
         logger.info("Cancellation requested for LLM run %s", run_id)
         return job
 

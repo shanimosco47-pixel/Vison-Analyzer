@@ -220,6 +220,37 @@ def test_cancel_mid_run_stops_before_the_next_pass_completes(
     assert "fine" not in seen_passes
 
 
+def test_cancel_of_a_running_job_reports_an_honest_stopping_message(
+    engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
+):
+    """Cancelling a job whose coarse request is already in flight must not
+    claim the vendor call itself was stopped - only that the *next* pass
+    won't start. The message right after cancel() (before the run has
+    actually finished) says so, distinct from "Cancelled before it
+    started" (the queued case) and from the final "Run cancelled"."""
+    engine = engine_store.create(
+        provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY"
+    )
+    seen_message_at_cancel_time: dict[str, str] = {}
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            cancelled_job = run_service.cancel(job_holder["run_id"])
+            seen_message_at_cancel_time["message"] = cancelled_job.message
+            assert cancelled_job.status == "running"  # not yet actually stopped
+        return canned_json_response(start_s=4.0, end_s=12.0, confidence=0.9)
+
+    monkeypatch.setattr(engine_store, "build_provider", lambda e: StubTimingProvider(respond))
+
+    job_holder: dict[str, str] = {}
+    job = run_service.submit(record, engine)
+    job_holder["run_id"] = job.run_id
+    _wait_for(run_service, job.run_id)
+
+    assert "stopping after the current" in seen_message_at_cancel_time["message"]
+    assert "current" in seen_message_at_cancel_time["message"]
+
+
 def test_a_frames_only_provider_request_never_carries_the_video_file(
     engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
 ):

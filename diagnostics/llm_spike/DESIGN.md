@@ -1673,3 +1673,123 @@ and the result/status-line helpers behind the comparison UI).
 No real vendor call was made from this sandbox (no API key here, as
 every prior round has noted) - manual verification against a real key is
 the operator's next step. PR #5 stays draft, not marked ready.
+
+## 24. Codex UI review of §23: secrets in os.environ, no request timeout, overclaimed cancellation
+
+A Codex review of commit `58479b5` (the app-integration slice) found the
+integration direction sound (focused suite: 116 Python + 25 JS, passing)
+but flagged three user-test blockers, not algorithm polish:
+
+**1. Saved secrets were copied into `os.environ` and never removed.**
+`LLMEngineStore._materialize_credential` wrote
+`VISION_ANALYZER_LLM_ENGINE_SECRET_<ID>` into the process environment
+before every `build_provider`/`test` call and never cleared it - a saved
+API key was readable by the whole process for the server's entire
+lifetime, the opposite of the OS-secret-store boundary the key was saved
+to protect in the first place.
+
+**Fix**: `build_default_openai_client`/`build_default_gemini_client` each
+gained an `api_key: str | None = None` keyword argument. When given, it
+is passed straight to the SDK client constructor; the original
+`api_key_env_var` positional argument is untouched and still works
+exactly as before for the `"env:<VAR_NAME>"` (operator-managed) path.
+`LLMEngineStore.build_provider`/`_resolve_credential` (renamed from
+`_materialize_credential`) now returns `(api_key, api_key_env_var)` -
+exactly one non-`None` - and never touches `os.environ` itself; the
+`_env_var_for_secret` helper and the per-engine env-var scheme it
+implemented are gone entirely. Regressions: `test_llm_provider_client_factories.py`
+snapshots `os.environ` before/after a `build_default_*_client(api_key=...)`
+call and asserts it is byte-for-byte unchanged (using a fake SDK module
+injected into `sys.modules`, since neither real SDK is installed here);
+`test_llm_engine_store.py::test_build_provider_passes_a_saved_secret_directly_never_via_os_environ`
+does the same at the `LLMEngineStore` layer and additionally asserts the
+resolved key string appears in no environment variable's value.
+
+**2. No bounded per-vendor request timeout.** Neither real SDK client was
+constructed with an explicit timeout, so a stalled request could hang
+indefinitely - the staged-progress UI would keep showing "in progress"
+for a request that was never coming back.
+
+**Fix**: both factories gained `timeout_s: float = 120.0`
+(`DEFAULT_REQUEST_TIMEOUT_S`), passed to the SDK client constructor
+(`OpenAI(..., timeout=timeout_s)`; `genai.Client(..., http_options=types.HttpOptions(timeout=timeout_s*1000))`
+- milliseconds, UNVERIFIED against live documentation like this module's
+other SDK-shape notes, network access to ai.google.dev being blocked
+here). A timeout already converged on the existing safe ABSTAIN/failed
+path with zero further change: OpenAI's `APITimeoutError` is a subclass
+of `APIConnectionError`, already classified `TransientProviderError`; the
+Gemini wrapper gained a best-effort, class-name-based
+`_looks_like_a_timeout` check (`"timeout" in type(exc).__name__.lower()`
+- not an `isinstance` check against a confirmed SDK exception type, same
+caveat) so the failure message names the configured bound explicitly
+("did not complete within 7s") rather than leaving the SDK's raw text;
+anything that doesn't match this heuristic re-raises completely
+unchanged, so `GeminiTimingProvider.analyze`'s own pre-existing catch-all
+still handles it safely regardless. Regressions inject a fake SDK client
+whose call raises a timeout-shaped exception and assert the resulting
+`TransientProviderError`'s message names the configured `timeout_s`.
+
+**3. Cancel was only checked between passes but presented as immediate.**
+`on_stage` was already correctly cooperative (checked before each of the
+four pipeline passes, never mid-request - see §23), but the "Cancel
+requested" UI gave no indication of that: a click looked like it should
+stop an in-flight vendor request, which it structurally cannot (neither
+SDK's request object is exposed to `LLMRunService` for that).
+
+**Fix**: `LLMRunService.cancel` now distinguishes three cases explicitly -
+a still-queued job stops immediately with nothing ever sent ("Cancelled
+before it started", unchanged); a running job gets an honest "Cancel
+requested - stopping after the current provider request finishes (it
+cannot be interrupted mid-request)" message, status staying `"running"`
+until the next `on_stage` check actually raises and the worker's own
+`except RunCancelled` sets the final "Run cancelled" state - the
+in-flight-request caveat is stated outright rather than implied away.
+`app/web/static/app.js`'s `cancelLLMRun` disables the Cancel button and
+relabels it "Cancelling..." immediately on click, before the network
+round-trip, so repeated clicks don't suggest a faster stop is possible;
+`runLLMEngine` resets that state when a fresh run starts. Neither SDK's
+own request-cancellation was wired in this round (would need investigating
+each SDK's own cancellation support cleanly, out of scope per the
+review's own "otherwise document the bounded behavior" fallback) - the
+bounded, honest cooperative semantics are what's shipped and documented,
+not faked as immediate. Regression:
+`test_llm_run_service.py::test_cancel_of_a_running_job_reports_an_honest_stopping_message`
+cancels from inside an in-flight stub response and asserts the message
+right after `cancel()` returns (before the run has actually finished).
+
+### Manual test procedure (updated)
+
+Same as §23's, with two additions to verify at steps 4-6:
+
+- After saving an API key (step 4), inspect the server process's
+  environment (e.g. `cat /proc/<pid>/environ` on Linux, or add a
+  temporary log line) and confirm no `VISION_ANALYZER_LLM_ENGINE_SECRET_*`
+  variable - or the key's own value under any name - appears there,
+  before or after clicking Run.
+- Click Cancel while a run is genuinely mid-request (a real, slow vendor
+  call): the message should read "Cancel requested - stopping after the
+  current provider request finishes..."), the button should grey out
+  immediately, and the run should still take until the in-flight request
+  returns before actually stopping - confirming the UI's own claim about
+  itself rather than a faster fake stop.
+
+### Gates
+
+`pytest -q` - 557 passed (up from 545; 12 new: 9 in
+`test_llm_provider_client_factories.py` covering both factories'
+`api_key`/`timeout_s` behavior plus the `_looks_like_a_timeout` helper,
+2 replacing/extending the old os.environ-materialization test in
+`test_llm_engine_store.py`, 1 for the honest cancel message in
+`test_llm_run_service.py`). `ruff check .` / `ruff format --check .` -
+clean. `mypy app` - clean except the same pre-existing, unrelated
+`app/web/routes.py` finding noted since §11 (a real mypy catch of my own
+fixed along the way: `build_provider`'s `api_key_env_var` needed an
+explicit `assert ... is not None` to narrow past `_resolve_credential`'s
+`tuple[str | None, str | None]` return type). `node --test
+tests_js/*.test.js` - 69/69, unaffected (this round's cancel-button
+disabling is DOM wiring, exercised by the manual procedure above, not by
+the pure-function JS tests, matching how the rest of this file's DOM code
+is tested).
+
+No real vendor call was made from this sandbox (still no SDK installed,
+no API key here). PR #5 stays draft, not marked ready.

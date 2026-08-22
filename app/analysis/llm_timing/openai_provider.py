@@ -330,15 +330,46 @@ def _response_schema_for_pass(pass_name: str, frame_timestamps_s: list[float]) -
     }
 
 
-def build_default_openai_client(api_key_env_var: str = "OPENAI_API_KEY") -> OpenAIClient:
+DEFAULT_REQUEST_TIMEOUT_S = 120.0
+
+
+def build_default_openai_client(
+    api_key_env_var: str = "OPENAI_API_KEY",
+    *,
+    api_key: str | None = None,
+    timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+) -> OpenAIClient:
     """Construct the real OpenAI SDK-backed client. Not exercised by tests.
 
     Imports the SDK lazily, inside this function body, so nothing in this
     package requires it to be installed unless this specific factory is
-    actually called - which nothing in this spike does yet. Reads the key
-    from the named environment variable only (never a literal), matching
-    the "server-side environment/secret store only, never committed"
-    requirement.
+    actually called - which nothing in this spike does yet.
+
+    ``api_key``, if given, is used directly instead of reading
+    ``api_key_env_var`` from the environment - the resolved value from an
+    OS-protected secret store (see ``app/services/secret_store.py``),
+    handed straight to the SDK client constructor and never round-tripped
+    through ``os.environ`` (a Codex review of the app-integration slice
+    caught the earlier design doing exactly that: it left a saved key
+    process-wide for the server's entire lifetime with no cleanup - the
+    opposite of the OS-secret-store boundary the key was saved to protect
+    in the first place). The environment-variable path is unchanged: when
+    ``api_key`` is not given, this still reads ``api_key_env_var`` from
+    ``os.environ`` exactly as before, matching the "server-side
+    environment/secret store only, never committed" requirement - an
+    operator-managed environment-variable reference keeps working exactly
+    as it did.
+
+    ``timeout_s`` bounds every request (the openai SDK's own ``timeout``
+    constructor parameter, in seconds - a stable, documented part of its
+    client shape). Without an explicit timeout the SDK's own long default
+    lets a stalled request hang far longer than any caller's staged-
+    progress UI implies. A timeout surfaces as ``openai.APITimeoutError``
+    (a subclass of ``APIConnectionError``), already classified as
+    ``TransientProviderError`` below - the existing bounded retry loop
+    (``OpenAITimingProvider``) and downstream ABSTAIN/failed-state handling
+    apply unchanged, so a timeout converges on the same safe outcome any
+    other transient provider error already does.
 
     Built against the official ``openai`` Python SDK
     (``pip install openai`` - see ``requirements-llm-spike.txt``), using
@@ -360,8 +391,8 @@ def build_default_openai_client(api_key_env_var: str = "OPENAI_API_KEY") -> Open
     """
     import os
 
-    api_key = os.environ.get(api_key_env_var)
-    if not api_key:
+    resolved_key = api_key if api_key is not None else os.environ.get(api_key_env_var)
+    if not resolved_key:
         raise ConfigurationError(
             f"No OpenAI API key found in the {api_key_env_var} environment variable.",
             detail="set it server-side before constructing a live OpenAI client",
@@ -372,11 +403,12 @@ def build_default_openai_client(api_key_env_var: str = "OPENAI_API_KEY") -> Open
     from openai import (
         APIConnectionError,
         APIStatusError,
+        APITimeoutError,
         InternalServerError,
         OpenAI,
     )
 
-    client = OpenAI(api_key=api_key, max_retries=0)
+    client = OpenAI(api_key=resolved_key, max_retries=0, timeout=timeout_s)
 
     def _to_openai_part(part: dict) -> dict:
         if "text" in part:
@@ -417,10 +449,20 @@ def build_default_openai_client(api_key_env_var: str = "OPENAI_API_KEY") -> Open
                 # exception type (it covers the whole >=500 range), so
                 # classified by type rather than by _classify_status_error.
                 raise TransientProviderError(str(exc)) from exc
+            except APITimeoutError as exc:
+                # Caught ahead of the plain APIConnectionError branch below
+                # (APITimeoutError is a subclass of it) so the message
+                # names the configured bound explicitly - "the request
+                # timed out" alone doesn't tell a user reading the run's
+                # failure message whether that was 5 seconds or 5 minutes.
+                raise TransientProviderError(
+                    f"The request to OpenAI did not complete within {timeout_s:.0f}s "
+                    "and was abandoned."
+                ) from exc
             except APIConnectionError as exc:
-                # Network-level failure (including APITimeoutError, a
-                # subclass of this) - not an HTTP status at all, worth a
-                # bounded retry just like a bare ConnectionError/TimeoutError.
+                # Every other network-level failure - not an HTTP status at
+                # all, worth a bounded retry just like a bare
+                # ConnectionError/TimeoutError.
                 raise TransientProviderError(str(exc)) from exc
             except APIStatusError as exc:
                 # Every other 4xx (bad request, auth, not found, ...) minus
