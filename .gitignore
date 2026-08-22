@@ -13,3 +13,8 @@ dist/
 .vision_analyzer/
 benchmark*.mp4
 *.log
+
+# Generated diagnostic video clips (e.g. diagnostics/stage0/clips/*.mp4):
+# reproducible from the scripts that made them, and real/synthetic footage
+# never belongs in git regardless - see tests/conftest.py's docstring.
+diagnostics/*/clips/
