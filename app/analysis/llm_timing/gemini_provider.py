@@ -13,19 +13,35 @@ live request happens anywhere in this spike - see
 ``diagnostics/llm_spike/DESIGN.md`` - this only makes the adapter
 constructible and fully testable behind the existing ``TimingProvider`` seam,
 ready to be wired in once a key is supplied and reviewed.
+
+Built against the current GA ``google-genai`` SDK (``from google import
+genai``), not the deprecated ``google-generativeai`` package - see
+``requirements-llm-spike.txt`` for the (optional, not installed by default)
+dependency.
 """
 
 from __future__ import annotations
 
 import base64
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
 from ...errors import ConfigurationError
-from .provider import ProviderRequest, RawProviderResponse
+from .provider import (
+    PermanentProviderError,
+    ProviderRequest,
+    RawProviderResponse,
+    TransientProviderError,
+)
 
 DEFAULT_GEMINI_MODEL_ID = "gemini-2.5-flash-lite"
+
+# Exception types treated as retryable even when a client raises them bare
+# (not wrapped in TransientProviderError) - the common shapes of "the
+# network hiccuped", which a bounded retry can plausibly fix.
+_RETRYABLE_BARE_EXCEPTIONS: tuple[type[Exception], ...] = (TimeoutError, ConnectionError)
 
 
 @dataclass(frozen=True)
@@ -46,7 +62,12 @@ class GeminiClient(Protocol):
     """The seam a fake test client and the real SDK wrapper both implement.
 
     Kept intentionally narrow (one method, plain-dict parts) so a test
-    double needs nothing beyond stdlib to satisfy it.
+    double needs nothing beyond stdlib to satisfy it. Raise
+    ``provider.TransientProviderError`` for a retryable failure (timeout,
+    429, 5xx) and ``provider.PermanentProviderError`` for one that isn't
+    (auth, validation, payload too large) - see
+    :class:`GeminiTimingProvider`'s retry policy. Any other exception is
+    treated as permanent by default (see the class docstring for why).
     """
 
     def generate_content(
@@ -61,6 +82,15 @@ class GeminiTimingProvider:
     network call or an installed SDK - see
     :func:`build_default_gemini_client` for the one place that actually
     wraps the real SDK, which this class never imports or references.
+
+    Retry policy: only ``TransientProviderError`` (or a bare
+    ``TimeoutError``/``ConnectionError``) is retried, up to ``max_retries``
+    times, with exponential backoff (``backoff_base_s * 2**attempt``,
+    capped at ``backoff_max_s``). Every other exception - including
+    ``PermanentProviderError`` and any unclassified exception a client
+    happens to raise - is treated as non-retryable: retrying an auth
+    failure or a request Gemini already rejected as too large wastes time
+    and money without any chance of a different outcome.
     """
 
     def __init__(
@@ -68,23 +98,37 @@ class GeminiTimingProvider:
         client: GeminiClient,
         *,
         model_id: str = DEFAULT_GEMINI_MODEL_ID,
-        max_retries: int = 1,
+        max_retries: int = 2,
         temperature: float = 0.0,
+        backoff_base_s: float = 1.0,
+        backoff_max_s: float = 10.0,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         if not model_id.strip():
             raise ConfigurationError("GeminiTimingProvider needs a non-empty model_id.")
         if max_retries < 0:
             raise ConfigurationError("max_retries must not be negative.")
+        if backoff_base_s < 0 or backoff_max_s < 0:
+            raise ConfigurationError("backoff_base_s and backoff_max_s must not be negative.")
         self._client = client
         self._model_id = model_id
         self._max_retries = max_retries
         self._temperature = temperature
+        self._backoff_base_s = backoff_base_s
+        self._backoff_max_s = backoff_max_s
+        self._sleep_fn = sleep_fn
 
     def analyze(self, request: ProviderRequest) -> RawProviderResponse:
         """Send one frame batch, total: any client exception becomes an
         ``error``-carrying :class:`RawProviderResponse`, never an exception
         that escapes this method - ``provider.parse_raw_response`` still
         owns turning that into an ABSTAIN verdict.
+
+        ``retries`` on the returned response counts retries *after* the
+        initial attempt, per the contract on
+        ``provider.RawProviderResponse.retries`` - a call that fails once
+        and is never retried (``max_retries=0``, or a non-retryable error)
+        reports ``retries=0``, not 1.
         """
         parts = _build_parts(request)
         generation_config = {
@@ -92,34 +136,44 @@ class GeminiTimingProvider:
             "response_mime_type": "application/json",
         }
 
-        attempts = 0
+        retries_so_far = 0
         last_error: Exception | None = None
         started = time.monotonic()
-        while attempts <= self._max_retries:
+        while True:
             try:
                 result = self._client.generate_content(
                     model=self._model_id, parts=parts, generation_config=generation_config
                 )
             except Exception as exc:  # the client can raise anything vendor-specific
                 last_error = exc
-                attempts += 1
+                if not _is_retryable(exc) or retries_so_far >= self._max_retries:
+                    return RawProviderResponse(
+                        model_id=self._model_id,
+                        raw_text="",
+                        latency_s=time.monotonic() - started,
+                        retries=retries_so_far,
+                        error=str(last_error),
+                    )
+                self._sleep_fn(min(self._backoff_base_s * (2**retries_so_far), self._backoff_max_s))
+                retries_so_far += 1
                 continue
+
             return RawProviderResponse(
                 model_id=self._model_id,
                 raw_text=result.text,
                 latency_s=time.monotonic() - started,
-                retries=attempts,
+                retries=retries_so_far,
                 prompt_tokens=result.prompt_tokens,
                 completion_tokens=result.completion_tokens,
             )
 
-        return RawProviderResponse(
-            model_id=self._model_id,
-            raw_text="",
-            latency_s=time.monotonic() - started,
-            retries=attempts,
-            error=str(last_error) if last_error is not None else "unknown error",
-        )
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, PermanentProviderError):
+        return False
+    if isinstance(exc, TransientProviderError):
+        return True
+    return isinstance(exc, _RETRYABLE_BARE_EXCEPTIONS)
 
 
 def _build_parts(request: ProviderRequest) -> list[dict]:
@@ -152,6 +206,10 @@ def build_default_gemini_client(api_key_env_var: str = "GEMINI_API_KEY") -> Gemi
     from the named environment variable only (never a literal), matching
     the "server-side environment/secret store only, never committed"
     requirement.
+
+    Built against the current GA ``google-genai`` SDK
+    (``pip install google-genai`` - see ``requirements-llm-spike.txt``),
+    not the deprecated ``google-generativeai`` package.
     """
     import os
 
@@ -162,16 +220,41 @@ def build_default_gemini_client(api_key_env_var: str = "GEMINI_API_KEY") -> Gemi
             detail="set it server-side before constructing a live Gemini client",
         )
 
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import errors as genai_errors
+    from google.genai import types
 
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
+
+    def _to_genai_part(part: dict):
+        if "text" in part:
+            return types.Part.from_text(text=part["text"])
+        inline = part["inline_data"]
+        return types.Part.from_bytes(
+            data=base64.b64decode(inline["data"]), mime_type=inline["mime_type"]
+        )
 
     class _RealGeminiClient:
         def generate_content(
             self, *, model: str, parts: list[dict], generation_config: dict
         ) -> GeminiCallResult:
-            gemini_model = genai.GenerativeModel(model)
-            response = gemini_model.generate_content(parts, generation_config=generation_config)
+            genai_parts = [_to_genai_part(part) for part in parts]
+            config = types.GenerateContentConfig(
+                temperature=generation_config.get("temperature"),
+                response_mime_type=generation_config.get("response_mime_type"),
+            )
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=genai_parts, config=config
+                )
+            except genai_errors.ClientError as exc:
+                # 4xx: bad request, auth, payload-too-large, validation -
+                # not retryable, per the class the caller checks against.
+                raise PermanentProviderError(str(exc)) from exc
+            except genai_errors.ServerError as exc:
+                # 5xx - worth a bounded retry.
+                raise TransientProviderError(str(exc)) from exc
+
             usage = getattr(response, "usage_metadata", None)
             return GeminiCallResult(
                 text=response.text,

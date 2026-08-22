@@ -33,7 +33,25 @@ class ModelPricing:
 # wired in (one entry per pinned model_id, not per provider), and bump
 # PRICING_TABLE_VERSION whenever a rate changes so old logged estimates
 # remain interpretable against the table version that produced them.
-PRICING_TABLE: dict[str, ModelPricing] = {}
+#
+# gemini-2.5-flash-lite: $0.10 / 1M input tokens, $0.40 / 1M output tokens.
+#
+# SOURCING CAVEAT: the official page (ai.google.dev/gemini-api/docs/pricing)
+# was unreachable from this sandbox's network (egress blocked); this figure
+# is corroborated across several independent third-party pricing aggregators
+# as of August 2026, not read directly from Google. Re-verify against the
+# official page before this number is used for any real billing decision.
+#
+# OPERATIONAL CAVEAT: multiple sources report Google is retiring
+# gemini-2.5-flash-lite on 2026-10-16. Pinning the spike's default adapter
+# model to a model being sunset in under two months is a real risk worth
+# the supervisor's attention independent of this pricing entry - flagged in
+# diagnostics/llm_spike/DESIGN.md, not something this module can act on.
+PRICING_TABLE: dict[str, ModelPricing] = {
+    "gemini-2.5-flash-lite": ModelPricing(
+        input_usd_per_1k_tokens=0.0001, output_usd_per_1k_tokens=0.0004
+    ),
+}
 
 
 def estimate_cost_usd(

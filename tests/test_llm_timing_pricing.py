@@ -23,6 +23,12 @@ def test_estimate_cost_usd_is_none_for_an_unpriced_model():
     assert estimate_cost_usd("unknown-model", 1000, 1000) is None
 
 
+def test_gemini_flash_lite_has_a_versioned_default_pricing_entry():
+    # 1,000,000 input tokens @ $0.10/1M + 1,000,000 output tokens @ $0.40/1M
+    cost = estimate_cost_usd("gemini-2.5-flash-lite", 1_000_000, 1_000_000)
+    assert cost == pytest.approx(0.10 + 0.40)
+
+
 def test_estimate_cost_usd_is_none_when_usage_is_unknown():
     table = {"m": ModelPricing(input_usd_per_1k_tokens=1.0, output_usd_per_1k_tokens=2.0)}
     assert estimate_cost_usd("m", None, 500, table=table) is None

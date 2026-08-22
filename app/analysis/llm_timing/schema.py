@@ -52,6 +52,11 @@ PIPELINE_REASON_CODES = frozenset(
         # none of it sits near the claimed start_s/end_s
         "uncertainty_exceeds_cap",  # start/end uncertainty too large to
         # trust as CONFIRMED, even though it parsed and is non-negative
+        "request_too_large",  # even the sparsest frame selection that still
+        # meets the gate's precision floor would exceed the provider's
+        # request-size budget; abstain rather than silently drop evidence
+        # below that floor or send an oversized request the provider would
+        # reject anyway (Codex review, round 2, finding 2)
     }
 )
 

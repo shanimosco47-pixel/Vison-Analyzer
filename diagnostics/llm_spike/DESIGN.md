@@ -190,13 +190,15 @@ prints says so loudly so its numbers can't be mistaken for gate evidence.
 | `engine_config.py` - `EngineConfig`, failure-isolated `run_llm_timing_for_engines` | Done (backend only - see §10) |
 | `redaction.py` - centralized, bounded sanitization for all provider/model free text | Done - see §11 |
 | `pipeline._validate_grounding` - anchors a parsed verdict to the actual video/request | Done - see §11 |
-| `pricing.py` + `PipelineOutcome` cost/usage reporting | Done - pricing table empty until a real model is priced, see §11 |
-| `gemini_provider.py` - `GeminiTimingProvider`, the first real adapter | Done, unit-tested with an injected fake client - **not called anywhere; no live request exists in this spike** |
+| `pricing.py` + `PipelineOutcome` cost/usage reporting | Done - `gemini-2.5-flash-lite` priced (unofficial-source caveat), see §12 |
+| `gemini_provider.py` - `GeminiTimingProvider`, built on the GA `google-genai` SDK | Done, unit-tested with an injected fake client - **not called anywhere; no live request exists in this spike** |
+| Deterministic frame resize + request-size/frame-count budget | Done - see §12 |
+| Retry policy (transient-only, bounded backoff, correct retry accounting) | Done - see §12 |
 | A real vendor provider actually wired to a live key | **Not started - needs an API key, explicitly deferred; `build_default_gemini_client` exists but nothing calls it** |
 | The two real hand-verified clips as committed fixtures | **Not available - real footage isn't committed to this repo; see `tests/conftest.py`'s own docstring on why** |
 | Adversarial regression fixtures (gate 2) | Not started |
 | Blinded 15-20 clip evaluation set (gate 3) | Not started - blocked on both of the above |
-| Populated pricing entries for real models | Not started - `PRICING_TABLE` is empty; add an entry once a model is actually being called |
+| Official-source verification of the Gemini pricing entry | Not started - see §12's sourcing caveat |
 | Prompt A/B: raw-video-with-vendor-code-execution vs. our own deterministic frame batching | Open design question - see §8 |
 | Settings UI (engine entries, `+` control, credential fields, connection validation) | **Not started - explicitly deferred until reviewed, see §10** |
 
@@ -427,3 +429,99 @@ before this branch existed, unrelated to any of this work.
 
 Still stopped here, per the standing instruction: no live gate, no
 production/UI wiring, without further review.
+
+## 12. Codex re-review round (commit `2cdcff6`) - three live-gate blockers addressed
+
+A second review pass, after §11's fixes, found the design was sound but not
+yet safe to point at a live key. Three findings, all fixed on this branch.
+
+**1. Deprecated SDK.** `build_default_gemini_client` imported
+`google.generativeai`, which Google has deprecated in favour of the GA
+`google-genai` package. Rewritten against `from google import genai` /
+`google.genai.types` / `client.models.generate_content(...)`, translating
+this module's vendor-neutral `parts: list[dict]` shape into
+`types.Part.from_text`/`types.Part.from_bytes` only inside the real client
+wrapper - `GeminiTimingProvider` and its tests are unaffected, since they
+only ever see the generic dict shape. `requirements-llm-spike.txt` (new,
+not part of `requirements.txt`) documents the dependency and why it's
+optional - nothing in the test suite imports it, and `build_default_gemini_client`
+still isn't called anywhere.
+
+**2. No request-size/frame-count budget.** The fine pass could send every
+native-fps full-resolution JPEG across both boundary windows, base64
+included - on a 1080p/30fps clip, comfortably over Gemini's ~20MB inline
+limit. Fixed with three pieces, all in `pipeline.py`:
+- `_resize_for_encoding`: every frame is downscaled (never upscaled) to
+  `PipelineConfig.max_frame_dimension_px` (default 768px longer side)
+  before encoding - deterministic, provider-agnostic.
+- `_min_frames_for_window`: derives a documented sampling floor from
+  `PipelineConfig.target_tolerance_s` (default 0.75s, matching gate 1) - at
+  least one sample per half-tolerance, so the fine pass never samples
+  sparser than the gate can tolerate.
+- `_fit_frames_to_budget`: deterministically thins an already-extracted
+  frame list until the estimated serialized size
+  (`_estimated_request_bytes`, base64-inflated) fits
+  `PipelineConfig.max_request_bytes` (default 18MB, under Gemini's limit
+  with margin) - never below the floor above. If even the floor doesn't
+  fit, the pass aborts with `request_too_large` **before any provider
+  call is made** - never a silently-thinned request below the gate's
+  precision floor, and never an oversized one sent anyway.
+- Grounding's tolerance (`_effective_tolerance_s`) now derives from the
+  actual gaps between whichever frames were actually selected after
+  thinning, not the nominal pre-thinning step - so a legitimately-cited
+  frame isn't rejected purely because thinning coarsened the achieved
+  density.
+
+Applied to both passes (the coarse pass gets a simpler fixed floor of 4
+frames - it only has to locate an approximate region, not hit gate-level
+precision). 16 new tests (`tests/test_llm_timing_frame_budget.py`): resize
+bounds, budget estimation, deterministic thinning (including a
+determinism check - same input, same output), the floor-unsatisfiable
+case, and two pipeline-level integration tests proving real thinning and a
+real `request_too_large` abstain both actually fire.
+
+**3. Two uncertainty/retry problems:**
+- `PipelineConfig.max_uncertainty_s` defaulted to 5.0s against a ±0.75s
+  acceptance target - a verdict admitting multi-second endpoint
+  uncertainty could still emit a plain CONFIRMED `Event`. Lowered to
+  **0.5s**, documented as itself uncalibrated until gate 3's blinded set
+  says otherwise (§ docstring on the field).
+- `RawProviderResponse.retries` counted total attempts, not retries after
+  the initial one (`max_retries=0` on an immediate failure reported
+  `retries=1`). Fixed in `GeminiTimingProvider.analyze`'s retry loop -
+  `retries=0` now means exactly what it says. Additionally: retries are
+  now only attempted for `provider.TransientProviderError` (or a bare
+  `TimeoutError`/`ConnectionError`) - `provider.PermanentProviderError`
+  and any exception the adapter can't classify are treated as
+  non-retryable by default (retrying an auth failure or a request Gemini
+  already rejected as too large wastes time and money for no chance of a
+  different outcome), with exponential backoff
+  (`backoff_base_s * 2**attempt`, capped at `backoff_max_s`) via an
+  injectable `sleep_fn` so tests never actually sleep. `build_default_gemini_client`'s
+  real wrapper classifies `google.genai.errors.ClientError` (4xx) as
+  permanent and `ServerError` (5xx) as transient. 9 new/rewritten tests in
+  `tests/test_llm_timing_gemini_provider.py`.
+
+**Gemini pricing entry.** `PRICING_TABLE["gemini-2.5-flash-lite"]` is now
+populated ($0.10/1M input, $0.40/1M output tokens) instead of empty.
+**Sourcing caveat, stated plainly**: the official page
+(`ai.google.dev/gemini-api/docs/pricing`) was unreachable from this
+sandbox (network egress blocked); the figure is corroborated across
+several independent third-party pricing aggregators as of August 2026, not
+read directly from Google, and is commented as such in `pricing.py` -
+re-verify against the official source before it's relied on for any real
+billing decision. **Separately, and worth the supervisor's attention
+regardless of pricing**: multiple of those same sources report Google is
+retiring `gemini-2.5-flash-lite` on **2026-10-16**. Pinning this spike's
+default adapter model to one being sunset in under two months is an
+operational risk this module can flag but not resolve - a live rollout
+should confirm the model's support window before depending on it.
+
+**Gates re-run after all of the above**: `pytest -q` - green (full suite,
+80 tests total across this branch's spike test files); `node --test
+tests_js/*.test.js` - green, unaffected; `ruff check .` - clean; `ruff
+format --check .` - clean; `mypy app` - clean except the same
+pre-existing, unrelated `app/web/routes.py` finding noted in §11.
+
+Still stopped here: no live gate, no production/UI wiring, without further
+review.

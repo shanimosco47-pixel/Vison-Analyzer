@@ -1,0 +1,16 @@
+# Optional dependency for the LLM timing spike (app/analysis/llm_timing).
+#
+# Not part of requirements.txt: the spike is not wired into the main
+# application (see diagnostics/llm_spike/DESIGN.md), and nothing in it -
+# including the full test suite - imports this package at module load time.
+# gemini_provider.build_default_gemini_client is the ONLY place that needs
+# it, imported lazily inside that one function, and nothing in this spike
+# calls that function yet.
+#
+# Install only if you're actually going to construct a live Gemini client:
+#     pip install -r requirements-llm-spike.txt
+#
+# google-genai is the current GA SDK (https://pypi.org/project/google-genai/).
+# The older google-generativeai package is deprecated by Google and is
+# deliberately not used here.
+google-genai>=1.0,<2

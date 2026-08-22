@@ -16,8 +16,12 @@ wrong" contract this whole application is built under.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
+
+import cv2
+import numpy as np
 
 from ...errors import ConfigurationError
 from ...video.metadata import VideoInfo
@@ -62,7 +66,34 @@ class PipelineConfig:
             CONFIRMED - a provider that says "start_s=4.0 +/- 12s" has not
             actually located the boundary. Exceeding this cap converges on
             ABSTAIN (reason code "uncertainty_exceeds_cap"), same as every
-            other grounding failure - see ``_validate_grounding``.
+            other grounding failure - see ``_validate_grounding``. Default
+            is deliberately tight relative to the ±0.75s acceptance target
+            (gate 1) - an uncertainty near that bound is not "probably
+            fine", it is "probably outside the gate" - and is itself
+            uncalibrated until the blinded real-clip set (gate 3) says
+            otherwise.
+        target_tolerance_s: the accuracy this pipeline is trying to hit
+            (matches the supervisor's own gate-1 bound, ±0.75s). Used to
+            derive how sparse the fine pass's frame sampling is allowed to
+            get under the request-size budget below - see
+            ``_min_frames_for_window`` - not to change the grounding checks
+            themselves.
+        max_frame_dimension_px: every extracted frame is downscaled (never
+            upscaled) so its longer side is at most this many pixels,
+            before JPEG encoding - deterministic, applied identically
+            regardless of provider.
+        jpeg_quality: passed straight to ``video.reader.encode_jpeg``.
+        max_request_bytes: an explicit ceiling on one request's estimated
+            serialized size (image bytes, base64-inflated, plus the prompt
+            text) - see ``_estimated_request_bytes``. Default leaves
+            headroom under Gemini's ~20MB inline-request limit; set this to
+            match whichever provider is actually wired in. Frames are
+            thinned deterministically (``_fit_frames_to_budget``) to fit,
+            never silently below the precision floor
+            ``_min_frames_for_window`` derives from ``target_tolerance_s`` -
+            a request that still can't fit at that floor aborts with
+            ``request_too_large`` rather than sending fewer frames than the
+            gate needs, or a request the provider would reject anyway.
     """
 
     coarse_step_s: float = 0.5
@@ -70,7 +101,11 @@ class PipelineConfig:
     fine_max_span_s: float = 6.0
     min_confidence: float = 0.5
     review_confidence: float = 0.75
-    max_uncertainty_s: float = 5.0
+    max_uncertainty_s: float = 0.5
+    target_tolerance_s: float = 0.75
+    max_frame_dimension_px: int = 768
+    jpeg_quality: int = 80
+    max_request_bytes: int = 18_000_000
 
     def validate(self) -> None:
         if self.coarse_step_s <= 0:
@@ -85,6 +120,14 @@ class PipelineConfig:
             raise ConfigurationError("review_confidence must be between min_confidence and 1.")
         if self.max_uncertainty_s <= 0:
             raise ConfigurationError("max_uncertainty_s must be positive.")
+        if self.target_tolerance_s <= 0:
+            raise ConfigurationError("target_tolerance_s must be positive.")
+        if self.max_frame_dimension_px <= 0:
+            raise ConfigurationError("max_frame_dimension_px must be positive.")
+        if not 1 <= self.jpeg_quality <= 100:
+            raise ConfigurationError("jpeg_quality must be between 1 and 100.")
+        if self.max_request_bytes <= 0:
+            raise ConfigurationError("max_request_bytes must be positive.")
 
 
 @dataclass
@@ -172,16 +215,98 @@ class PipelineOutcome:
         }
 
 
+def _resize_for_encoding(image: np.ndarray, max_dimension_px: int) -> np.ndarray:
+    """Downscale (never upscale) so the longer side is at most this many
+    pixels - deterministic, applied before every frame is encoded, so a
+    request's size never depends on hidden per-provider behaviour."""
+    height, width = image.shape[:2]
+    longest = max(height, width)
+    if longest <= max_dimension_px:
+        return image
+    scale = max_dimension_px / longest
+    new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+
+
 def _extract_frames(
-    reader: VideoReader, timestamps_s: list[float], *, jpeg_quality: int = 85
-) -> tuple[TimedFrame, ...]:
+    reader: VideoReader,
+    timestamps_s: list[float],
+    *,
+    max_dimension_px: int,
+    jpeg_quality: int,
+) -> list[TimedFrame]:
     frames = []
     for ts in timestamps_s:
-        image = reader.frame_at(ts)
+        image = _resize_for_encoding(reader.frame_at(ts), max_dimension_px)
         frames.append(
             TimedFrame(timestamp_s=ts, image_bytes=encode_jpeg(image, quality=jpeg_quality))
         )
-    return tuple(frames)
+    return frames
+
+
+# Roughly what base64 costs on top of raw bytes (RFC 4648: 4 output bytes
+# per 3 input bytes) - used only to estimate a request's serialized size
+# before sending it, not to actually encode anything.
+_BASE64_INFLATION = 4 / 3
+
+
+def _estimated_request_bytes(frames: list[TimedFrame], prompt_text: str) -> int:
+    image_bytes = sum(len(frame.image_bytes) for frame in frames)
+    return int(image_bytes * _BASE64_INFLATION) + len(prompt_text.encode("utf-8"))
+
+
+def _min_frames_for_window(span_s: float, target_tolerance_s: float) -> int:
+    """The sparsest sampling still "sufficient for the ±0.75s gate": at
+    least one sample per half-tolerance, so consecutive samples are never
+    farther apart than half of what the gate allows as an error - a
+    deliberate safety margin, not sampling at exactly the tolerance itself.
+    """
+    if span_s <= 0:
+        return 2
+    step = max(target_tolerance_s / 2, 1e-6)
+    return max(3, math.ceil(span_s / step) + 1)
+
+
+def _fit_frames_to_budget(
+    frames: list[TimedFrame], *, prompt_text: str, max_request_bytes: int, min_frames: int
+) -> list[TimedFrame] | None:
+    """Deterministically thin an already-extracted frame list until the
+    estimated serialized request fits the budget, never dropping below
+    ``min_frames``.
+
+    Returns ``None`` - never a silent partial selection below that floor -
+    if even the sparsest allowed selection still doesn't fit; the caller
+    turns that into an abstain rather than sending an undersized or
+    oversized request.
+    """
+    candidate = frames
+    while _estimated_request_bytes(candidate, prompt_text) > max_request_bytes:
+        if len(candidate) <= min_frames:
+            return None
+        target_count = max(min_frames, (len(candidate) + 1) // 2)
+        if target_count >= len(candidate):
+            target_count = len(candidate) - 1
+        step = len(candidate) / target_count
+        indices = sorted({min(len(candidate) - 1, int(i * step)) for i in range(target_count)})
+        if len(indices) < 2:
+            return None
+        candidate = [candidate[i] for i in indices]
+    return candidate
+
+
+def _effective_tolerance_s(timestamps_s: list[float], fallback_step_s: float) -> float:
+    """Grounding tolerance derived from the density actually achieved after
+    budget-fitting, not the nominal (pre-thinning) sampling step - if the
+    frame set had to be thinned, "near a submitted frame" and "near the
+    claimed boundary" must widen to match, or a legitimately-cited frame
+    would be rejected purely because thinning made it farther from its
+    neighbours than the original dense step assumed.
+    """
+    if len(timestamps_s) < 2:
+        return 2.0 * fallback_step_s
+    ordered = sorted(timestamps_s)
+    largest_gap = max(b - a for a, b in zip(ordered, ordered[1:], strict=False))
+    return max(2.0 * fallback_step_s, largest_gap)
 
 
 def _coarse_timestamps(duration_s: float, step_s: float) -> list[float]:
@@ -307,6 +432,30 @@ def _abstain_outcome(
     )
 
 
+def _unsent_response(reason: str) -> RawProviderResponse:
+    """A placeholder for a pass that was never sent to the provider at all.
+
+    Used only when frame-budget fitting fails before any network call was
+    attempted (see ``request_too_large`` below) - ``PipelineOutcome``
+    always needs a ``RawProviderResponse`` to report against, even when the
+    honest answer is "we refused to send this."
+    """
+    return RawProviderResponse(model_id="", raw_text="", latency_s=0.0, error=reason)
+
+
+def _oversized_abstain(prompt_version: str, pass_name: str, frame_count: int) -> TimingVerdict:
+    return TimingVerdict.abstain(
+        reason_codes=("request_too_large",),
+        model_id="",
+        prompt_version=prompt_version,
+        raw_notes=(
+            f"{pass_name} pass: {frame_count} frames still exceed the request byte "
+            f"budget even at the sparsest sampling that meets the target tolerance; "
+            f"never sent to the provider"
+        ),
+    )
+
+
 def run_llm_timing(
     video_path: Path,
     provider: TimingProvider,
@@ -336,23 +485,43 @@ def run_llm_timing(
             )
 
         coarse_times = _coarse_timestamps(duration_s, cfg.coarse_step_s)
-        coarse_frames = _extract_frames(reader, coarse_times)
+        coarse_frames_dense = _extract_frames(
+            reader,
+            coarse_times,
+            max_dimension_px=cfg.max_frame_dimension_px,
+            jpeg_quality=cfg.jpeg_quality,
+        )
+        # The coarse pass only has to locate an approximate region, not hit
+        # gate-level precision - 4 frames is enough to bracket "roughly
+        # where", so its floor doesn't scale off target_tolerance_s the way
+        # the fine pass's does.
+        coarse_frames = _fit_frames_to_budget(
+            coarse_frames_dense,
+            prompt_text=prompt_text,
+            max_request_bytes=cfg.max_request_bytes,
+            min_frames=4,
+        )
+        if coarse_frames is None:
+            abstain = _oversized_abstain(prompt_version, "coarse", len(coarse_frames_dense))
+            return _abstain_outcome(abstain, _unsent_response(abstain.raw_notes))
+
         coarse_request = ProviderRequest(
             prompt_version=prompt_version,
             prompt_text=prompt_text,
-            frames=coarse_frames,
+            frames=tuple(coarse_frames),
             pass_name="coarse",
         )
         coarse_response = provider.analyze(coarse_request)
         coarse_verdict = parse_raw_response(
             coarse_response, prompt_version=prompt_version, min_confidence=cfg.min_confidence
         )
+        coarse_submitted = [frame.timestamp_s for frame in coarse_frames]
         coarse_verdict = _validate_grounding(
             coarse_verdict,
             start_bounds=(0.0, duration_s),
             end_bounds=(0.0, duration_s),
-            submitted_timestamps_s=tuple(coarse_times),
-            time_tolerance_s=cfg.coarse_step_s,
+            submitted_timestamps_s=tuple(coarse_submitted),
+            time_tolerance_s=_effective_tolerance_s(coarse_submitted, cfg.coarse_step_s),
             max_uncertainty_s=cfg.max_uncertainty_s,
         )
 
@@ -407,23 +576,50 @@ def run_llm_timing(
                 if end_lo + i * fine_step_s <= end_hi
             }
         )
-        fine_frames = _extract_frames(reader, fine_times)
+        fine_frames_dense = _extract_frames(
+            reader,
+            fine_times,
+            max_dimension_px=cfg.max_frame_dimension_px,
+            jpeg_quality=cfg.jpeg_quality,
+        )
+        # The floor is the sparsest sampling that can still resolve *each*
+        # boundary to within target_tolerance_s - summed across both
+        # windows, since they share one request's byte budget.
+        fine_min_frames = _min_frames_for_window(
+            start_hi - start_lo, cfg.target_tolerance_s
+        ) + _min_frames_for_window(end_hi - end_lo, cfg.target_tolerance_s)
+        fine_frames = _fit_frames_to_budget(
+            fine_frames_dense,
+            prompt_text=prompt_text,
+            max_request_bytes=cfg.max_request_bytes,
+            min_frames=fine_min_frames,
+        )
+        if fine_frames is None:
+            abstain = _oversized_abstain(prompt_version, "fine", len(fine_frames_dense))
+            return PipelineOutcome(
+                verdict=abstain,
+                event=None,
+                coarse_response=coarse_response,
+                fine_response=_unsent_response(abstain.raw_notes),
+            )
+
         fine_request = ProviderRequest(
             prompt_version=prompt_version,
             prompt_text=prompt_text,
-            frames=fine_frames,
+            frames=tuple(fine_frames),
             pass_name="fine",
         )
         fine_response = provider.analyze(fine_request)
         fine_verdict = parse_raw_response(
             fine_response, prompt_version=prompt_version, min_confidence=cfg.min_confidence
         )
+        fine_submitted = [frame.timestamp_s for frame in fine_frames]
         fine_verdict = _validate_grounding(
             fine_verdict,
             start_bounds=(start_lo, start_hi),
             end_bounds=(end_lo, end_hi),
-            submitted_timestamps_s=tuple(fine_times),
-            time_tolerance_s=2.0 * fine_step_s,
+            submitted_timestamps_s=tuple(fine_submitted),
+            time_tolerance_s=_effective_tolerance_s(fine_submitted, fine_step_s),
             max_uncertainty_s=cfg.max_uncertainty_s,
         )
 

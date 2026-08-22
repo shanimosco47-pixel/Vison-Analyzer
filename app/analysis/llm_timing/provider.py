@@ -23,6 +23,30 @@ from .redaction import sanitize_untrusted_text
 from .schema import TimingStatus, TimingVerdict
 
 
+class ProviderCallError(Exception):
+    """Base for exceptions a ``TimingProvider`` implementation may raise to
+    signal that one call failed.
+
+    Not required - ``pipeline.run_llm_timing`` and any adapter's own retry
+    logic catch and convert *any* exception, so a provider that never raises
+    one of these still works. Raising one of the two subtypes below instead
+    of a bare exception lets retry logic distinguish "try again" from "don't
+    bother" - see ``gemini_provider.GeminiTimingProvider`` for the consumer.
+    """
+
+
+class TransientProviderError(ProviderCallError):
+    """A failure worth retrying: timeout, rate limit (429), 5xx, a network
+    blip. The same request might succeed on a later attempt."""
+
+
+class PermanentProviderError(ProviderCallError):
+    """A failure that will not go away on retry: bad credentials, a 4xx
+    validation error, a request that's simply too large. Retrying wastes
+    time, money, and (for a rate limit that looks like a 4xx on some
+    vendors) can make things worse."""
+
+
 @dataclass(frozen=True)
 class TimedFrame:
     """One deterministically-extracted frame, ready to hand to a provider.
