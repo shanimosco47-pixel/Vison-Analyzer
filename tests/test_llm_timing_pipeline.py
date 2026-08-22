@@ -18,6 +18,7 @@ import pytest
 
 from app.analysis.base_detector import EventStatus
 from app.analysis.llm_timing.pipeline import PipelineConfig, run_llm_timing
+from app.analysis.llm_timing.prompts import PROMPT_END_COARSE_V2_ID
 from app.analysis.llm_timing.provider import (
     ProviderRequest,
     RawProviderResponse,
@@ -809,6 +810,59 @@ def test_pipeline_abstains_when_the_candidate_has_no_room_for_the_full_validatio
     assert validate_calls == []  # the validation request was never sent
     assert [c.pass_name for c in provider.calls] == ["coarse", "fine", "end_coarse"]
     assert outcome.end_validation_response is None
+
+
+def test_pipeline_reaches_the_true_break_in_one_call_when_end_coarse_avoids_the_transient(
+    zahn_video,
+):
+    """Reproduces the shape of a real whole-clip rerun (commit 27587f5):
+    the end-coarse pass nominated a transient early shortening (18.5s)
+    that recovered toward baseline, which trend validation correctly
+    rejected, leaving the true break (~20.5s) unreachable in the
+    single-shot design. PROMPT_END_COARSE_V2 fixes this at the prompt
+    level only - no pipeline change was needed, since the whole sparse
+    batch was already visible to the model in one request. This proves
+    the plumbing itself needs nothing further: a single end-coarse call
+    that reports the true, trend-confirmed candidate (not the transient)
+    still reaches CONFIRMED in exactly one end-coarse call and one
+    validation call, and the pipeline is wired to the live V2 prompt."""
+    true_break_s = 20.5
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=true_break_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            return _confirm_validation(request)
+        assert request.pass_name == "end_coarse"
+        assert request.prompt_version == PROMPT_END_COARSE_V2_ID
+        # A compliant model, per V2's rule, rejects the 18.5s transient
+        # (its own later sparse checkpoints recover toward baseline) and
+        # nominates the earliest trend-confirmed candidate instead.
+        return canned_json_response(
+            start_s=true_break_s,
+            end_s=true_break_s,
+            confidence=0.9,
+            evidence_frame_timestamps_s=(true_break_s,),
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.end_s == pytest.approx(true_break_s)
+    assert [c.pass_name for c in provider.calls] == [
+        "coarse",
+        "fine",
+        "end_coarse",
+        "end_validate",
+    ]
 
 
 def test_pipeline_accepts_a_validated_candidate_reporting_its_own_t_not_a_later_point(zahn_video):

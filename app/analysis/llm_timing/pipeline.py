@@ -29,8 +29,8 @@ from ...video.reader import VideoReader, encode_jpeg
 from ..base_detector import Event, EventStatus
 from .pricing import PRICING_TABLE_VERSION, ModelPricing, estimate_cost_usd
 from .prompts import (
-    PROMPT_END_COARSE_V1,
-    PROMPT_END_COARSE_V1_ID,
+    PROMPT_END_COARSE_V2,
+    PROMPT_END_COARSE_V2_ID,
     PROMPT_END_VALIDATE_V1,
     PROMPT_END_VALIDATE_V1_ID,
     PROMPT_START_REFINE_V1,
@@ -171,7 +171,7 @@ class PipelineOutcome:
     fine_response: RawProviderResponse | None
     end_coarse_response: RawProviderResponse | None = None
     """The single whole-clip (post-start), sparsely-sampled call that
-    nominates one end candidate - see ``PROMPT_END_COARSE_V1``. ``None``
+    nominates one end candidate - see ``PROMPT_END_COARSE_V2``. ``None``
     for a run that never reached this phase (an abstain before it). This
     replaced a chronological multi-window scan (Codex/supervisor
     experiment, see ``diagnostics/llm_spike/DESIGN.md``): a real gate-1
@@ -928,7 +928,7 @@ def run_llm_timing(
         # confirmed it (787,182 tokens/~7 minutes for the 13-window scan,
         # versus ~16,000 tokens/~22s for the isolated single-request
         # equivalent of stage 2 below) - supervisor-directed replacement,
-        # see diagnostics/llm_spike/DESIGN.md and PROMPT_END_COARSE_V1/
+        # see diagnostics/llm_spike/DESIGN.md and PROMPT_END_COARSE_V2/
         # PROMPT_END_VALIDATE_V1. Failed validation now falls back directly
         # to ABSTAIN (assisted/manual workflow) rather than searching for
         # another candidate - single-shot, not a search.
@@ -964,13 +964,13 @@ def run_llm_timing(
         end_coarse_min_frames = _min_coarse_frames(duration_s - scan_from_s, cfg.fine_margin_s)
         end_coarse_frames = _fit_frames_to_budget(
             end_coarse_frames_dense,
-            prompt_text=PROMPT_END_COARSE_V1,
+            prompt_text=PROMPT_END_COARSE_V2,
             max_request_bytes=cfg.max_request_bytes,
             min_frames=end_coarse_min_frames,
         )
         if end_coarse_frames is None:
             abstain = _oversized_abstain(
-                PROMPT_END_COARSE_V1_ID,
+                PROMPT_END_COARSE_V2_ID,
                 "end_coarse",
                 f"{len(end_coarse_frames_dense)} frames still exceed the request byte "
                 f"budget even at the sparsest sampling ({end_coarse_min_frames} frames) "
@@ -984,15 +984,15 @@ def run_llm_timing(
             )
 
         end_coarse_request = ProviderRequest(
-            prompt_version=PROMPT_END_COARSE_V1_ID,
-            prompt_text=PROMPT_END_COARSE_V1,
+            prompt_version=PROMPT_END_COARSE_V2_ID,
+            prompt_text=PROMPT_END_COARSE_V2,
             frames=tuple(end_coarse_frames),
             pass_name="end_coarse",
         )
         end_coarse_response = provider.analyze(end_coarse_request)
         end_coarse_verdict = parse_raw_response(
             end_coarse_response,
-            prompt_version=PROMPT_END_COARSE_V1_ID,
+            prompt_version=PROMPT_END_COARSE_V2_ID,
             min_confidence=cfg.min_confidence,
         )
         end_coarse_submitted = [frame.timestamp_s for frame in end_coarse_frames]
@@ -1035,7 +1035,7 @@ def run_llm_timing(
             abstain = TimingVerdict.abstain(
                 reason_codes=("insufficient_future_context",),
                 model_id=end_coarse_verdict.model_id,
-                prompt_version=PROMPT_END_COARSE_V1_ID,
+                prompt_version=PROMPT_END_COARSE_V2_ID,
                 raw_notes=(
                     f"candidate at t={candidate_ts:.2f}s needs "
                     f"{cfg.end_validation_horizon_s:.2f}s of future context to validate, "
@@ -1152,10 +1152,10 @@ def run_llm_timing(
                 )
             ),
             model_id=end_coarse_verdict.model_id,
-            prompt_version=PROMPT_END_COARSE_V1_ID,
+            prompt_version=PROMPT_END_COARSE_V2_ID,
             raw_notes=(
                 f"start confirmed via {PROMPT_START_REFINE_V1_ID}; candidate break "
-                f"nominated via {PROMPT_END_COARSE_V1_ID} at "
+                f"nominated via {PROMPT_END_COARSE_V2_ID} at "
                 f"t={end_coarse_verdict.end_s:.3f}s; validated as a sustained trend via "
                 f"{PROMPT_END_VALIDATE_V1_ID}"
             ),
@@ -1180,7 +1180,7 @@ def run_llm_timing(
                 "evidence_frame_timestamps_s": list(final_verdict.evidence_frame_timestamps_s),
                 "model_id": final_verdict.model_id,
                 "start_prompt_version": PROMPT_START_REFINE_V1_ID,
-                "end_coarse_prompt_version": PROMPT_END_COARSE_V1_ID,
+                "end_coarse_prompt_version": PROMPT_END_COARSE_V2_ID,
                 "end_validate_prompt_version": PROMPT_END_VALIDATE_V1_ID,
                 "coarse_start_s": coarse_verdict.start_s,
                 "coarse_end_s": coarse_verdict.end_s,

@@ -293,7 +293,7 @@ def _response_schema_for_pass(pass_name: str, frame_timestamps_s: list[float]) -
     must echo back one submitted timestamp verbatim (the CANDIDATE
     frame's own) rather than compute one. "end_coarse" (the whole-clip
     candidate-nomination request that replaced the chronological scan -
-    see ``pipeline.PROMPT_END_COARSE_V1``) carries the identical
+    see ``pipeline.PROMPT_END_COARSE_V2``) carries the identical
     fabrication risk and was missed in the round that introduced it; a
     Codex review caught the gap before any live rerun exercised it.
 

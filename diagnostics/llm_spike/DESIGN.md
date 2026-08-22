@@ -1132,7 +1132,7 @@ authorization. PR #5 stays draft - ready for one real whole-clip rerun.
 ## 19. Codex review of §18: OpenAI schema gap for "end_coarse", and future-context enforced structurally
 
 A Codex review of commit `66b2996` (before any live rerun) caught two
-gaps in the two-stage replacement, both fixed here (commit TBD):
+gaps in the two-stage replacement, both fixed here (commit `27587f5`):
 
 **OpenAI enum constraint missed the new pass.**
 `openai_provider._response_schema_for_pass` still special-cased only
@@ -1173,3 +1173,71 @@ noted since §11; `node --test tests_js/*.test.js` - 44/44, unaffected.
 
 No other changes. PR #5 stays draft - ready for one real whole-clip
 rerun.
+
+## 20. PROMPT_END_COARSE_V2: eliminating transients before nominating a candidate
+
+The first real whole-clip rerun (commit `27587f5`) came back a safe but
+unhelpful ABSTAIN: 83.297s harness / 61.423s provider, 162,404 tokens,
+zero retries. `end_coarse` nominated `18.500s`; dense validation correctly
+rejected it because the reach fluctuated and returned near baseline. The
+true break is ~20.5s.
+
+Root cause, found directly in `PROMPT_END_COARSE_V1`'s own wording: it
+told the model to "report your single best candidate even if you cannot
+fully confirm [a sustained trend]," and, when torn between two nearby
+candidates, to "prefer the EARLIER one." In a single-shot design where a
+rejected candidate converges straight on ABSTAIN (§18/§19), those two
+instructions together are exactly the bias that selects an early
+transient over a later, better-supported break - and make the true
+candidate unreachable, since there is no second attempt.
+
+**Fix** (commit TBD, prompt-only - "no pipeline expansion or extra
+calls" per the authorization): `PROMPT_END_COARSE_V2` rewrites the
+MEASUREMENT RULE to use the whole sparse batch before nominating
+anything, instead of stopping at the first shorter-looking frame. Scan
+every frame in the batch, chronologically, that looks shorter than the
+established baseline; for each, check whether the batch's own later
+frames show continued shortening or a recovery; reject any that recover
+as transients and keep scanning; nominate the earliest candidate whose
+later checkpoints, still within the same batch, already support continued
+shortening; abstain (`no_break_found`) if every candidate in the batch is
+a transient or none exists. The "prefer the earlier one when ambiguous"
+tie-break is removed entirely - an unsupported early candidate is now
+rejected outright, never preferred over a later, trend-confirmed one.
+`pipeline.py` was updated to import and send `PROMPT_END_COARSE_V2`
+instead of V1 - a one-line rename at each of its ~10 use sites, no logic
+change, since the whole sparse batch was already visible to the model in
+one request; only the instructions for how to use it changed.
+`PROMPT_END_COARSE_V1` is preserved unchanged as the historical record of
+what the `27587f5` rerun was actually scored against, per this file's own
+"never mutate a prompt in place" rule.
+
+**Tests**: this is the first fix in the whole spike where the change is
+purely in prompt *wording*, not code - no pipeline/provider logic needed
+to change, so pipeline-level regressions alone can't pin it down (a stub
+can't "reason" the way a real model does). New file
+`tests/test_llm_timing_prompts.py` asserts directly on the prompt text:
+the exact root-cause phrasing ("report your single best candidate even
+if you cannot fully...", "prefer the EARLIER...") is confirmed present,
+unchanged, in V1 and absent from V2; V2 is confirmed to instruct
+rejecting a transient and continuing chronologically, requiring later-
+checkpoint support, and still abstaining when nothing qualifies; both
+versions stay independently registered under their own IDs. One new
+pipeline regression
+(`test_pipeline_reaches_the_true_break_in_one_call_when_end_coarse_avoids_the_transient`)
+reproduces the real failure's shape (18.5s transient, 20.5s true break)
+and proves two things structurally: `run_llm_timing` is actually wired to
+`PROMPT_END_COARSE_V2_ID` now, and a model that reports the true,
+trend-confirmed candidate (as V2 asks it to) still reaches CONFIRMED in
+exactly one end-coarse call and one validation call - the plumbing itself
+needed nothing further.
+
+**Gates**: `pytest -q` - green (473 tests total across the full repo,
+seven more than before this round: six new prompt-content assertions plus
+one new pipeline regression); `ruff check .` / `ruff format --check .` -
+clean; `mypy app` - clean except the same pre-existing, unrelated
+`app/web/routes.py:261` finding noted since §11; `node --test
+tests_js/*.test.js` - 44/44, unaffected.
+
+Model configurability and `gpt-4.1-mini` preserved. No UI, no unrelated
+cleanup. PR #5 stays draft - ready for one real whole-clip rerun.

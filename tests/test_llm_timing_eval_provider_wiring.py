@@ -36,7 +36,7 @@ from app.analysis.llm_timing.openai_provider import (
     OpenAITimingProvider,
 )
 from app.analysis.llm_timing.prompts import (
-    PROMPT_END_COARSE_V1,
+    PROMPT_END_COARSE_V2,
     PROMPT_END_VALIDATE_V1,
     PROMPT_START_REFINE_V1,
     PROMPT_V1,
@@ -100,7 +100,7 @@ def _truth_aware_response(true_start_s: float, true_end_s: float) -> Callable[[l
             start_s, end_s, evidence = true_start_s, true_end_s, (true_start_s, true_end_s)
         elif prompt_text == PROMPT_START_REFINE_V1:
             start_s, end_s, evidence = true_start_s, true_start_s, (true_start_s,)
-        elif prompt_text == PROMPT_END_COARSE_V1:
+        elif prompt_text == PROMPT_END_COARSE_V2:
             if frame_timestamps_s and min(frame_timestamps_s) <= true_end_s <= max(
                 frame_timestamps_s
             ):

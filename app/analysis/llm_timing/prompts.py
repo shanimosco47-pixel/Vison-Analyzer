@@ -87,22 +87,49 @@ wording stays static and version-pinned like every other one here. Reuses
 candidate is validated (echo its own timestamp back), ABSTAIN means it is
 rejected (the trend didn't hold) or there isn't enough evidence to judge.
 
-``PROMPT_END_COARSE_V1`` is the single whole-clip (post-start), sparsely
-sampled request that nominates the one candidate ``PROMPT_END_VALIDATE_V1``
-then checks - together replacing the chronological end-scan entirely
+``PROMPT_END_COARSE_V1`` (superseded by V2 below, kept only as the
+historical record of what the first real whole-clip rerun was actually
+scored against) was the single whole-clip (post-start), sparsely sampled
+request that nominates the one candidate ``PROMPT_END_VALIDATE_V1`` then
+checks - together replacing the chronological end-scan entirely
 (``pipeline.run_llm_timing`` no longer builds or sends any
 ``PROMPT_END_SCAN_V2`` window at all). The real experiment referenced
 above diagnosed *why* the 13-window chronological scan failed: decomposing
 the search into many narrow, isolated windows lost the temporal context a
 model needs to judge a sustained trend, and cost far more (787,182 tokens
 across 13 windows plus one validation call) than one coherent request
-needs. This prompt explicitly uses the sustained-shortening-onset framing
-(never the single-frame "first frame that looks shorter, do not wait for
+needs. V1 explicitly used the sustained-shortening-onset framing (never
+the single-frame "first frame that looks shorter, do not wait for
 confirmation" framing ``PROMPT_V1`` still uses for its own end_s, which is
 never acted on downstream - see ``pipeline.run_llm_timing``) over sparse,
 uniformly-spaced frames spanning from the confirmed start to the end of
 the clip, explicitly warning against reporting the stream's final
-disappearance instead of the true onset. Reuses
+disappearance instead of the true onset.
+
+``PROMPT_END_COARSE_V2`` is the live end-coarse prompt. The first real
+whole-clip rerun against V1 (commit `27587f5`) came back a safe ABSTAIN:
+the end-coarse pass nominated an early transient (18.5s, a shortening that
+recovered back toward baseline) instead of the true break (~20.5s), and
+the single-shot design's trend validation correctly rejected it, with
+nothing left to fall back to. Root cause, found directly in V1's own
+wording: it told the model to "report your single best candidate even if
+you cannot fully confirm a sustained trend from these sparse samples
+alone," and to "prefer the EARLIER one" when torn between two nearby
+candidates - exactly the bias that picks a transient over a later,
+better-supported one. V2 rewrites the MEASUREMENT RULE to use the *whole*
+sparse batch before nominating anything: scan every frame that looks
+shorter than the baseline, in order; for each, check whether the batch's
+own later frames show continued shortening or a recovery; reject any that
+recover as transients and keep scanning chronologically; nominate the
+EARLIEST candidate whose later sparse checkpoints, still within the same
+batch, already support continued shortening; abstain (``no_break_found``)
+if every candidate in the batch is a transient or none exists at all. The
+"prefer the earlier one when ambiguous" tie-break is removed entirely -
+an unsupported early candidate is no longer preferred over a later,
+trend-confirmed one; it is rejected outright. No pipeline change was
+needed for this fix - the single end-coarse/end-validate call structure
+is unchanged, since the whole batch was already visible to the model in
+one request; only the instructions for how to use it changed. Reuses
 ``schema.TimingVerdict``'s existing degenerate-point shape the same way
 every prompt below ``PROMPT_END_SCAN_V1`` does. Its own candidate is never
 trusted on its own - ``PROMPT_END_VALIDATE_V1`` must still confirm it -
@@ -587,6 +614,107 @@ null, and explain why in reason_codes. Do not invent a confident-sounding
 timestamp when the evidence does not support one.
 """
 
+PROMPT_END_COARSE_V2_ID = "zahn-efflux-end-coarse-v2"
+
+PROMPT_END_COARSE_V2 = """\
+You are analyzing a Zahn cup viscosity test video. The stream's start has
+already been confirmed by an earlier pass; you are given a SPARSE batch of
+frames, spread across the rest of the clip, and asked to nominate ONE
+candidate location for where the continuous stream first begins a
+SUSTAINED shortening trend - the beginning of the real break. A later,
+much denser pass will re-examine your candidate closely and confirm or
+reject it, but this pass must still do real work first: use every frame
+in this batch to rule out a transient before nominating anything, not
+just report the first frame that happens to look shorter and hope the
+later pass sorts it out. A candidate this pass never offers cannot be
+rescued downstream.
+
+Each frame is labelled with its exact timestamp in seconds. Frame
+selection was done deterministically by the calling pipeline, not by you;
+rely only on the timestamps given - these are sparse, spread across a
+much longer span than a normal video frame rate, so consecutive labelled
+frames may be a full second or more apart.
+
+MEASUREMENT RULE (use exactly this rule, do not invent your own):
+- The connected, outlet-attached stream has an established, roughly
+  stable reach earlier in this batch - use that as the baseline.
+- Scan the WHOLE batch, in chronological order, for every frame whose
+  reach looks shorter than the baseline - not just the first one you
+  notice. For EACH such frame, check the frames that come after it,
+  still within this same batch: does the reach stay shorter (or get
+  shorter still), or does it recover back toward the baseline and stay
+  there?
+- A frame that looks shorter but is followed, within this batch, by a
+  recovery back toward the baseline reach is a TRANSIENT - a visual/
+  camera/contrast artifact, not the real break. REJECT it outright and
+  keep scanning later in the batch for the next shorter-looking frame.
+  Do not nominate a transient just because it was the first one you saw.
+- Your candidate is the EARLIEST frame that looks shorter than the
+  baseline AND whose later frames, still within this batch, already
+  support continued shortening rather than a recovery - i.e. the
+  earliest candidate this batch's own evidence already backs as an
+  ongoing trend, never a single shorter-looking frame taken in isolation.
+- Do NOT report the stream's final disappearance or the point where it
+  has already broken into intermittent drops - by then the real break
+  happened earlier, at the first frame that already showed a genuine,
+  continuing narrowing. Look for the ONSET of the trend, not its
+  endpoint.
+- If every shorter-looking frame in this batch turns out to be a
+  transient (each one is followed by a recovery), or nothing in this
+  batch looks shorter than the baseline at all, report "abstain" with
+  reason_codes including "no_break_found" - do not nominate a transient
+  just because a real break must exist somewhere in the clip.
+
+TIMESTAMP RULE (read this carefully): start_s and end_s must be COPIED
+EXACTLY, character-for-character, from one of the "[frame at t=...s]"
+labels shown above - never computed, estimated, rounded, or interpolated
+between two labelled frames.
+
+HAZARDS SPECIFIC TO THIS FOOTAGE:
+- The cup, stream and background are often close to the same pale/dusty
+  colour (industrial environment) - contrast can be very low. A drop in
+  raw pixel brightness alone is not evidence of narrowing: look for the
+  connected stream's own geometric reach, not an absolute brightness
+  threshold.
+- The footage is handheld - there is camera shake. Do not confuse
+  whole-frame motion (camera movement) with real motion of the stream
+  itself.
+- Because these frames are sparse, this batch's own later checkpoints are
+  your only evidence that a candidate is not just noise - trust that
+  evidence over a hunch. Never nominate a candidate whose own later
+  frames, still within this batch, already contradict it by recovering
+  toward the baseline - and never prefer an earlier, unsupported
+  candidate over a later one this batch's own evidence actually backs.
+
+OUTPUT: reply with a single JSON object and nothing else (no prose before
+or after it), matching exactly this shape. This search reports a single
+moment (your candidate), not an interval - set start_s and end_s to the
+SAME timestamp, and start_uncertainty_s/end_uncertainty_s to the same
+value:
+
+{
+  "status": "confirmed" | "abstain",
+  "start_s": <float seconds, copied exactly from one of the frame labels
+              above - identical to end_s; or null if abstaining>,
+  "end_s": <float seconds, copied exactly from one of the frame labels
+            above - identical to start_s; or null if abstaining>,
+  "start_uncertainty_s": <float, your own +/- bound on the timestamp>,
+  "end_uncertainty_s": <float, the same +/- bound as start_uncertainty_s>,
+  "confidence": <float 0..1>,
+  "reason_codes": [<short machine-readable strings, e.g. "weak_contrast",
+                     "camera_motion", "no_break_found", "ambiguous_evidence">],
+  "evidence_frame_timestamps_s": [<frame timestamps you actually inspected
+                                     - your candidate, the baseline you
+                                     compared it to, and the later
+                                     checkpoints that support it>],
+  "raw_notes": "<short free-text explanation, for a human audit log only>"
+}
+
+If you are not confident, set "status" to "abstain", leave start_s/end_s
+null, and explain why in reason_codes. Do not invent a confident-sounding
+timestamp when the evidence does not support one.
+"""
+
 PROMPTS: dict[str, str] = {
     PROMPT_V1_ID: PROMPT_V1,
     PROMPT_END_SCAN_V1_ID: PROMPT_END_SCAN_V1,
@@ -594,6 +722,7 @@ PROMPTS: dict[str, str] = {
     PROMPT_START_REFINE_V1_ID: PROMPT_START_REFINE_V1,
     PROMPT_END_VALIDATE_V1_ID: PROMPT_END_VALIDATE_V1,
     PROMPT_END_COARSE_V1_ID: PROMPT_END_COARSE_V1,
+    PROMPT_END_COARSE_V2_ID: PROMPT_END_COARSE_V2,
 }
 
 
