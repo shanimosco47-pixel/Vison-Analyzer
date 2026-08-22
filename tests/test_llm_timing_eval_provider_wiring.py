@@ -148,7 +148,9 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_gemini(zahn_
     )
     assert result.coarse_model_id == DEFAULT_GEMINI_MODEL_ID
     assert result.fine_model_id == DEFAULT_GEMINI_MODEL_ID
-    assert client.calls == [DEFAULT_GEMINI_MODEL_ID, DEFAULT_GEMINI_MODEL_ID]
+    # coarse, fine (start), then one end-scan window - the fixed canned
+    # response is self-consistent enough to confirm the very first window.
+    assert client.calls == [DEFAULT_GEMINI_MODEL_ID] * 3
 
 
 # --------------------------------------------------------------------------- #
@@ -225,7 +227,9 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_openai(zahn_
     )
     assert result.coarse_model_id == DEFAULT_OPENAI_MODEL_ID
     assert result.fine_model_id == DEFAULT_OPENAI_MODEL_ID
-    assert client.calls == [DEFAULT_OPENAI_MODEL_ID, DEFAULT_OPENAI_MODEL_ID]
+    # coarse, fine (start), then one end-scan window - the fixed canned
+    # response is self-consistent enough to confirm the very first window.
+    assert client.calls == [DEFAULT_OPENAI_MODEL_ID] * 3
 
 
 # --------------------------------------------------------------------------- #

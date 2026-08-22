@@ -105,6 +105,15 @@ class _PerfectStubProvider:
     Deliberately named so it cannot be mistaken for evidence: any report row
     produced with this provider is a check that the pipeline plumbing works,
     not a measurement of anything about real-world accuracy.
+
+    Branches on ``request.pass_name`` because the pipeline's chronological
+    end-scan phase asks a different question per window ("does the break
+    fall in *this* window") - confirming the true end unconditionally,
+    regardless of which window is asked about, would never ground (the
+    scan's per-window bounds check requires both the echoed start_s and
+    end_s to fall inside that one window, which two boundaries ~seconds
+    apart never both do) and the self-test would always abstain instead of
+    proving the plumbing works end-to-end.
     """
 
     def __init__(self, true_start_s: float, true_end_s: float) -> None:
@@ -112,8 +121,22 @@ class _PerfectStubProvider:
         self._true_end_s = true_end_s
 
     def analyze(self, request: ProviderRequest) -> RawProviderResponse:
-        return canned_json_response(
-            start_s=self._true_start_s, end_s=self._true_end_s, confidence=0.95
+        if request.pass_name in ("coarse", "fine"):
+            return canned_json_response(
+                start_s=self._true_start_s, end_s=self._true_end_s, confidence=0.95
+            )
+        window_times = [f.timestamp_s for f in request.frames]
+        if window_times and min(window_times) <= self._true_end_s <= max(window_times):
+            return canned_json_response(
+                start_s=self._true_end_s,
+                end_s=self._true_end_s,
+                confidence=0.95,
+                evidence_frame_timestamps_s=(self._true_end_s,),
+            )
+        return RawProviderResponse(
+            model_id="stub-perfect",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.0,
         )
 
 

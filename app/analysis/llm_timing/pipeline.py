@@ -28,6 +28,7 @@ from ...video.metadata import VideoInfo
 from ...video.reader import VideoReader, encode_jpeg
 from ..base_detector import Event, EventStatus
 from .pricing import PRICING_TABLE_VERSION, ModelPricing, estimate_cost_usd
+from .prompts import PROMPT_END_SCAN_V1, PROMPT_END_SCAN_V1_ID
 from .provider import (
     ProviderRequest,
     RawProviderResponse,
@@ -143,23 +144,35 @@ class PipelineOutcome:
     event: Event | None
     coarse_response: RawProviderResponse
     fine_response: RawProviderResponse | None
+    end_scan_responses: tuple[RawProviderResponse, ...] = ()
+    """Every end-scan window call that came back before (and including) the
+    one that established the final end_s - see ``_end_scan_windows``. Empty
+    for a run that never reached the end-scan phase (an abstain before it,
+    or a pipeline run from before this phase existed). Kept separate from
+    ``fine_response`` (which still holds the start-confirming call) so
+    every pass's cost/latency/retries is individually inspectable, not
+    collapsed into one number."""
 
     @property
     def total_retries(self) -> int:
-        return self.coarse_response.retries + (
-            self.fine_response.retries if self.fine_response else 0
+        return (
+            self.coarse_response.retries
+            + (self.fine_response.retries if self.fine_response else 0)
+            + sum(r.retries for r in self.end_scan_responses)
         )
 
     @property
     def total_latency_s(self) -> float:
-        return self.coarse_response.latency_s + (
-            self.fine_response.latency_s if self.fine_response else 0.0
+        return (
+            self.coarse_response.latency_s
+            + (self.fine_response.latency_s if self.fine_response else 0.0)
+            + sum(r.latency_s for r in self.end_scan_responses)
         )
 
     @property
     def total_tokens(self) -> int | None:
         """``None`` (unknown) unless every pass that ran reported usage."""
-        parts = [self.coarse_response, self.fine_response]
+        parts = [self.coarse_response, self.fine_response, *self.end_scan_responses]
         counts = []
         for response in parts:
             if response is None:
@@ -175,7 +188,7 @@ class PipelineOutcome:
         Deliberately not "sum the known ones and ignore the rest" - a
         partial total would understate cost silently. See ``pricing.py``.
         """
-        responses = [self.coarse_response, self.fine_response]
+        responses = [self.coarse_response, self.fine_response, *self.end_scan_responses]
         total = 0.0
         for response in responses:
             if response is None:
@@ -207,6 +220,9 @@ class PipelineOutcome:
             "fine_completion_tokens": (
                 self.fine_response.completion_tokens if self.fine_response else None
             ),
+            "end_scan_window_count": len(self.end_scan_responses),
+            "end_scan_total_retries": sum(r.retries for r in self.end_scan_responses),
+            "end_scan_total_latency_s": sum(r.latency_s for r in self.end_scan_responses),
             "total_latency_s": self.total_latency_s,
             "total_retries": self.total_retries,
             "total_tokens": self.total_tokens,
@@ -393,6 +409,27 @@ def _effective_tolerance_s(timestamps_s: list[float], fallback_step_s: float) ->
     ordered = sorted(timestamps_s)
     largest_gap = max(b - a for a, b in zip(ordered, ordered[1:], strict=False))
     return max(2.0 * fallback_step_s, largest_gap)
+
+
+def _end_scan_windows(
+    scan_from_s: float, duration_s: float, window_width_s: float, step_s: float
+) -> list[tuple[float, float]]:
+    """Bounded, overlapping windows scanning chronologically forward from
+    ``scan_from_s`` to ``duration_s``.
+
+    Overlap (``step_s < window_width_s``) so a break sitting near one
+    window's boundary still falls fully inside the *next* window too,
+    rather than being split across a boundary and visible nowhere in full.
+    """
+    windows = []
+    lo = scan_from_s
+    while lo < duration_s:
+        hi = min(duration_s, lo + window_width_s)
+        windows.append((lo, hi))
+        if hi >= duration_s:
+            break
+        lo += step_s
+    return windows
 
 
 def _coarse_timestamps(duration_s: float, step_s: float) -> list[float]:
@@ -794,33 +831,184 @@ def run_llm_timing(
                 fine_response=fine_response,
             )
 
+        # Start is locked in here, from the combined fine pass above -
+        # completely unchanged from the pre-existing mechanism. Its end_s
+        # is deliberately NOT used from this point on: real gate-1 runs
+        # across four models (gemini-3.5-flash-lite, gemini-3.5-flash,
+        # gpt-4o-mini, gpt-4.1-mini) converged on one shared failure - a
+        # single wide end window lets the model's own end-of-stream
+        # judgement drift toward a late final-disappearance/thinning event
+        # near the end of the window rather than the first genuine break
+        # (supervisor-directed experiment, see diagnostics/llm_spike/DESIGN.md).
+        # The end is searched for chronologically instead, one small
+        # window at a time, stopping at the first grounded candidate - see
+        # _end_scan_windows and PROMPT_END_SCAN_V1.
+        assert fine_verdict.start_s is not None and fine_verdict.end_s is not None
+        locked_start_s: float = fine_verdict.start_s
+        locked_start_uncertainty_s = fine_verdict.start_uncertainty_s
+        start_region = _GroundingRegion(
+            bounds=(start_lo, start_hi),
+            submitted_timestamps_s=tuple(start_submitted),
+            time_tolerance_s=_effective_tolerance_s(start_submitted, fine_step_s),
+        )
+        # Only the evidence that actually grounds the (kept) start claim
+        # carries forward - fine_verdict's evidence may also include
+        # points near the (now-discarded) old end_s, which say nothing
+        # about the new, independently-found end.
+        start_side_evidence = tuple(
+            ts
+            for ts in fine_verdict.evidence_frame_timestamps_s
+            if abs(ts - locked_start_s) <= start_region.time_tolerance_s
+        )
+
+        end_window_width_s = 2.0 * cfg.fine_margin_s
+        end_window_step_s = max(cfg.fine_margin_s, 1e-3)  # overlapping windows
+        scan_windows = _end_scan_windows(
+            min(locked_start_s, duration_s), duration_s, end_window_width_s, end_window_step_s
+        )
+
+        end_scan_responses: list[RawProviderResponse] = []
+        end_candidate: TimingVerdict | None = None
+        window_lo = window_hi = locked_start_s
+        for window_lo, window_hi in scan_windows:
+            window_times = _dense_timestamps(window_lo, window_hi, fine_step_s)
+            window_frames_dense = _extract_frames(
+                reader,
+                window_times,
+                max_dimension_px=cfg.max_frame_dimension_px,
+                jpeg_quality=cfg.jpeg_quality,
+            )
+            window_min_frames = _min_frames_for_window(
+                window_hi - window_lo, cfg.target_tolerance_s
+            )
+            window_frames = _fit_frames_to_budget(
+                window_frames_dense,
+                prompt_text=PROMPT_END_SCAN_V1,
+                max_request_bytes=cfg.max_request_bytes,
+                min_frames=window_min_frames,
+            )
+            if window_frames is None:
+                abstain = _oversized_abstain(
+                    PROMPT_END_SCAN_V1_ID,
+                    "end_scan",
+                    f"window [{window_lo:.2f}, {window_hi:.2f}]s: "
+                    f"{len(window_frames_dense)} frames still exceed the request byte "
+                    f"budget even at the sparsest sampling ({window_min_frames} frames) "
+                    f"that meets the target tolerance",
+                )
+                return PipelineOutcome(
+                    verdict=abstain,
+                    event=None,
+                    coarse_response=coarse_response,
+                    fine_response=fine_response,
+                    end_scan_responses=tuple(end_scan_responses),
+                )
+
+            window_request = ProviderRequest(
+                prompt_version=PROMPT_END_SCAN_V1_ID,
+                prompt_text=PROMPT_END_SCAN_V1,
+                frames=tuple(window_frames),
+                pass_name="end_scan",
+            )
+            window_response = provider.analyze(window_request)
+            end_scan_responses.append(window_response)
+            window_verdict = parse_raw_response(
+                window_response,
+                prompt_version=PROMPT_END_SCAN_V1_ID,
+                min_confidence=cfg.min_confidence,
+            )
+            window_submitted = [frame.timestamp_s for frame in window_frames]
+            window_region = _GroundingRegion(
+                bounds=(window_lo, window_hi),
+                submitted_timestamps_s=tuple(window_submitted),
+                time_tolerance_s=_effective_tolerance_s(window_submitted, fine_step_s),
+            )
+            window_verdict = _validate_grounding(
+                window_verdict,
+                start_region=window_region,
+                end_region=window_region,
+                max_uncertainty_s=cfg.max_uncertainty_s,
+            )
+            if window_verdict.status is TimingStatus.CONFIRMED:
+                end_candidate = window_verdict
+                break
+            # ABSTAIN for this window only (no break here, ungrounded, or
+            # malformed) - the break may simply be later; keep scanning.
+            # Never treat one window's abstain as the whole run's abstain.
+
+        if end_candidate is None:
+            abstain = TimingVerdict.abstain(
+                reason_codes=("no_break_found",),
+                model_id=end_scan_responses[-1].model_id if end_scan_responses else "",
+                prompt_version=PROMPT_END_SCAN_V1_ID,
+                raw_notes=(
+                    f"scanned forward from t={locked_start_s:.2f}s to the end of the "
+                    f"clip (t={duration_s:.2f}s) in {len(end_scan_responses)} window(s); "
+                    f"no grounded break of the continuous stream was found"
+                ),
+            )
+            return PipelineOutcome(
+                verdict=abstain,
+                event=None,
+                coarse_response=coarse_response,
+                fine_response=fine_response,
+                end_scan_responses=tuple(end_scan_responses),
+            )
+
+        assert end_candidate.end_s is not None
+        final_confidence = min(fine_verdict.confidence, end_candidate.confidence)
+        final_verdict = TimingVerdict(
+            status=TimingStatus.CONFIRMED,
+            start_s=locked_start_s,
+            end_s=end_candidate.end_s,
+            start_uncertainty_s=locked_start_uncertainty_s,
+            end_uncertainty_s=end_candidate.end_uncertainty_s,
+            confidence=final_confidence,
+            reason_codes=tuple(
+                sorted(set(fine_verdict.reason_codes) | set(end_candidate.reason_codes))
+            ),
+            evidence_frame_timestamps_s=tuple(
+                sorted(set(start_side_evidence) | set(end_candidate.evidence_frame_timestamps_s))
+            ),
+            model_id=end_candidate.model_id,
+            prompt_version=PROMPT_END_SCAN_V1_ID,
+            raw_notes=(
+                f"start confirmed via {prompt_version}; end confirmed via chronological "
+                f"end-scan ({PROMPT_END_SCAN_V1_ID}) after {len(end_scan_responses) - 1} "
+                f"earlier window(s) with no break, winning window "
+                f"[{window_lo:.2f}, {window_hi:.2f}]s"
+            ),
+        )
+
         status = (
             EventStatus.CONFIRMED
-            if fine_verdict.confidence >= cfg.review_confidence
+            if final_verdict.confidence >= cfg.review_confidence
             else EventStatus.REVIEW
         )
-        assert fine_verdict.start_s is not None and fine_verdict.end_s is not None
         event = Event(
             label="Efflux (LLM spike)",
-            start_s=fine_verdict.start_s,
-            end_s=fine_verdict.end_s,
-            confidence=fine_verdict.confidence,
+            start_s=locked_start_s,
+            end_s=end_candidate.end_s,
+            confidence=final_verdict.confidence,
             detector="llm_timing_spike",
             status=status,
-            notes=fine_verdict.reason_codes,
+            notes=final_verdict.reason_codes,
             details={
-                "start_uncertainty_s": fine_verdict.start_uncertainty_s,
-                "end_uncertainty_s": fine_verdict.end_uncertainty_s,
-                "evidence_frame_timestamps_s": list(fine_verdict.evidence_frame_timestamps_s),
-                "model_id": fine_verdict.model_id,
-                "prompt_version": fine_verdict.prompt_version,
+                "start_uncertainty_s": final_verdict.start_uncertainty_s,
+                "end_uncertainty_s": final_verdict.end_uncertainty_s,
+                "evidence_frame_timestamps_s": list(final_verdict.evidence_frame_timestamps_s),
+                "model_id": final_verdict.model_id,
+                "start_prompt_version": prompt_version,
+                "end_prompt_version": PROMPT_END_SCAN_V1_ID,
                 "coarse_start_s": coarse_verdict.start_s,
                 "coarse_end_s": coarse_verdict.end_s,
+                "end_scan_window_count": len(end_scan_responses),
             },
         )
         return PipelineOutcome(
-            verdict=fine_verdict,
+            verdict=final_verdict,
             event=event,
             coarse_response=coarse_response,
             fine_response=fine_response,
+            end_scan_responses=tuple(end_scan_responses),
         )

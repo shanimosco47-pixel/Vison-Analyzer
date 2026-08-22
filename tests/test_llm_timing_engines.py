@@ -17,7 +17,11 @@ from app.analysis.llm_timing.engine_config import (
     EngineRunStatus,
     run_llm_timing_for_engines,
 )
-from app.analysis.llm_timing.provider import StubTimingProvider, canned_json_response
+from app.analysis.llm_timing.provider import (
+    RawProviderResponse,
+    StubTimingProvider,
+    canned_json_response,
+)
 from app.analysis.llm_timing.schema import TimingStatus
 from app.errors import ConfigurationError
 
@@ -81,15 +85,35 @@ def test_engine_config_to_dict_never_exposes_credential_ref():
 # --------------------------------------------------------------------------- #
 
 
-def _perfect_provider(zahn_video):
-    def respond(request):
-        return canned_json_response(
-            start_s=zahn_video.truth["flow_start_s"],
-            end_s=zahn_video.truth["flow_end_s"],
-            confidence=0.9,
+def _confirms_at(start_s: float, end_s: float):
+    """A respond() that confirms coarse/fine against (start_s, end_s), and
+    for the chronological end-scan confirms only the window that actually
+    contains end_s (abstaining "no_break_found" for every earlier one) -
+    the same shape a real model's answers take, so the scan loop is
+    actually exercised rather than short-circuited by an always-confirm
+    stub."""
+
+    def respond(request) -> RawProviderResponse:
+        if request.pass_name in ("coarse", "fine"):
+            return canned_json_response(start_s=start_s, end_s=end_s, confidence=0.9)
+        window_times = [f.timestamp_s for f in request.frames]
+        if window_times and min(window_times) <= end_s <= max(window_times):
+            return canned_json_response(
+                start_s=end_s, end_s=end_s, confidence=0.9, evidence_frame_timestamps_s=(end_s,)
+            )
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
         )
 
-    return StubTimingProvider(respond)
+    return respond
+
+
+def _perfect_provider(zahn_video):
+    return StubTimingProvider(
+        _confirms_at(zahn_video.truth["flow_start_s"], zahn_video.truth["flow_end_s"])
+    )
 
 
 def test_disabled_engine_is_skipped_and_never_calls_the_factory(zahn_video):
@@ -168,15 +192,8 @@ def test_results_are_never_aggregated_even_when_engines_disagree(zahn_video):
 
     def factory(engine):
         if engine.engine_id == "early":
-
-            def respond(request):
-                return canned_json_response(start_s=4.0, end_s=10.0, confidence=0.9)
-        else:
-
-            def respond(request):
-                return canned_json_response(start_s=4.0, end_s=21.5, confidence=0.9)
-
-        return StubTimingProvider(respond)
+            return StubTimingProvider(_confirms_at(4.0, 10.0))
+        return StubTimingProvider(_confirms_at(4.0, 21.5))
 
     results = run_llm_timing_for_engines(
         zahn_video.path,

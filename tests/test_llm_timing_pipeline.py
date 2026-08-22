@@ -211,16 +211,41 @@ def test_parse_never_raises_on_abstain_payload_garbage(raw_text):
 # --------------------------------------------------------------------------- #
 
 
-def _stub_matching_truth(truth: dict[str, float], *, fine_confidence: float = 0.9):
-    """A StubTimingProvider that answers accurately on both passes."""
+def _stub_matching_truth(
+    truth: dict[str, float], *, fine_confidence: float = 0.9, end_scan_confidence: float = 0.9
+):
+    """A StubTimingProvider that answers accurately on every pass, including
+    the chronological end-scan: it confirms the true break only for the
+    scan window that actually contains it, and abstains (no_break_found)
+    for every earlier window - the same shape a real model's answers take,
+    so tests exercise the scan loop itself rather than a single fine call.
+    """
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
             return canned_json_response(
                 start_s=truth["flow_start_s"], end_s=truth["flow_end_s"], confidence=0.8
             )
-        return canned_json_response(
-            start_s=truth["flow_start_s"], end_s=truth["flow_end_s"], confidence=fine_confidence
+        if request.pass_name == "fine":
+            return canned_json_response(
+                start_s=truth["flow_start_s"],
+                end_s=truth["flow_end_s"],
+                confidence=fine_confidence,
+            )
+        assert request.pass_name == "end_scan"
+        window_times = [f.timestamp_s for f in request.frames]
+        end_s = truth["flow_end_s"]
+        if window_times and min(window_times) <= end_s <= max(window_times):
+            return canned_json_response(
+                start_s=end_s,
+                end_s=end_s,
+                confidence=end_scan_confidence,
+                evidence_frame_timestamps_s=(end_s,),
+            )
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
         )
 
     return StubTimingProvider(respond)
@@ -239,11 +264,18 @@ def test_pipeline_confirms_event_matching_ground_truth(zahn_video):
     assert outcome.event.status is EventStatus.CONFIRMED
     assert outcome.event.start_s == pytest.approx(zahn_video.truth["flow_start_s"])
     assert outcome.event.end_s == pytest.approx(zahn_video.truth["flow_end_s"])
-    # Both passes actually ran, and the fine pass saw dense native-fps frames.
-    assert len(provider.calls) == 2
+    # coarse, then fine (start), then one or more end-scan windows, stopping
+    # at the one that actually contains the true break.
     assert provider.calls[0].pass_name == "coarse"
     assert provider.calls[1].pass_name == "fine"
     assert len(provider.calls[1].frames) > len(provider.calls[0].frames)
+    assert len(provider.calls) > 2
+    assert all(c.pass_name == "end_scan" for c in provider.calls[2:])
+    # The winning window's frames actually contain the true break.
+    winning_times = [f.timestamp_s for f in provider.calls[-1].frames]
+    assert min(winning_times) <= zahn_video.truth["flow_end_s"] <= max(winning_times)
+    assert outcome.end_scan_responses  # every scan call's diagnostics preserved
+    assert outcome.end_scan_responses[-1].model_id == outcome.verdict.model_id
 
 
 def test_pipeline_marks_low_but_passing_confidence_as_review(zahn_video):
@@ -476,6 +508,100 @@ def test_pipeline_abstains_when_evidence_is_grounded_but_far_from_the_claim(zahn
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
     assert "evidence_far_from_claim" in outcome.verdict.reason_codes
+
+
+# --------------------------------------------------------------------------- #
+# Chronological end-scan (supervisor-directed experiment, after four real
+# gate-1 runs converged on one shared failure: a single wide end window let
+# the model's own judgement drift to a late final-disappearance/thinning
+# event instead of the first genuine break). The end is now searched for in
+# bounded, overlapping windows after the confirmed start, stopping at the
+# first grounded candidate.
+# --------------------------------------------------------------------------- #
+
+
+def test_pipeline_end_scan_stops_at_the_first_break_ignoring_a_later_resumed_flow_window(
+    zahn_video,
+):
+    """A later window that would also confirm a plausible-looking break
+    (simulating the stream resuming after the first break, then breaking
+    again) must never even be asked about, once an earlier window has
+    already produced a grounded candidate - the FIRST break wins, and the
+    scan stops there."""
+    end_scan_calls: list[ProviderRequest] = []
+    first_break_s = 10.0
+    resumed_break_s = 18.0  # only reachable if the scan wrongly kept going
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name in ("coarse", "fine"):
+            return canned_json_response(start_s=4.0, end_s=first_break_s, confidence=0.9)
+        end_scan_calls.append(request)
+        window_times = [f.timestamp_s for f in request.frames]
+        for candidate in (first_break_s, resumed_break_s):
+            if window_times and min(window_times) <= candidate <= max(window_times):
+                return canned_json_response(
+                    start_s=candidate,
+                    end_s=candidate,
+                    confidence=0.9,
+                    evidence_frame_timestamps_s=(candidate,),
+                )
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.end_s == pytest.approx(first_break_s)
+    # Every end-scan window actually asked about stopped short of the later
+    # "resumed flow" candidate - the scan never got there because it had
+    # already stopped at the first grounded break.
+    for call in end_scan_calls:
+        window_times = [f.timestamp_s for f in call.frames]
+        assert max(window_times) < resumed_break_s
+    assert len(outcome.end_scan_responses) == len(end_scan_calls)
+    assert end_scan_calls[-1] is provider.calls[-1]
+
+
+def test_pipeline_end_scan_abstains_with_no_break_found_when_the_stream_never_breaks(zahn_video):
+    """The stream stays continuous (or the model never sees a genuine
+    break) all the way to the end of the clip - every scan window abstains,
+    and the whole run converges on ABSTAIN, never a fabricated end."""
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name in ("coarse", "fine"):
+            return canned_json_response(start_s=4.0, end_s=21.5, confidence=0.9)
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "no_break_found" in outcome.verdict.reason_codes
+    # Scanned all the way to the end of the clip, never fabricating a result.
+    assert outcome.end_scan_responses
+    assert all(c.pass_name == "end_scan" for c in provider.calls[2:])
+    last_window_frames = [c for c in provider.calls if c.pass_name == "end_scan"][-1].frames
+    assert max(f.timestamp_s for f in last_window_frames) == pytest.approx(
+        zahn_video.duration_s, abs=0.1
+    )
 
 
 def test_pipeline_config_rejects_invalid_bounds():

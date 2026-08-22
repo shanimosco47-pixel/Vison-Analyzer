@@ -525,7 +525,7 @@ pre-existing, unrelated `app/web/routes.py` finding noted in §11.
 Still stopped here: no live gate, no production/UI wiring, without further
 review.
 
-## 13. Codex re-review round (commit TBD) - per-window coverage, 429 retry, pricing correction
+## 13. Codex re-review round (commit `70f0b7c`) - per-window coverage, 429 retry, pricing correction
 
 A third review pass, after §12's fixes. Three findings, all fixed on this
 branch.
@@ -675,3 +675,109 @@ Still stopped here: no live gate, no production/UI wiring, without further
 review. Per the supervisor's round-3 instruction: report the new commit
 and exact tests, then await explicit authorization before the controlled
 real-clip/API-key gate-1 run.
+
+## 14. First real gate-1 runs (four models) and a chronological end-scan experiment
+
+Gate 1 was authorized and run for real, locally, by the operator - a real
+clip, a real API key, never in this sandbox. Results, reported back via PR
+comment (no credentials, clip, or reference values ever posted to GitHub):
+
+- **`gemini-2.5-flash-lite`** (round-3 default): coarse call rejected with
+  a 401 `invalid_api_key` on the first attempt - a masked-credential
+  redaction gap (`prefix********suffix` slipping past both existing
+  patterns) was found and fixed (`11f4a8f`, §"masked credential" fix,
+  committed between this section and §13) before any accuracy result was
+  produced.
+- **`gemini-3.5-flash-lite`**: completed, but **false-confident** - end
+  error +5.1s (215,671 tokens).
+- **`gemini-3.5-flash`**: safe **abstain** (`ambiguous_evidence`,
+  `no_break_found`) - the fine pass's end window, centered on the coarse
+  pass's own (wrong) estimate, left the true break in a gap it never saw
+  (244.3s latency, 232,427 tokens).
+- **`gpt-4o-mini`** (after the OpenAI adapter, §"Add OpenAI adapter" commit
+  `69799e2`): coarse completed, but the fine request exceeded the model's
+  128K context window.
+- **`gpt-4.1-mini`**: safe **abstain** (`out_of_bounds`) - the coarse pass
+  selected a late end estimate (~26s), so the fine end window was
+  `[25.500, 27.031]` and structurally could not contain the true first
+  break (~20.5s). 109,303 tokens, ~40.9s latency.
+
+**Diagnosis, shared across all four models**: the coarse pass's own
+end-of-stream judgement gravitates toward final disappearance/late
+thinning near the end of the clip, not the first genuine break of the
+continuous stream - this repro'd the exact ambiguity `PROMPT_V1`'s
+MEASUREMENT RULE already tries (and fails) to rule out by wording alone
+("stop at the first genuine shortening event"). Once the coarse estimate
+lands late, the existing architecture's single narrow fine window (coarse
+estimate ± `fine_margin_s`) cannot recover regardless of model quality -
+the true break is simply never in the frames sent.
+
+**Experiment authorized and implemented** (this round): start detection is
+completely unchanged (the existing coarse pass + combined start/end fine
+call, byte budgets, dual-region grounding - none of that code was touched).
+Its `end_s` is discarded. The end is instead searched for **chronologically**,
+in bounded, overlapping windows (`_end_scan_windows` in `pipeline.py`) moving
+forward from the confirmed `start_s` to the end of the clip:
+
+- Each window reuses the exact frame-density/byte-budget machinery the fine
+  pass already used (`_dense_timestamps`, `_extract_frames`,
+  `_fit_frames_to_budget`, `_min_frames_for_window`).
+- Each window's provider call uses a new prompt, `PROMPT_END_SCAN_V1`,
+  asking a narrower question ("does the stream break for the first time
+  within *this* window") and reusing `schema.TimingVerdict`'s existing
+  shape unchanged by reporting a break as a degenerate point
+  (`start_s == end_s == the break's timestamp`) rather than an interval -
+  no schema change was needed.
+- Each window is graded with the *same* `_validate_grounding`/
+  `_GroundingRegion` machinery the coarse pass already uses for a single
+  shared region (`start_region == end_region == this window`), so evidence
+  for a candidate can only come from frames immediately before/at/after it,
+  within that window's own achieved density - not the wide, model-judged
+  window the previous approach relied on.
+- The scan **stops at the first grounded CONFIRMED window** - a later
+  window (e.g. one that would show the stream resuming, thinning further,
+  or finally disappearing) is never even requested once an earlier one has
+  been confirmed. If every window from the confirmed start to the end of
+  the clip abstains, the whole run abstains with `no_break_found` - never a
+  fabricated end.
+- `PipelineOutcome` gained `end_scan_responses: tuple[RawProviderResponse, ...]`
+  (every scan-window call, including the winner) so every pass's
+  cost/latency/retries stays individually inspectable - `total_retries`,
+  `total_latency_s`, `total_tokens`, and `estimated_cost_usd()` all fold
+  scan calls in, and `to_dict()`/the harness's console+JSON output report
+  `end_scan_window_count` alongside the existing coarse/fine fields.
+- `scripts/llm_timing_eval.py`'s `--provider stub-perfect` self-test was
+  updated to be end-scan-aware (branching on `pass_name` the same way the
+  real adapters' test doubles now do) - its old "answer every pass
+  identically" shape would never ground a scan window (a window's bounds
+  check requires both the echoed `start_s` and `end_s` to fall inside that
+  one window, which two boundaries seconds apart never both do), so the
+  self-test would have silently started reporting ABSTAIN on every run.
+
+Two new synthetic regressions in `test_llm_timing_pipeline.py`, both
+against the existing `zahn_video` fixture with scripted per-window
+`StubTimingProvider` responses (no real clip needed): a stream that breaks,
+then would show a plausible-looking "resumed flow" break further along -
+confirms the *first* break and proves the later window is never even
+requested; and a stream that never breaks - scans to the end of the clip
+and abstains `no_break_found`. Every existing pipeline/engine/pricing/eval-
+wiring test whose stub answered identically regardless of `pass_name` was
+updated to be end-scan-aware in the same way (`_stub_matching_truth`,
+`_perfect_provider`, `_confirms_at`, `_respond_confirming_every_pass`) -
+tests that abort before the fine pass confirms (grounding failures,
+oversized-budget aborts, coarse-level rejections) were unaffected, since
+the end-scan phase is never reached in those cases.
+
+**Gates**: `pytest -q` - green (451 tests total across the full repo);
+`ruff check .` / `ruff format --check .` - clean; `mypy app` - clean except
+the same pre-existing, unrelated `app/web/routes.py` finding noted in §11;
+`node --test tests_js/*.test.js` - green, unaffected. `--provider
+stub-perfect` re-smoke-tested end-to-end against the synthetic fixture
+after the fix above.
+
+This is explicitly an **experiment**, not a production-default
+recommendation - gate 1 has not yet been rerun against a real clip with
+this change (no real clip or API key exists in this sandbox; the operator
+reruns it locally with `--provider openai --model-id gpt-4.1-mini` first,
+per the authorization). Still stopped here: no UI, no additional
+providers, no Gemini-side tuning, no unrelated cleanup. PR #5 stays draft.

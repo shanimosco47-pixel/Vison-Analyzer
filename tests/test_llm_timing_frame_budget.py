@@ -155,12 +155,25 @@ def _stub_matching_truth(truth: dict[str, float]):
             return canned_json_response(
                 start_s=truth["flow_start_s"], end_s=truth["flow_end_s"], confidence=0.8
             )
-        # Evidence near both boundaries so grounding still passes despite thinning.
-        return canned_json_response(
-            start_s=truth["flow_start_s"],
-            end_s=truth["flow_end_s"],
-            confidence=0.9,
-            evidence_frame_timestamps_s=(truth["flow_start_s"], truth["flow_end_s"]),
+        if request.pass_name == "fine":
+            # Evidence near both boundaries so grounding still passes despite thinning.
+            return canned_json_response(
+                start_s=truth["flow_start_s"],
+                end_s=truth["flow_end_s"],
+                confidence=0.9,
+                evidence_frame_timestamps_s=(truth["flow_start_s"], truth["flow_end_s"]),
+            )
+        assert request.pass_name == "end_scan"
+        window_times = [f.timestamp_s for f in request.frames]
+        end_s = truth["flow_end_s"]
+        if window_times and min(window_times) <= end_s <= max(window_times):
+            return canned_json_response(
+                start_s=end_s, end_s=end_s, confidence=0.9, evidence_frame_timestamps_s=(end_s,)
+            )
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
         )
 
     return StubTimingProvider(respond)
@@ -182,10 +195,9 @@ def test_pipeline_thins_fine_frames_under_a_tight_byte_budget(zahn_video):
         prompt_text="irrelevant for a stub",
         config=config,
     )
-    assert len(provider.calls) == 2
-    fine_call = provider.calls[-1]
+    fine_call = provider.calls[1]
     assert fine_call.pass_name == "fine"
-    # Native-fps density over ~3s windows at 25fps would be dozens of
+    # Native-fps density over a ~3s window at 25fps would be dozens of
     # frames; the tight budget must have thinned it down substantially.
     assert len(fine_call.frames) < 30
     assert outcome.event is not None  # still confirms - just with fewer frames
