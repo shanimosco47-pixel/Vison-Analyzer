@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
@@ -33,6 +35,7 @@ from app.analysis.llm_timing.openai_provider import (
     OpenAICallResult,
     OpenAITimingProvider,
 )
+from app.analysis.llm_timing.prompts import PROMPT_END_SCAN_V2, PROMPT_START_REFINE_V1, PROMPT_V1
 from app.analysis.llm_timing.provider import PermanentProviderError, ProviderRequest, TimedFrame
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "llm_timing_eval.py"
@@ -55,18 +58,78 @@ _CONFIRMED_JSON = json.dumps(
     }
 )
 
+# ``response_text`` on both fake clients below is either a fixed string (the
+# common case: most of these tests only care about model-ID routing, one
+# call, any well-formed CONFIRMED payload will do) or a callable taking the
+# actual ``parts`` sent for that call and returning the JSON text - needed
+# for the two full-harness tests, where the coarse/fine/end-scan passes
+# genuinely need different, window-aware answers to reach a real CONFIRMED
+# result under the chronological end-scan (see ``_truth_aware_response``).
+_ResponseText = str | Callable[[list[dict]], str]
+
+_FRAME_LABEL_RE = re.compile(r"\[frame at t=([\d.]+)s\]")
+
+
+def _truth_aware_response(true_start_s: float, true_end_s: float) -> Callable[[list[dict]], str]:
+    """Builds a ``response_text`` callable good enough to reach a real,
+    grounded CONFIRMED result through the actual pipeline: it answers
+    accurately for whichever pass (coarse/fine/end-scan) the request's own
+    prompt text identifies, and - for an end-scan window - only confirms
+    the window that actually contains ``true_end_s``, abstaining
+    (``no_break_found``) for every other one, the same shape a real model's
+    answers take."""
+
+    def respond(parts: list[dict]) -> str:
+        prompt_text = parts[0]["text"]
+        # Frame labels only - parts[1:], never parts[0] (the prompt text
+        # itself), which quotes the literal placeholder "[frame at t=...s]"
+        # as part of its own instructions and would otherwise get matched
+        # as a fake, non-numeric "frame timestamp".
+        frame_timestamps_s = [
+            float(match)
+            for match in _FRAME_LABEL_RE.findall(" ".join(p.get("text", "") for p in parts[1:]))
+        ]
+        if prompt_text == PROMPT_V1:
+            start_s, end_s, evidence = true_start_s, true_end_s, (true_start_s, true_end_s)
+        elif prompt_text == PROMPT_START_REFINE_V1:
+            start_s, end_s, evidence = true_start_s, true_start_s, (true_start_s,)
+        elif prompt_text == PROMPT_END_SCAN_V2:
+            if frame_timestamps_s and min(frame_timestamps_s) <= true_end_s <= max(
+                frame_timestamps_s
+            ):
+                start_s, end_s, evidence = true_end_s, true_end_s, (true_end_s,)
+            else:
+                return json.dumps({"status": "abstain", "reason_codes": ["no_break_found"]})
+        else:  # pragma: no cover - would mean a new pass was added and this helper wasn't updated
+            raise AssertionError(f"unrecognized prompt text: {prompt_text[:80]!r}")
+        return json.dumps(
+            {
+                "status": "confirmed",
+                "start_s": start_s,
+                "end_s": end_s,
+                "start_uncertainty_s": 0.1,
+                "end_uncertainty_s": 0.1,
+                "confidence": 0.9,
+                "reason_codes": [],
+                "evidence_frame_timestamps_s": list(evidence),
+            }
+        )
+
+    return respond
+
 
 class _RecordingFakeClient:
     """Stands in for the real google-genai-backed client - records which
     model each call requested, no network or SDK involved."""
 
-    def __init__(self, response_text: str) -> None:
+    def __init__(self, response_text: _ResponseText) -> None:
         self._response_text = response_text
         self.calls: list[str] = []
 
     def generate_content(self, *, model, parts, generation_config):
         self.calls.append(model)
-        return GeminiCallResult(text=self._response_text)
+        text = self._response_text(parts) if callable(self._response_text) else self._response_text
+        return GeminiCallResult(text=text)
 
 
 def _dummy_request() -> ProviderRequest:
@@ -138,7 +201,7 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_gemini(zahn_
         "true_start_s": zahn_video.truth["flow_start_s"],
         "true_end_s": zahn_video.truth["flow_end_s"],
     }
-    client = _RecordingFakeClient(_CONFIRMED_JSON)
+    client = _RecordingFakeClient(_truth_aware_response(entry["true_start_s"], entry["true_end_s"]))
     result = llm_timing_eval._evaluate_clip(
         entry,
         "gemini",
@@ -148,9 +211,14 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_gemini(zahn_
     )
     assert result.coarse_model_id == DEFAULT_GEMINI_MODEL_ID
     assert result.fine_model_id == DEFAULT_GEMINI_MODEL_ID
-    # coarse, fine (start), then one end-scan window - the fixed canned
-    # response is self-consistent enough to confirm the very first window.
-    assert client.calls == [DEFAULT_GEMINI_MODEL_ID] * 3
+    # coarse, fine (start), then one or more end-scan windows, stopping at
+    # the one that actually contains the true break.
+    assert client.calls[:2] == [DEFAULT_GEMINI_MODEL_ID] * 2
+    assert len(client.calls) > 2
+    assert all(m == DEFAULT_GEMINI_MODEL_ID for m in client.calls)
+    assert result.status == "confirmed"
+    assert result.predicted_start_s == pytest.approx(entry["true_start_s"])
+    assert result.predicted_end_s == pytest.approx(entry["true_end_s"])
 
 
 # --------------------------------------------------------------------------- #
@@ -162,13 +230,14 @@ class _RecordingFakeOpenAIClient:
     """Stands in for the real openai-SDK-backed client - records which model
     each call requested, no network or SDK involved."""
 
-    def __init__(self, response_text: str) -> None:
+    def __init__(self, response_text: _ResponseText) -> None:
         self._response_text = response_text
         self.calls: list[str] = []
 
     def generate_content(self, *, model, parts, generation_config):
         self.calls.append(model)
-        return OpenAICallResult(text=self._response_text)
+        text = self._response_text(parts) if callable(self._response_text) else self._response_text
+        return OpenAICallResult(text=text)
 
 
 def test_build_provider_openai_routes_to_openaitimingprovider_with_default_model_id():
@@ -217,7 +286,9 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_openai(zahn_
         "true_start_s": zahn_video.truth["flow_start_s"],
         "true_end_s": zahn_video.truth["flow_end_s"],
     }
-    client = _RecordingFakeOpenAIClient(_CONFIRMED_JSON)
+    client = _RecordingFakeOpenAIClient(
+        _truth_aware_response(entry["true_start_s"], entry["true_end_s"])
+    )
     result = llm_timing_eval._evaluate_clip(
         entry,
         "openai",
@@ -227,9 +298,14 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_openai(zahn_
     )
     assert result.coarse_model_id == DEFAULT_OPENAI_MODEL_ID
     assert result.fine_model_id == DEFAULT_OPENAI_MODEL_ID
-    # coarse, fine (start), then one end-scan window - the fixed canned
-    # response is self-consistent enough to confirm the very first window.
-    assert client.calls == [DEFAULT_OPENAI_MODEL_ID] * 3
+    # coarse, fine (start), then one or more end-scan windows, stopping at
+    # the one that actually contains the true break.
+    assert client.calls[:2] == [DEFAULT_OPENAI_MODEL_ID] * 2
+    assert len(client.calls) > 2
+    assert all(m == DEFAULT_OPENAI_MODEL_ID for m in client.calls)
+    assert result.status == "confirmed"
+    assert result.predicted_start_s == pytest.approx(entry["true_start_s"])
+    assert result.predicted_end_s == pytest.approx(entry["true_end_s"])
 
 
 # --------------------------------------------------------------------------- #

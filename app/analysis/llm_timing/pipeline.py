@@ -816,6 +816,19 @@ def run_llm_timing(
         # end-of-stream judgement drift toward a late final-disappearance/
         # thinning event rather than the first genuine break. See
         # _end_scan_windows and PROMPT_END_SCAN_V2.
+        #
+        # The scan must not start at locked_start_s itself: a real gate-1
+        # rerun showed the first end-scan window built that way still
+        # contains the onset transition (nothing visible -> stream visible),
+        # and a model can misread that transition as a "break" (both
+        # stream_start_visible and first_break_in_window in its own reason
+        # codes) - a false-confirmed end just a fraction of a second after
+        # the true start. The fix is structural, not a prompt-wording
+        # request: the scan begins no earlier than start_hi, the far edge of
+        # the grounded start-refinement window, so no onset/pre-flow frame
+        # is ever eligible to be submitted as a candidate end timestamp in
+        # the first place (supervisor-directed fix, see
+        # diagnostics/llm_spike/DESIGN.md).
         assert fine_verdict.start_s is not None
         locked_start_s: float = fine_verdict.start_s
         locked_start_uncertainty_s = fine_verdict.start_uncertainty_s
@@ -823,13 +836,14 @@ def run_llm_timing(
 
         end_window_width_s = 2.0 * cfg.fine_margin_s
         end_window_step_s = max(cfg.fine_margin_s, 1e-3)  # overlapping windows
+        scan_from_s = min(max(start_hi, locked_start_s), duration_s)
         scan_windows = _end_scan_windows(
-            min(locked_start_s, duration_s), duration_s, end_window_width_s, end_window_step_s
+            scan_from_s, duration_s, end_window_width_s, end_window_step_s
         )
 
         end_scan_responses: list[RawProviderResponse] = []
         end_candidate: TimingVerdict | None = None
-        window_lo = window_hi = locked_start_s
+        window_lo = window_hi = scan_from_s
         for window_lo, window_hi in scan_windows:
             window_times = _dense_timestamps(window_lo, window_hi, fine_step_s)
             window_frames_dense = _extract_frames(
@@ -902,8 +916,9 @@ def run_llm_timing(
                 model_id=end_scan_responses[-1].model_id if end_scan_responses else "",
                 prompt_version=PROMPT_END_SCAN_V2_ID,
                 raw_notes=(
-                    f"scanned forward from t={locked_start_s:.2f}s to the end of the "
-                    f"clip (t={duration_s:.2f}s) in {len(end_scan_responses)} window(s); "
+                    f"scanned forward from t={scan_from_s:.2f}s (end of the grounded "
+                    f"start-refinement window) to the end of the clip "
+                    f"(t={duration_s:.2f}s) in {len(end_scan_responses)} window(s); "
                     f"no grounded break of the continuous stream was found"
                 ),
             )

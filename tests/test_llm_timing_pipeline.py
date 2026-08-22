@@ -671,6 +671,72 @@ def test_pipeline_start_confirmation_is_independent_of_a_stale_coarse_end_estima
     assert max(fine_times) < 10.0
 
 
+def test_pipeline_end_scan_never_considers_the_onset_transition_as_a_candidate_break(zahn_video):
+    """Reproduces a real gate-1 failure: a third real rerun (commit
+    ``894dfe6``) got a CONFIRMED start of ~4.033s (correct) but a
+    false-CONFIRMED end of ~4.666s from the *first* end-scan window,
+    ``[4.03, 7.03]`` - the model misread the stream's own onset transition
+    (nothing visible -> stream visible), right next to the confirmed start,
+    as if it were a break, with its own reason codes naming both
+    ``stream_start_visible`` and ``first_break_in_window``.
+
+    The fix is structural: the scan begins no earlier than ``start_hi``,
+    the far edge of the grounded start-refinement window, so an onset
+    timestamp is never even eligible to be submitted as a candidate end -
+    a stub that is (unrealistically) willing to falsely confirm right next
+    to the true start must never get the chance, and the later, true break
+    must still be found."""
+    false_onset_break_s = zahn_video.truth["flow_start_s"] + 0.633  # ~4.666s
+    true_break_s = 15.0
+    end_scan_calls: list[ProviderRequest] = []
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(
+                start_s=zahn_video.truth["flow_start_s"], end_s=true_break_s, confidence=0.9
+            )
+        if request.pass_name == "fine":
+            return canned_json_response(
+                start_s=zahn_video.truth["flow_start_s"],
+                end_s=zahn_video.truth["flow_start_s"],
+                confidence=0.9,
+            )
+        end_scan_calls.append(request)
+        window_times = [f.timestamp_s for f in request.frames]
+        for candidate in (false_onset_break_s, true_break_s):
+            if window_times and min(window_times) <= candidate <= max(window_times):
+                return canned_json_response(
+                    start_s=candidate,
+                    end_s=candidate,
+                    confidence=0.9,
+                    evidence_frame_timestamps_s=(candidate,),
+                )
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.start_s == pytest.approx(zahn_video.truth["flow_start_s"])
+    assert outcome.event.end_s == pytest.approx(true_break_s)
+    # No end-scan window ever included the onset region - the false break
+    # was never even a reachable candidate, not merely one that lost to a
+    # later grounded confirmation.
+    assert end_scan_calls
+    for call in end_scan_calls:
+        window_times = [f.timestamp_s for f in call.frames]
+        assert min(window_times) > false_onset_break_s
+
+
 def test_pipeline_config_rejects_invalid_bounds():
     with pytest.raises(ConfigurationError):
         PipelineConfig(min_confidence=0.9, review_confidence=0.5).validate()

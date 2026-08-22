@@ -854,3 +854,46 @@ in §11.
 Still an experiment, not a production-default recommendation. No UI, no
 additional providers, no unrelated cleanup beyond what these two fixes
 directly required. PR #5 stays draft - ready for the next rerun.
+
+## 16. Third rerun blocker: the end-scan's own first window could see the onset transition and misread it as a break
+
+A third real rerun against `gpt-4.1-mini` (base commit `894dfe6`) got past
+both prior blockers - `start_s` CONFIRMED at ~4.033s (correct, +0.133s) -
+but then falsely CONFIRMED `end_s` at ~4.666s from the *first* end-scan
+window, `[4.03, 7.03]s` (true end ~20.5s, error -15.834s). That window's
+own `reason_codes` named both `stream_start_visible` and
+`first_break_in_window`: the scan's first window began at the locked
+start itself, so it still showed the onset transition (nothing visible ->
+stream visible), and the model misread that transition as the break it
+was asked to find.
+
+Fixed structurally, not by prompt wording alone (commit TBD): the
+end-scan now begins no earlier than `start_hi` - the far edge of the
+grounded start-refinement window - rather than at `locked_start_s`
+itself. Concretely, `pipeline.run_llm_timing` computes
+`scan_from_s = min(max(start_hi, locked_start_s), duration_s)` and passes
+that (not `locked_start_s`) to `_end_scan_windows`. Because grounding
+already guarantees `start_lo <= locked_start_s <= start_hi`, this can
+only ever push the scan's starting point later, never earlier - a
+continuous-stream baseline has already been established by the time any
+end-scan window's frames are extracted, so no onset/pre-flow frame is
+ever eligible to be submitted as a candidate end timestamp at all. This
+is a request-construction change, not a grounding-relaxation: the enum
+constraint and every existing `_validate_grounding` check are unchanged.
+
+One new regression
+(`test_pipeline_end_scan_never_considers_the_onset_transition_as_a_candidate_break`)
+reproduces the real failure's shape: a stub willing to falsely confirm a
+break at a timestamp ~0.63s after the true start (mirroring the real
+run's ~4.666s) is proven unreachable - no end-scan window's submitted
+frames ever include that timestamp - while the true, later break is still
+found and confirmed correctly.
+
+**Gates**: `pytest -q` - green (458 tests total across the full repo);
+`ruff check .` / `ruff format --check .` - clean; `mypy app` - clean
+except the same pre-existing, unrelated `app/web/routes.py` finding noted
+in §11; `node --test tests_js/*.test.js` - unaffected (Python-only
+change), green.
+
+Still an experiment. No UI, no additional providers, no unrelated
+cleanup. PR #5 stays draft - ready for the next rerun.
