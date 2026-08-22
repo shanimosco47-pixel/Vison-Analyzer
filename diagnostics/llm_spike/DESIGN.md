@@ -781,3 +781,76 @@ this change (no real clip or API key exists in this sandbox; the operator
 reruns it locally with `--provider openai --model-id gpt-4.1-mini` first,
 per the authorization). Still stopped here: no UI, no additional
 providers, no Gemini-side tuning, no unrelated cleanup. PR #5 stays draft.
+
+## 15. Two rerun blockers found and fixed: an OpenAI timestamp contract gap, and a discarded-but-still-blocking fine end_s
+
+Two more real reruns against `gpt-4.1-mini`, each exposing one more
+concrete gap before any accuracy evidence could be produced:
+
+**Rerun 1** (commit `d52ac27`): the chronological scan reached the
+*correct* `[20.000, 23.000]s` window (true break ~20.5s) - the end-scan
+architecture worked - but the model returned `start_s=end_s=5.533`, a
+value matching no frame actually shown. Grounding safely rejected it
+(`out_of_bounds`), but the call was wasted (40.7s latency, 134,152
+tokens). Fixed two ways, both scoped to the end-scan phase only (commit
+`e835d0a`): `openai_provider._response_schema_for_pass` constrains the
+OpenAI Structured Outputs schema so `start_s`/`end_s` for an `end_scan`
+call can only be one of the timestamps actually submitted for that window
+(`anyOf: [{type: number, enum: [...]}, {type: null}]` - `strict: True`
+Structured Outputs validates this before the response is ever returned,
+so the failure becomes structurally impossible to receive back); and
+`PROMPT_END_SCAN_V2` (a new prompt version - never mutate one in place)
+adds an explicit "TIMESTAMP RULE" instructing the model to copy a shown
+label verbatim, as defense-in-depth for a provider (Gemini) without the
+same schema guarantee.
+
+**Rerun 2** (commit `e835d0a`): a *different* blocker, before the
+end-scan even got to run. Safe `ABSTAIN`/`out_of_bounds` - the combined
+start+end fine pass returned `end_s=5.933` for its own stale end window
+(`[25.500, 27.031]`, built from the coarse pass's own wrong end estimate).
+That `end_s` was never actually used downstream (the end-scan phase
+already ignored it, per §14) - but `_validate_grounding` requires *both*
+claimed boundaries to ground before confirming anything, so an invalid
+answer to a question nobody needed could still abstain the whole run
+before the end-scan ever started.
+
+Fixed by removing the end window from the fine pass entirely, not just
+ignoring its answer: the fine pass now sends **only** the start window
+(the preferred fix per the supervisor's authorization - "a bounded
+start-only fine request/contract") via a new prompt, `PROMPT_START_REFINE_V1`,
+asking a single question ("pinpoint the exact start frame in this
+window") and reusing `schema.TimingVerdict`'s shape the same way
+`PROMPT_END_SCAN_V2` does (`start_s == end_s`, a degenerate point).
+Grounding is a single shared region (`start_region == end_region ==` the
+one start window), the same pattern the coarse pass and each end-scan
+window already use - no changes to `_validate_grounding`/
+`_GroundingRegion` themselves. The now-unused dual-window budget-splitting
+path (`_fit_fine_windows_to_budget`) was left in place rather than
+removed, to stay inside the requested scope - it is fully dead code as of
+this round, worth removing in a future pass if the supervisor wants that.
+The start window now also gets the *full* per-request byte budget
+(previously halved to share with the discarded end window), a strict
+improvement in achievable start-window density, not a tradeoff.
+
+Every existing stub whose "fine" response answered with a distinct
+`(start_s, end_s)` pair was updated to the new degenerate-point contract;
+one test whose exact scenario (evidence in the gap *between two merged
+fine windows*) became structurally impossible under the new one-window
+design was rewritten to cover the same underlying discipline (fabricated
+evidence must never ground a claim) against the new shape instead of
+deleted. One new regression
+(`test_pipeline_start_confirmation_is_independent_of_a_stale_coarse_end_estimate`)
+reproduces the real failure's shape directly: the coarse pass reports a
+wildly wrong end estimate (mimicking the stale `[25.500, 27.031]s`
+window), and the test proves the fine request never even attempts to
+cover anything near it, start still confirms, and the end-scan still
+finds the true first break independent of the bad coarse signal.
+
+**Gates**: `pytest -q` - green (457 tests total across the full repo);
+`ruff check .` / `ruff format --check .` - clean; `mypy app` - clean
+except the same pre-existing, unrelated `app/web/routes.py` finding noted
+in §11.
+
+Still an experiment, not a production-default recommendation. No UI, no
+additional providers, no unrelated cleanup beyond what these two fixes
+directly required. PR #5 stays draft - ready for the next rerun.

@@ -28,7 +28,12 @@ from ...video.metadata import VideoInfo
 from ...video.reader import VideoReader, encode_jpeg
 from ..base_detector import Event, EventStatus
 from .pricing import PRICING_TABLE_VERSION, ModelPricing, estimate_cost_usd
-from .prompts import PROMPT_END_SCAN_V2, PROMPT_END_SCAN_V2_ID
+from .prompts import (
+    PROMPT_END_SCAN_V2,
+    PROMPT_END_SCAN_V2_ID,
+    PROMPT_START_REFINE_V1,
+    PROMPT_START_REFINE_V1_ID,
+)
 from .provider import (
     ProviderRequest,
     RawProviderResponse,
@@ -706,120 +711,93 @@ def run_llm_timing(
             return _abstain_outcome(coarse_verdict, coarse_response)
 
         assert coarse_verdict.start_s is not None and coarse_verdict.end_s is not None
-        # Each fine window is sized independently around its own boundary, and
-        # widened past fine_margin_s when the coarse pass itself reported more
-        # uncertainty than that - a wide window is only "too ambiguous to
-        # fine-scan" relative to how uncertain *that one boundary* is, not
-        # relative to how far apart start and end naturally are (a real
-        # efflux time is routinely tens of seconds).
+        # The fine pass now asks about the start ONLY - a single window,
+        # widened past fine_margin_s when the coarse pass itself reported
+        # more start uncertainty than that. It used to also build and send
+        # an end window in the same request (to refine both boundaries at
+        # once), but that end answer was already fully discarded once the
+        # chronological end-scan below was introduced - and a live gate-1
+        # run showed why sending it anyway is actively unsafe: the fine
+        # pass's own end_s can fall outside its (irrelevant) end window,
+        # and _validate_grounding requires *both* claimed boundaries to
+        # ground before confirming anything - so an invalid answer to a
+        # question nobody needed could abstain the whole run before the
+        # end-scan ever got to start (supervisor-directed fix, see
+        # diagnostics/llm_spike/DESIGN.md). See PROMPT_START_REFINE_V1.
         start_margin = max(cfg.fine_margin_s, coarse_verdict.start_uncertainty_s)
-        end_margin = max(cfg.fine_margin_s, coarse_verdict.end_uncertainty_s)
         start_lo = max(0.0, coarse_verdict.start_s - start_margin)
         start_hi = min(duration_s, coarse_verdict.start_s + start_margin)
-        end_lo = max(0.0, coarse_verdict.end_s - end_margin)
-        end_hi = min(duration_s, coarse_verdict.end_s + end_margin)
 
-        oversized = [
-            (name, lo, hi)
-            for name, lo, hi in (("start", start_lo, start_hi), ("end", end_lo, end_hi))
-            if (hi - lo) > cfg.fine_max_span_s
-        ]
-        if oversized:
-            detail = "; ".join(f"{name} window {hi - lo:.2f}s" for name, lo, hi in oversized)
+        if (start_hi - start_lo) > cfg.fine_max_span_s:
             abstain = TimingVerdict.abstain(
                 reason_codes=("ambiguous_evidence",),
                 model_id=coarse_response.model_id,
                 prompt_version=prompt_version,
                 raw_notes=(
-                    f"coarse pass's own uncertainty makes at least one fine window too "
-                    f"wide to scan densely ({detail}, cap={cfg.fine_max_span_s:.2f}s); "
-                    f"coarse estimate was start_s={coarse_verdict.start_s} "
-                    f"end_s={coarse_verdict.end_s}"
+                    f"coarse pass's own start uncertainty makes the fine start window "
+                    f"too wide to scan densely ({start_hi - start_lo:.2f}s, "
+                    f"cap={cfg.fine_max_span_s:.2f}s); coarse estimate was "
+                    f"start_s={coarse_verdict.start_s}"
                 ),
             )
             return _abstain_outcome(abstain, coarse_response)
 
         fps = reader.info.fps
         fine_step_s = 1.0 / fps
-        # Each window is extracted, budget-fitted, and grounded on its own
-        # - never merged into one list before thinning - so a busier or
-        # larger-JPEG window can never crowd out the other's density, and
-        # each boundary's grounding tolerance reflects only that window's
-        # own achieved sampling, not the (often much larger) empty gap
-        # between the two windows. See _fit_fine_windows_to_budget and
-        # _GroundingRegion (Codex re-review round 3, finding 1).
         start_times = _dense_timestamps(start_lo, start_hi, fine_step_s)
-        end_times = _dense_timestamps(end_lo, end_hi, fine_step_s)
         start_frames_dense = _extract_frames(
             reader,
             start_times,
             max_dimension_px=cfg.max_frame_dimension_px,
             jpeg_quality=cfg.jpeg_quality,
         )
-        end_frames_dense = _extract_frames(
-            reader,
-            end_times,
-            max_dimension_px=cfg.max_frame_dimension_px,
-            jpeg_quality=cfg.jpeg_quality,
-        )
         start_min_frames = _min_frames_for_window(start_hi - start_lo, cfg.target_tolerance_s)
-        end_min_frames = _min_frames_for_window(end_hi - end_lo, cfg.target_tolerance_s)
-        start_frames, end_frames = _fit_fine_windows_to_budget(
+        start_frames = _fit_frames_to_budget(
             start_frames_dense,
-            end_frames_dense,
-            prompt_text=prompt_text,
+            prompt_text=PROMPT_START_REFINE_V1,
             max_request_bytes=cfg.max_request_bytes,
-            start_min_frames=start_min_frames,
-            end_min_frames=end_min_frames,
+            min_frames=start_min_frames,
         )
-        failures = []
         if start_frames is None:
-            failures.append(
-                f"start window: {len(start_frames_dense)} frames still exceed this "
-                f"window's half of the request byte budget even at the sparsest "
-                f"sampling ({start_min_frames} frames) that meets the target tolerance"
+            abstain = _oversized_abstain(
+                PROMPT_START_REFINE_V1_ID,
+                "fine",
+                f"start window: {len(start_frames_dense)} frames still exceed the "
+                f"request byte budget even at the sparsest sampling "
+                f"({start_min_frames} frames) that meets the target tolerance",
             )
-        if end_frames is None:
-            failures.append(
-                f"end window: {len(end_frames_dense)} frames still exceed this "
-                f"window's half of the request byte budget even at the sparsest "
-                f"sampling ({end_min_frames} frames) that meets the target tolerance"
-            )
-        if failures:
-            abstain = _oversized_abstain(prompt_version, "fine", "; ".join(failures))
             return PipelineOutcome(
                 verdict=abstain,
                 event=None,
                 coarse_response=coarse_response,
                 fine_response=_unsent_response(abstain.raw_notes),
             )
-        assert start_frames is not None and end_frames is not None
 
-        fine_frames = _merge_frames_sorted(start_frames, end_frames)
         fine_request = ProviderRequest(
-            prompt_version=prompt_version,
-            prompt_text=prompt_text,
-            frames=tuple(fine_frames),
+            prompt_version=PROMPT_START_REFINE_V1_ID,
+            prompt_text=PROMPT_START_REFINE_V1,
+            frames=tuple(start_frames),
             pass_name="fine",
         )
         fine_response = provider.analyze(fine_request)
         fine_verdict = parse_raw_response(
-            fine_response, prompt_version=prompt_version, min_confidence=cfg.min_confidence
+            fine_response,
+            prompt_version=PROMPT_START_REFINE_V1_ID,
+            min_confidence=cfg.min_confidence,
         )
         start_submitted = [frame.timestamp_s for frame in start_frames]
-        end_submitted = [frame.timestamp_s for frame in end_frames]
+        start_region = _GroundingRegion(
+            bounds=(start_lo, start_hi),
+            submitted_timestamps_s=tuple(start_submitted),
+            time_tolerance_s=_effective_tolerance_s(start_submitted, fine_step_s),
+        )
+        # Single shared region for both arguments - this call only ever
+        # claims one boundary (start_s == end_s, per PROMPT_START_REFINE_V1),
+        # same pattern as the coarse pass and each end-scan window.
         fine_verdict = _validate_grounding(
             fine_verdict,
-            start_region=_GroundingRegion(
-                bounds=(start_lo, start_hi),
-                submitted_timestamps_s=tuple(start_submitted),
-                time_tolerance_s=_effective_tolerance_s(start_submitted, fine_step_s),
-            ),
-            end_region=_GroundingRegion(
-                bounds=(end_lo, end_hi),
-                submitted_timestamps_s=tuple(end_submitted),
-                time_tolerance_s=_effective_tolerance_s(end_submitted, fine_step_s),
-            ),
+            start_region=start_region,
+            end_region=start_region,
             max_uncertainty_s=cfg.max_uncertainty_s,
         )
 
@@ -831,35 +809,17 @@ def run_llm_timing(
                 fine_response=fine_response,
             )
 
-        # Start is locked in here, from the combined fine pass above -
-        # completely unchanged from the pre-existing mechanism. Its end_s
-        # is deliberately NOT used from this point on: real gate-1 runs
-        # across four models (gemini-3.5-flash-lite, gemini-3.5-flash,
-        # gpt-4o-mini, gpt-4.1-mini) converged on one shared failure - a
-        # single wide end window lets the model's own end-of-stream
-        # judgement drift toward a late final-disappearance/thinning event
-        # near the end of the window rather than the first genuine break
-        # (supervisor-directed experiment, see diagnostics/llm_spike/DESIGN.md).
-        # The end is searched for chronologically instead, one small
-        # window at a time, stopping at the first grounded candidate - see
+        # The end is searched for chronologically instead of asked about
+        # here, one small window at a time, stopping at the first grounded
+        # candidate - real gate-1 runs across four models found that asking
+        # for both boundaries over one wide end window let the model's own
+        # end-of-stream judgement drift toward a late final-disappearance/
+        # thinning event rather than the first genuine break. See
         # _end_scan_windows and PROMPT_END_SCAN_V2.
-        assert fine_verdict.start_s is not None and fine_verdict.end_s is not None
+        assert fine_verdict.start_s is not None
         locked_start_s: float = fine_verdict.start_s
         locked_start_uncertainty_s = fine_verdict.start_uncertainty_s
-        start_region = _GroundingRegion(
-            bounds=(start_lo, start_hi),
-            submitted_timestamps_s=tuple(start_submitted),
-            time_tolerance_s=_effective_tolerance_s(start_submitted, fine_step_s),
-        )
-        # Only the evidence that actually grounds the (kept) start claim
-        # carries forward - fine_verdict's evidence may also include
-        # points near the (now-discarded) old end_s, which say nothing
-        # about the new, independently-found end.
-        start_side_evidence = tuple(
-            ts
-            for ts in fine_verdict.evidence_frame_timestamps_s
-            if abs(ts - locked_start_s) <= start_region.time_tolerance_s
-        )
+        start_side_evidence = fine_verdict.evidence_frame_timestamps_s
 
         end_window_width_s = 2.0 * cfg.fine_margin_s
         end_window_step_s = max(cfg.fine_margin_s, 1e-3)  # overlapping windows
@@ -973,10 +933,10 @@ def run_llm_timing(
             model_id=end_candidate.model_id,
             prompt_version=PROMPT_END_SCAN_V2_ID,
             raw_notes=(
-                f"start confirmed via {prompt_version}; end confirmed via chronological "
-                f"end-scan ({PROMPT_END_SCAN_V2_ID}) after {len(end_scan_responses) - 1} "
-                f"earlier window(s) with no break, winning window "
-                f"[{window_lo:.2f}, {window_hi:.2f}]s"
+                f"start confirmed via {PROMPT_START_REFINE_V1_ID}; end confirmed via "
+                f"chronological end-scan ({PROMPT_END_SCAN_V2_ID}) after "
+                f"{len(end_scan_responses) - 1} earlier window(s) with no break, "
+                f"winning window [{window_lo:.2f}, {window_hi:.2f}]s"
             ),
         )
 
@@ -998,7 +958,7 @@ def run_llm_timing(
                 "end_uncertainty_s": final_verdict.end_uncertainty_s,
                 "evidence_frame_timestamps_s": list(final_verdict.evidence_frame_timestamps_s),
                 "model_id": final_verdict.model_id,
-                "start_prompt_version": prompt_version,
+                "start_prompt_version": PROMPT_START_REFINE_V1_ID,
                 "end_prompt_version": PROMPT_END_SCAN_V2_ID,
                 "coarse_start_s": coarse_verdict.start_s,
                 "coarse_end_s": coarse_verdict.end_s,

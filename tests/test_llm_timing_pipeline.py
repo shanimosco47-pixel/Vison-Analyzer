@@ -227,10 +227,14 @@ def _stub_matching_truth(
                 start_s=truth["flow_start_s"], end_s=truth["flow_end_s"], confidence=0.8
             )
         if request.pass_name == "fine":
+            # The fine pass is start-only now: it reports the confirmed
+            # start as a degenerate point (start_s == end_s), never the
+            # (now-irrelevant) end.
             return canned_json_response(
                 start_s=truth["flow_start_s"],
-                end_s=truth["flow_end_s"],
+                end_s=truth["flow_start_s"],
                 confidence=fine_confidence,
+                evidence_frame_timestamps_s=(truth["flow_start_s"],),
             )
         assert request.pass_name == "end_scan"
         window_times = [f.timestamp_s for f in request.frames]
@@ -433,9 +437,7 @@ def _stub_coarse_ok_fine_custom(truth, fine_response: RawProviderResponse):
 def test_pipeline_abstains_when_fine_start_is_outside_its_window(zahn_video):
     # The fine window is only ~fine_margin_s wide around the coarse
     # estimate (default 1.5s); 0.0 is nowhere near a true start_s of 4.0.
-    fine_response = canned_json_response(
-        start_s=0.0, end_s=zahn_video.truth["flow_end_s"], confidence=0.9
-    )
+    fine_response = canned_json_response(start_s=0.0, end_s=0.0, confidence=0.9)
     provider = _stub_coarse_ok_fine_custom(zahn_video.truth, fine_response)
     outcome = run_llm_timing(
         zahn_video.path,
@@ -451,7 +453,7 @@ def test_pipeline_abstains_when_fine_start_is_outside_its_window(zahn_video):
 def test_pipeline_abstains_when_evidence_is_empty(zahn_video):
     fine_response = canned_json_response(
         start_s=zahn_video.truth["flow_start_s"],
-        end_s=zahn_video.truth["flow_end_s"],
+        end_s=zahn_video.truth["flow_start_s"],
         confidence=0.9,
         evidence_frame_timestamps_s=(),
     )
@@ -470,7 +472,7 @@ def test_pipeline_abstains_when_evidence_is_empty(zahn_video):
 def test_pipeline_abstains_when_evidence_matches_no_submitted_frame(zahn_video):
     fine_response = canned_json_response(
         start_s=zahn_video.truth["flow_start_s"],
-        end_s=zahn_video.truth["flow_end_s"],
+        end_s=zahn_video.truth["flow_start_s"],
         confidence=0.9,
         # A timestamp nowhere near anything the pipeline actually extracted
         # and sent - a fabricated citation.
@@ -490,11 +492,11 @@ def test_pipeline_abstains_when_evidence_matches_no_submitted_frame(zahn_video):
 
 def test_pipeline_abstains_when_evidence_is_grounded_but_far_from_the_claim(zahn_video):
     # start_lo is roughly flow_start_s - fine_margin_s = 4.0 - 1.5 = 2.5;
-    # this is a real, submittable frame timestamp, but nowhere near either
-    # the claimed start_s (4.0) or end_s (21.5).
+    # this is a real, submittable frame timestamp, but nowhere near the
+    # claimed start_s (4.0).
     fine_response = canned_json_response(
         start_s=zahn_video.truth["flow_start_s"],
-        end_s=zahn_video.truth["flow_end_s"],
+        end_s=zahn_video.truth["flow_start_s"],
         confidence=0.9,
         evidence_frame_timestamps_s=(2.5,),
     )
@@ -533,8 +535,12 @@ def test_pipeline_end_scan_stops_at_the_first_break_ignoring_a_later_resumed_flo
     resumed_break_s = 18.0  # only reachable if the scan wrongly kept going
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
-        if request.pass_name in ("coarse", "fine"):
+        if request.pass_name == "coarse":
             return canned_json_response(start_s=4.0, end_s=first_break_s, confidence=0.9)
+        if request.pass_name == "fine":
+            # Start-only pass now: reports the confirmed start as a
+            # degenerate point, never the (discarded) end.
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         end_scan_calls.append(request)
         window_times = [f.timestamp_s for f in request.frames]
         for candidate in (first_break_s, resumed_break_s):
@@ -577,8 +583,10 @@ def test_pipeline_end_scan_abstains_with_no_break_found_when_the_stream_never_br
     and the whole run converges on ABSTAIN, never a fabricated end."""
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
-        if request.pass_name in ("coarse", "fine"):
+        if request.pass_name == "coarse":
             return canned_json_response(start_s=4.0, end_s=21.5, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         return RawProviderResponse(
             model_id="stub-model",
             raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
@@ -602,6 +610,65 @@ def test_pipeline_end_scan_abstains_with_no_break_found_when_the_stream_never_br
     assert max(f.timestamp_s for f in last_window_frames) == pytest.approx(
         zahn_video.duration_s, abs=0.1
     )
+
+
+def test_pipeline_start_confirmation_is_independent_of_a_stale_coarse_end_estimate(zahn_video):
+    """Reproduces the shape of a real gate-1 failure: the coarse pass's own
+    end estimate is stale/wrong, close to the end of the clip - exactly the
+    shape that, under the old combined start+end fine-window design, built
+    an unusable fine end window (e.g. ~[25.500, 27.031]s) whose invalid
+    end_s could abstain the *whole* run before the end-scan ever got to
+    run, even though that end answer was never actually used downstream.
+    The fine pass no longer builds or asks about an end window at all, so
+    a bad coarse end estimate can't touch start confirmation, and the
+    chronological end-scan still runs and finds the true first break
+    (supervisor-directed fix, see diagnostics/llm_spike/DESIGN.md)."""
+    stale_coarse_end_s = 25.9  # nowhere near the true end (21.5)
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(
+                start_s=zahn_video.truth["flow_start_s"], end_s=stale_coarse_end_s, confidence=0.8
+            )
+        if request.pass_name == "fine":
+            return canned_json_response(
+                start_s=zahn_video.truth["flow_start_s"],
+                end_s=zahn_video.truth["flow_start_s"],
+                confidence=0.9,
+            )
+        # end_scan
+        window_times = [f.timestamp_s for f in request.frames]
+        true_end_s = zahn_video.truth["flow_end_s"]
+        if window_times and min(window_times) <= true_end_s <= max(window_times):
+            return canned_json_response(
+                start_s=true_end_s,
+                end_s=true_end_s,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(true_end_s,),
+            )
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.start_s == pytest.approx(zahn_video.truth["flow_start_s"])
+    assert outcome.event.end_s == pytest.approx(zahn_video.truth["flow_end_s"])
+    # The fine request never covered anything near the coarse pass's (bad)
+    # end estimate - it only ever spans the start window.
+    fine_call = provider.calls[1]
+    assert fine_call.pass_name == "fine"
+    fine_times = [f.timestamp_s for f in fine_call.frames]
+    assert max(fine_times) < 10.0
 
 
 def test_pipeline_config_rejects_invalid_bounds():

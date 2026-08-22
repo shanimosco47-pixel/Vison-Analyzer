@@ -94,8 +94,12 @@ def _confirms_at(start_s: float, end_s: float):
     stub."""
 
     def respond(request) -> RawProviderResponse:
-        if request.pass_name in ("coarse", "fine"):
+        if request.pass_name == "coarse":
             return canned_json_response(start_s=start_s, end_s=end_s, confidence=0.9)
+        if request.pass_name == "fine":
+            # Start-only pass: reports the confirmed start as a degenerate
+            # point, never the (discarded) end.
+            return canned_json_response(start_s=start_s, end_s=start_s, confidence=0.9)
         window_times = [f.timestamp_s for f in request.frames]
         if window_times and min(window_times) <= end_s <= max(window_times):
             return canned_json_response(

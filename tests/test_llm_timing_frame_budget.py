@@ -156,12 +156,14 @@ def _stub_matching_truth(truth: dict[str, float]):
                 start_s=truth["flow_start_s"], end_s=truth["flow_end_s"], confidence=0.8
             )
         if request.pass_name == "fine":
-            # Evidence near both boundaries so grounding still passes despite thinning.
+            # Start-only pass: reports the confirmed start as a degenerate
+            # point, never the (discarded) end. Evidence near the claim so
+            # grounding still passes despite thinning.
             return canned_json_response(
                 start_s=truth["flow_start_s"],
-                end_s=truth["flow_end_s"],
+                end_s=truth["flow_start_s"],
                 confidence=0.9,
-                evidence_frame_timestamps_s=(truth["flow_start_s"], truth["flow_end_s"]),
+                evidence_frame_timestamps_s=(truth["flow_start_s"],),
             )
         assert request.pass_name == "end_scan"
         window_times = [f.timestamp_s for f in request.frames]
@@ -395,7 +397,15 @@ def test_validate_grounding_confirms_when_each_boundary_has_its_own_nearby_evide
 # --------------------------------------------------------------------------- #
 
 
-def test_pipeline_abstains_when_fine_evidence_only_exists_in_the_gap_between_windows(zahn_video):
+def test_pipeline_abstains_when_fine_evidence_is_nowhere_near_the_start_window(zahn_video):
+    """The fine pass is start-only now, so the original "evidence in the
+    gap between two merged fine windows" scenario (Codex re-review round 3,
+    finding 1) can no longer occur - there is only ever one fine window.
+    The underlying discipline it protected still matters though: a
+    timestamp far outside the one window actually sent must not ground a
+    claim, no matter how internally consistent the rest of the verdict
+    looks."""
+
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
             return canned_json_response(
@@ -403,14 +413,14 @@ def test_pipeline_abstains_when_fine_evidence_only_exists_in_the_gap_between_win
                 end_s=zahn_video.truth["flow_end_s"],
                 confidence=0.8,
             )
-        # A timestamp roughly halfway between the two fine windows - never
-        # actually extracted or sent for either boundary.
-        midpoint = (zahn_video.truth["flow_start_s"] + zahn_video.truth["flow_end_s"]) / 2
+        # Nowhere near the start window (~[2.5, 5.5]) - never actually
+        # extracted or sent.
+        far_timestamp = zahn_video.truth["flow_end_s"]
         return canned_json_response(
             start_s=zahn_video.truth["flow_start_s"],
-            end_s=zahn_video.truth["flow_end_s"],
+            end_s=zahn_video.truth["flow_start_s"],
             confidence=0.9,
-            evidence_frame_timestamps_s=(midpoint,),
+            evidence_frame_timestamps_s=(far_timestamp,),
         )
 
     provider = StubTimingProvider(respond)

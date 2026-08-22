@@ -58,6 +58,10 @@ def _respond_confirming_every_pass(
             base = canned_json_response(
                 start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
             )
+        elif request.pass_name == "fine":
+            # Start-only pass: reports the confirmed start as a degenerate
+            # point, never the (discarded) end.
+            base = canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         else:
             base = canned_json_response(start_s=4.0, end_s=21.5, confidence=0.9)
         return RawProviderResponse(
