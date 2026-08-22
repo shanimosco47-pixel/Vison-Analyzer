@@ -31,6 +31,7 @@ from typing import Protocol
 from ...errors import ConfigurationError
 from .provider import (
     PermanentProviderError,
+    ProviderCallError,
     ProviderRequest,
     RawProviderResponse,
     TransientProviderError,
@@ -85,10 +86,15 @@ class GeminiTimingProvider:
 
     Retry policy: only ``TransientProviderError`` (or a bare
     ``TimeoutError``/``ConnectionError``) is retried, up to ``max_retries``
-    times, with exponential backoff (``backoff_base_s * 2**attempt``,
-    capped at ``backoff_max_s``). Every other exception - including
-    ``PermanentProviderError`` and any unclassified exception a client
-    happens to raise - is treated as non-retryable: retrying an auth
+    times. The real wrapper (``build_default_gemini_client``) raises
+    ``TransientProviderError`` for a 408 or 429, ``PermanentProviderError``
+    for every other 4xx (auth, validation, payload too large) - see
+    ``_client_error_status_code``. The delay before a retry uses a
+    server-suggested ``Retry-After`` when the raised error carries one
+    (``TransientProviderError.retry_after_s``), otherwise exponential
+    backoff (``backoff_base_s * 2**attempt``, capped at ``backoff_max_s``).
+    Every other exception - including ``PermanentProviderError`` and
+    anything unclassified - is treated as non-retryable: retrying an auth
     failure or a request Gemini already rejected as too large wastes time
     and money without any chance of a different outcome.
     """
@@ -154,7 +160,15 @@ class GeminiTimingProvider:
                         retries=retries_so_far,
                         error=str(last_error),
                     )
-                self._sleep_fn(min(self._backoff_base_s * (2**retries_so_far), self._backoff_max_s))
+                # A server-suggested delay (e.g. a 429's Retry-After) beats
+                # a guessed backoff - use it when the raiser supplied one.
+                suggested = getattr(exc, "retry_after_s", None)
+                delay = (
+                    suggested
+                    if suggested is not None
+                    else min(self._backoff_base_s * (2**retries_so_far), self._backoff_max_s)
+                )
+                self._sleep_fn(delay)
                 retries_so_far += 1
                 continue
 
@@ -195,6 +209,71 @@ def _build_parts(request: ProviderRequest) -> list[dict]:
             }
         )
     return parts
+
+
+def _client_error_status_code(exc: Exception) -> int | None:
+    """Best-effort extraction of an HTTP status code from a
+    ``google.genai.errors.ClientError``.
+
+    UNVERIFIED against live SDK documentation - this sandbox's network
+    access to ai.google.dev is blocked, so the exact attribute name on
+    this exception type has not been confirmed against the official
+    source. ``code`` and ``status_code`` are both checked since different
+    SDK versions/error hierarchies commonly use one or the other; if
+    neither is present this returns ``None`` and the caller falls back to
+    treating the error as a non-retryable 4xx (the safer default, per
+    ``GeminiTimingProvider``'s retry policy). Confirm this against the
+    actual installed SDK version before depending on 408/429 retry
+    behaviour in a live run.
+    """
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+# Status codes worth retrying even though they arrive as a ClientError
+# (4xx): the request may genuinely succeed on a later attempt. Every other
+# 4xx (400 bad request, 401/403 auth, 413 payload too large, 422
+# validation, ...) is left permanent.
+_RETRYABLE_CLIENT_ERROR_STATUS_CODES = frozenset({408, 429})
+
+
+def _classify_client_error(exc: Exception) -> ProviderCallError:
+    """Turn a ``google.genai.errors.ClientError`` into the right
+    ``ProviderCallError`` subtype, as a standalone function so the policy
+    (which status codes are retryable) is unit-testable with a fake
+    exception object, independent of whether the real SDK is installed.
+    """
+    status_code = _client_error_status_code(exc)
+    if status_code in _RETRYABLE_CLIENT_ERROR_STATUS_CODES:
+        return TransientProviderError(str(exc), retry_after_s=_client_error_retry_after_s(exc))
+    return PermanentProviderError(str(exc))
+
+
+def _client_error_retry_after_s(exc: Exception) -> float | None:
+    """Best-effort extraction of a server-suggested retry delay.
+
+    Same verification caveat as :func:`_client_error_status_code`: the
+    attribute/header path checked here is a reasonable guess, not a
+    confirmed reading of the SDK's actual exception shape. Returns
+    ``None`` (falls back to the caller's own exponential backoff) if
+    nothing matches, rather than guessing a number.
+    """
+    direct = getattr(exc, "retry_after", None)
+    if isinstance(direct, int | float):
+        return float(direct)
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) if response is not None else None
+    if headers is not None:
+        raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+        if raw is not None:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def build_default_gemini_client(api_key_env_var: str = "GEMINI_API_KEY") -> GeminiClient:
@@ -248,9 +327,10 @@ def build_default_gemini_client(api_key_env_var: str = "GEMINI_API_KEY") -> Gemi
                     model=model, contents=genai_parts, config=config
                 )
             except genai_errors.ClientError as exc:
-                # 4xx: bad request, auth, payload-too-large, validation -
-                # not retryable, per the class the caller checks against.
-                raise PermanentProviderError(str(exc)) from exc
+                # Most 4xx (bad request, auth, payload-too-large, schema
+                # validation) are not retryable. 408/429 are the
+                # exceptions - see _classify_client_error.
+                raise _classify_client_error(exc) from exc
             except genai_errors.ServerError as exc:
                 # 5xx - worth a bounded retry.
                 raise TransientProviderError(str(exc)) from exc

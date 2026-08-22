@@ -14,9 +14,13 @@ from app.analysis.llm_timing.pipeline import (
     PipelineConfig,
     _effective_tolerance_s,
     _estimated_request_bytes,
+    _fit_fine_windows_to_budget,
     _fit_frames_to_budget,
+    _GroundingRegion,
+    _min_coarse_frames,
     _min_frames_for_window,
     _resize_for_encoding,
+    _validate_grounding,
     run_llm_timing,
 )
 from app.analysis.llm_timing.provider import (
@@ -26,7 +30,7 @@ from app.analysis.llm_timing.provider import (
     TimedFrame,
     canned_json_response,
 )
-from app.analysis.llm_timing.schema import TimingStatus
+from app.analysis.llm_timing.schema import TimingStatus, TimingVerdict
 
 PROMPT_VERSION = "test-prompt-v1"
 
@@ -165,9 +169,10 @@ def _stub_matching_truth(truth: dict[str, float]):
 def test_pipeline_thins_fine_frames_under_a_tight_byte_budget(zahn_video):
     provider = _stub_matching_truth(zahn_video.truth)
     # Real synthetic-video JPEGs here run several KB each. This budget
-    # comfortably fits the coarse pass's 4-frame floor (~25KB) and the fine
-    # pass's precision floor (~18 frames, ~115KB), but not native-fps dense
-    # sampling of two ~3s windows (~150 frames, roughly 1MB) - forcing
+    # comfortably fits the coarse pass's floor (~19 frames, ~163KB - see
+    # _min_coarse_frames) and each fine window's own precision floor (~9
+    # frames, well under its 100KB half-share), but not native-fps dense
+    # sampling of two ~3s windows (~150 frames total, roughly 1MB) - forcing
     # thinning without being literally unsatisfiable.
     config = PipelineConfig(max_request_bytes=200_000)
     outcome = run_llm_timing(
@@ -188,9 +193,12 @@ def test_pipeline_thins_fine_frames_under_a_tight_byte_budget(zahn_video):
 
 def test_pipeline_abstains_with_request_too_large_when_fine_floor_cannot_fit(zahn_video):
     provider = _stub_matching_truth(zahn_video.truth)
-    # Enough for the coarse pass's small floor, not enough for the fine
-    # pass's larger (per-boundary-precision) floor.
-    config = PipelineConfig(max_request_bytes=50_000)
+    # A tight target_tolerance_s makes each fine window's own floor (~61
+    # frames, ~500KB) far larger than the coarse pass's floor (~19 frames
+    # spread across the whole clip, ~163KB) - so a budget that comfortably
+    # fits the coarse pass (200KB) still isn't enough for either fine
+    # window's half of the same budget (100KB each).
+    config = PipelineConfig(max_request_bytes=200_000, target_tolerance_s=0.1)
     outcome = run_llm_timing(
         zahn_video.path,
         provider,
@@ -219,3 +227,188 @@ def test_pipeline_abstains_with_request_too_large_when_even_coarse_floor_cannot_
     assert outcome.event is None
     assert "request_too_large" in outcome.verdict.reason_codes
     assert len(provider.calls) == 0  # never even reached the coarse call
+
+
+# --------------------------------------------------------------------------- #
+# Per-window fine-pass coverage (Codex re-review round 3, finding 1): the
+# start and end fine windows must be budgeted, thinned, and grounded
+# independently - never merged into one list/one tolerance first.
+# --------------------------------------------------------------------------- #
+
+
+def test_min_coarse_frames_scales_with_duration_and_fine_margin():
+    # A longer clip, or a tighter fine_margin_s, needs more coarse samples
+    # to still guarantee one lands within fine_margin_s of the true
+    # transition wherever it is.
+    assert _min_coarse_frames(60.0, fine_margin_s=1.5) > _min_coarse_frames(10.0, fine_margin_s=1.5)
+    assert _min_coarse_frames(60.0, fine_margin_s=0.5) > _min_coarse_frames(60.0, fine_margin_s=5.0)
+    # Never below the old flat floor, even for a very short/generous case.
+    assert _min_coarse_frames(1.0, fine_margin_s=10.0) >= 4
+
+
+def test_fit_fine_windows_to_budget_gives_each_window_its_own_half_regardless_of_the_others_size():
+    # The end window's frames are individually far larger (a "busier" JPEG)
+    # than the start window's - under a merged single-list thinning pass,
+    # this used to let one window's bulk crowd out the other's density. Each
+    # must independently retain at least its own floor.
+    start_frames = [_frame(float(i), 1_500) for i in range(40)]  # light
+    end_frames = [_frame(20.0 + i, 7_000) for i in range(40)]  # heavy
+
+    fitted_start, fitted_end = _fit_fine_windows_to_budget(
+        start_frames,
+        end_frames,
+        prompt_text="p",
+        max_request_bytes=200_000,
+        start_min_frames=10,
+        end_min_frames=10,
+    )
+    assert fitted_start is not None
+    assert fitted_end is not None
+    assert len(fitted_start) >= 10
+    assert len(fitted_end) >= 10
+    # Each window's own half of the budget is respected independently.
+    assert _estimated_request_bytes(fitted_start, "p") <= 100_000
+    assert _estimated_request_bytes(fitted_end, "p") <= 100_000
+
+
+def test_fit_fine_windows_to_budget_reports_each_window_failure_independently():
+    light = [_frame(float(i), 1_000) for i in range(20)]
+    heavy = [_frame(20.0 + i, 500_000) for i in range(20)]  # can't fit even at the floor
+
+    fitted_light, fitted_heavy = _fit_fine_windows_to_budget(
+        light,
+        heavy,
+        prompt_text="p",
+        max_request_bytes=200_000,
+        start_min_frames=5,
+        end_min_frames=5,
+    )
+    assert fitted_light is not None  # the light window still fits fine
+    assert fitted_heavy is None  # the heavy window doesn't - reported separately
+
+
+# --------------------------------------------------------------------------- #
+# _validate_grounding / _GroundingRegion: evidence from the empty space
+# between two disjoint windows - never actually sent to the provider - must
+# never "ground" either boundary, and evidence legitimately drawn from one
+# window must never ground the other window's claim.
+# --------------------------------------------------------------------------- #
+
+
+def _confirmed_verdict(*, start_s, end_s, evidence):
+    return TimingVerdict(
+        status=TimingStatus.CONFIRMED,
+        start_s=start_s,
+        end_s=end_s,
+        start_uncertainty_s=0.1,
+        end_uncertainty_s=0.1,
+        confidence=0.9,
+        reason_codes=(),
+        evidence_frame_timestamps_s=evidence,
+        model_id="stub-model",
+        prompt_version="test-v1",
+    )
+
+
+def test_a_timestamp_never_actually_sent_cannot_ground_either_boundary_via_the_inter_window_gap():
+    # A realistic pair of disjoint fine windows, far apart - exactly the
+    # shape a real efflux clip produces (start ~4s, end ~21.5s).
+    start_region = _GroundingRegion(
+        bounds=(2.5, 5.5),
+        submitted_timestamps_s=tuple(round(2.5 + i * 0.04, 6) for i in range(76)),
+        time_tolerance_s=0.08,
+    )
+    end_region = _GroundingRegion(
+        bounds=(20.0, 23.0),
+        submitted_timestamps_s=tuple(round(20.0 + i * 0.04, 6) for i in range(76)),
+        time_tolerance_s=0.08,
+    )
+    # 10.0 sits in the dead zone between the two windows - never sent to the
+    # provider at all. Under the old merged-tolerance behaviour (tolerance
+    # inflated to the ~14.5s inter-window gap), this single fabricated
+    # timestamp would incorrectly "match" a submitted frame and "ground"
+    # both start_s and end_s at once. It must not.
+    verdict = _confirmed_verdict(start_s=4.0, end_s=21.5, evidence=(10.0,))
+    result = _validate_grounding(
+        verdict, start_region=start_region, end_region=end_region, max_uncertainty_s=0.5
+    )
+    assert result.status is TimingStatus.ABSTAIN
+    assert "ungrounded_evidence" in result.reason_codes
+
+
+def test_evidence_from_one_window_cannot_ground_the_other_windows_claim():
+    start_region = _GroundingRegion(
+        bounds=(2.5, 5.5),
+        submitted_timestamps_s=tuple(round(2.5 + i * 0.04, 6) for i in range(76)),
+        time_tolerance_s=0.08,
+    )
+    end_region = _GroundingRegion(
+        bounds=(20.0, 23.0),
+        submitted_timestamps_s=tuple(round(20.0 + i * 0.04, 6) for i in range(76)),
+        time_tolerance_s=0.08,
+    )
+    # Evidence is real (genuinely submitted, in the end window) but there is
+    # nothing anywhere near start_s - a verdict citing only end-window
+    # evidence must not be treated as having grounded the start claim too.
+    verdict = _confirmed_verdict(start_s=4.0, end_s=21.5, evidence=(21.48,))
+    result = _validate_grounding(
+        verdict, start_region=start_region, end_region=end_region, max_uncertainty_s=0.5
+    )
+    assert result.status is TimingStatus.ABSTAIN
+    assert "evidence_far_from_claim" in result.reason_codes
+
+
+def test_validate_grounding_confirms_when_each_boundary_has_its_own_nearby_evidence():
+    start_region = _GroundingRegion(
+        bounds=(2.5, 5.5),
+        submitted_timestamps_s=tuple(round(2.5 + i * 0.04, 6) for i in range(76)),
+        time_tolerance_s=0.08,
+    )
+    end_region = _GroundingRegion(
+        bounds=(20.0, 23.0),
+        submitted_timestamps_s=tuple(round(20.0 + i * 0.04, 6) for i in range(76)),
+        time_tolerance_s=0.08,
+    )
+    verdict = _confirmed_verdict(start_s=4.0, end_s=21.5, evidence=(4.0, 21.5))
+    result = _validate_grounding(
+        verdict, start_region=start_region, end_region=end_region, max_uncertainty_s=0.5
+    )
+    assert result.status is TimingStatus.CONFIRMED
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end: the same fabricated-inter-window-gap evidence, exercised
+# through the real pipeline against the real (widely-separated) zahn_video
+# windows, not just the unit-level helpers above.
+# --------------------------------------------------------------------------- #
+
+
+def test_pipeline_abstains_when_fine_evidence_only_exists_in_the_gap_between_windows(zahn_video):
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(
+                start_s=zahn_video.truth["flow_start_s"],
+                end_s=zahn_video.truth["flow_end_s"],
+                confidence=0.8,
+            )
+        # A timestamp roughly halfway between the two fine windows - never
+        # actually extracted or sent for either boundary.
+        midpoint = (zahn_video.truth["flow_start_s"] + zahn_video.truth["flow_end_s"]) / 2
+        return canned_json_response(
+            start_s=zahn_video.truth["flow_start_s"],
+            end_s=zahn_video.truth["flow_end_s"],
+            confidence=0.9,
+            evidence_frame_timestamps_s=(midpoint,),
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "ungrounded_evidence" in outcome.verdict.reason_codes
+    assert len(provider.calls) == 2  # both coarse and fine were sent

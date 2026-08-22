@@ -36,17 +36,20 @@ class ModelPricing:
 #
 # gemini-2.5-flash-lite: $0.10 / 1M input tokens, $0.40 / 1M output tokens.
 #
-# SOURCING CAVEAT: the official page (ai.google.dev/gemini-api/docs/pricing)
-# was unreachable from this sandbox's network (egress blocked); this figure
-# is corroborated across several independent third-party pricing aggregators
-# as of August 2026, not read directly from Google. Re-verify against the
-# official page before this number is used for any real billing decision.
-#
-# OPERATIONAL CAVEAT: multiple sources report Google is retiring
-# gemini-2.5-flash-lite on 2026-10-16. Pinning the spike's default adapter
-# model to a model being sunset in under two months is a real risk worth
-# the supervisor's attention independent of this pricing entry - flagged in
-# diagnostics/llm_spike/DESIGN.md, not something this module can act on.
+# SOURCING: this sandbox's network egress to ai.google.dev is blocked, so
+# this number was never fetched directly here - it was first entered from
+# third-party aggregators, then confirmed correct (and re-typed as-is) per
+# the supervisor's review of this PR, who reported reading it directly off
+# the official page:
+#   https://ai.google.dev/gemini-api/docs/pricing
+# No shutdown/retirement date is listed for this model on the official
+# deprecations page either, per the same review:
+#   https://ai.google.dev/gemini-api/docs/deprecations
+# (An earlier version of this comment claimed an 2026-10-16 retirement
+# date from third-party sources - that claim was wrong, likely confusion
+# with a different preview model, and has been removed.) Anyone who can
+# reach those pages directly should still treat this as worth a periodic
+# recheck, not a permanently-settled fact.
 PRICING_TABLE: dict[str, ModelPricing] = {
     "gemini-2.5-flash-lite": ModelPricing(
         input_usd_per_1k_tokens=0.0001, output_usd_per_1k_tokens=0.0004

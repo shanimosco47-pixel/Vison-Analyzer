@@ -18,6 +18,9 @@ from app.analysis.llm_timing.gemini_provider import (
     DEFAULT_GEMINI_MODEL_ID,
     GeminiCallResult,
     GeminiTimingProvider,
+    _classify_client_error,
+    _client_error_retry_after_s,
+    _client_error_status_code,
 )
 from app.analysis.llm_timing.provider import (
     PermanentProviderError,
@@ -271,3 +274,134 @@ def test_rejects_negative_backoff():
     client = _FakeClient(lambda model, parts, cfg: GeminiCallResult(text=CONFIRMED_JSON))
     with pytest.raises(ConfigurationError):
         GeminiTimingProvider(client, backoff_base_s=-1.0)
+
+
+# --------------------------------------------------------------------------- #
+# 408/429 client-error classification (Codex re-review round 3, finding 2):
+# a ClientError-shaped fake exception is unit-tested directly, no real SDK
+# involved - see _classify_client_error's own docstring for why.
+# --------------------------------------------------------------------------- #
+
+
+class _FakeClientErrorWithCode:
+    """Stands in for google.genai.errors.ClientError, carrying a status code
+    via the ``code`` attribute (one of the two attribute names checked)."""
+
+    def __init__(self, code: int, message: str = "client error") -> None:
+        self.code = code
+        super_message = message
+        self._message = super_message
+
+    def __str__(self) -> str:
+        return self._message
+
+
+class _FakeClientErrorWithStatusCode:
+    """Same idea, but via the other checked attribute name: status_code."""
+
+    def __init__(self, status_code: int, message: str = "client error") -> None:
+        self.status_code = status_code
+        self._message = message
+
+    def __str__(self) -> str:
+        return self._message
+
+
+class _FakeClientErrorWithRetryAfter(_FakeClientErrorWithCode):
+    """A 429 that also carries a direct retry_after attribute."""
+
+    def __init__(self, code: int, retry_after: float, message: str = "rate limited") -> None:
+        super().__init__(code, message)
+        self.retry_after = retry_after
+
+
+class _FakeHeaders(dict):
+    """dict subclass so hasattr(headers, "get") is True, like a real
+    requests/httpx headers mapping."""
+
+
+class _FakeResponse:
+    def __init__(self, headers: dict) -> None:
+        self.headers = _FakeHeaders(headers)
+
+
+class _FakeClientErrorWithRetryAfterHeader(_FakeClientErrorWithCode):
+    """A 429 with no direct retry_after attribute, but a response.headers
+    Retry-After entry - the other shape _client_error_retry_after_s checks."""
+
+    def __init__(self, code: int, retry_after_header: str, message: str = "rate limited") -> None:
+        super().__init__(code, message)
+        self.response = _FakeResponse({"Retry-After": retry_after_header})
+
+
+@pytest.mark.parametrize("code", [429, 408])
+def test_429_and_408_client_errors_classify_as_transient(code):
+    exc = _FakeClientErrorWithCode(code)
+    classified = _classify_client_error(exc)
+    assert isinstance(classified, TransientProviderError)
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 413, 422, 500])
+def test_other_status_codes_classify_as_permanent(code):
+    exc = _FakeClientErrorWithCode(code)
+    classified = _classify_client_error(exc)
+    assert isinstance(classified, PermanentProviderError)
+
+
+def test_an_exception_with_no_recognisable_status_code_classifies_as_permanent():
+    """No code/status_code attribute at all - the safe default: never retry
+    what can't be classified."""
+    exc = RuntimeError("something went wrong, shape unknown")
+    classified = _classify_client_error(exc)
+    assert isinstance(classified, PermanentProviderError)
+
+
+def test_status_code_is_read_from_either_code_or_status_code_attribute():
+    assert _client_error_status_code(_FakeClientErrorWithCode(429)) == 429
+    assert _client_error_status_code(_FakeClientErrorWithStatusCode(408)) == 408
+    assert _client_error_status_code(RuntimeError("no code here")) is None
+
+
+def test_retry_after_is_captured_from_a_direct_attribute():
+    exc = _FakeClientErrorWithRetryAfter(429, retry_after=12.5)
+    classified = _classify_client_error(exc)
+    assert isinstance(classified, TransientProviderError)
+    assert classified.retry_after_s == 12.5
+
+
+def test_retry_after_is_captured_from_a_response_header():
+    exc = _FakeClientErrorWithRetryAfterHeader(429, retry_after_header="7")
+    assert _client_error_retry_after_s(exc) == 7.0
+    classified = _classify_client_error(exc)
+    assert isinstance(classified, TransientProviderError)
+    assert classified.retry_after_s == 7.0
+
+
+def test_retry_after_is_none_when_nothing_matches():
+    exc = _FakeClientErrorWithCode(429)
+    assert _client_error_retry_after_s(exc) is None
+    classified = _classify_client_error(exc)
+    assert isinstance(classified, TransientProviderError)
+    assert classified.retry_after_s is None
+
+
+def test_analyze_honors_a_server_suggested_retry_after_over_computed_backoff():
+    """When the raised TransientProviderError carries a retry_after_s (as
+    _classify_client_error produces for a real 429), the retry loop must
+    sleep that long instead of its own exponential backoff guess."""
+    attempts = {"n": 0}
+
+    def respond(model, parts, cfg):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise _classify_client_error(_FakeClientErrorWithRetryAfter(429, retry_after=9.0))
+        return GeminiCallResult(text=CONFIRMED_JSON)
+
+    client = _FakeClient(respond)
+    sleep = _RecordingSleep()
+    provider = GeminiTimingProvider(
+        client, max_retries=2, backoff_base_s=1.0, backoff_max_s=10.0, sleep_fn=sleep
+    )
+    response = provider.analyze(_request())
+    assert response.error is None
+    assert sleep.delays == [9.0]  # server-suggested delay, not the 1.0 backoff guess

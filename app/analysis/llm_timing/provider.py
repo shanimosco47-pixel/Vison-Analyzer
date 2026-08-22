@@ -36,8 +36,19 @@ class ProviderCallError(Exception):
 
 
 class TransientProviderError(ProviderCallError):
-    """A failure worth retrying: timeout, rate limit (429), 5xx, a network
-    blip. The same request might succeed on a later attempt."""
+    """A failure worth retrying: timeout (408), rate limit (429), 5xx, a
+    network blip. The same request might succeed on a later attempt.
+
+    ``retry_after_s``, when a raiser can supply it (e.g. a 429's
+    ``Retry-After`` header), overrides the retry loop's own computed
+    backoff delay for the next attempt - honoring what the server actually
+    asked for beats guessing. Leave it ``None`` when there's nothing to go
+    on; the caller falls back to its own exponential backoff.
+    """
+
+    def __init__(self, message: str, *, retry_after_s: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
 
 
 class PermanentProviderError(ProviderCallError):

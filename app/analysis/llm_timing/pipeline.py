@@ -267,6 +267,92 @@ def _min_frames_for_window(span_s: float, target_tolerance_s: float) -> int:
     return max(3, math.ceil(span_s / step) + 1)
 
 
+def _min_coarse_frames(duration_s: float, fine_margin_s: float) -> int:
+    """The sparsest coarse sampling that still guarantees *some* coarse
+    sample lands within ``fine_margin_s`` of the true transition, wherever
+    it actually is - so the fine window later built around the coarse
+    estimate (+/- ``fine_margin_s``) is still guaranteed to cover the true
+    boundary, even in the worst case.
+
+    A flat floor (the previous ``min_frames=4``) can't make that guarantee
+    for a long clip: with only 4 samples spread across a 60s video,
+    consecutive coarse samples can be ~20s apart - far past any reasonable
+    ``fine_margin_s`` - so the coarse estimate could be nowhere near a
+    sample, and the resulting fine window could miss the true boundary
+    entirely (Codex re-review round 3, finding 1).
+    """
+    if fine_margin_s <= 0:
+        return 4
+    return max(4, math.ceil(duration_s / fine_margin_s) + 1)
+
+
+def _dense_timestamps(lo: float, hi: float, step_s: float) -> list[float]:
+    """Every native-fps timestamp in ``[lo, hi]``, deterministically."""
+    return sorted(
+        {
+            round(lo + i * step_s, 6)
+            for i in range(int((hi - lo) / step_s) + 2)
+            if lo + i * step_s <= hi
+        }
+    )
+
+
+def _merge_frames_sorted(*groups: list[TimedFrame]) -> list[TimedFrame]:
+    """Combine independently-thinned window frame lists into the one batch
+    actually sent to the provider - sorted, and de-duplicated by timestamp
+    in case two windows happen to overlap (a short true efflux time can put
+    the start and end fine windows close enough to share native-fps
+    timestamps)."""
+    by_timestamp: dict[float, TimedFrame] = {}
+    for group in groups:
+        for frame in group:
+            by_timestamp.setdefault(frame.timestamp_s, frame)
+    return [by_timestamp[ts] for ts in sorted(by_timestamp)]
+
+
+def _fit_fine_windows_to_budget(
+    start_frames: list[TimedFrame],
+    end_frames: list[TimedFrame],
+    *,
+    prompt_text: str,
+    max_request_bytes: int,
+    start_min_frames: int,
+    end_min_frames: int,
+) -> tuple[list[TimedFrame] | None, list[TimedFrame] | None]:
+    """Thin the start and end fine-pass windows independently, each against
+    its own half of the shared request byte budget.
+
+    Independent, not "merge both windows then thin the combined list" (the
+    previous approach): merging first lets whichever window happens to have
+    larger or more numerous frames crowd out the other window's density
+    during thinning, and - separately - is what made
+    ``_effective_tolerance_s`` blow up to the empty space *between* the two
+    windows rather than either window's own achieved sampling density (see
+    ``_validate_grounding``/``_GroundingRegion``). Splitting the budget in
+    half up front keeps each boundary's achieved precision fully
+    determined by its own frames, regardless of the other window's size
+    (Codex re-review round 3, finding 1).
+
+    Each element of the returned pair is ``None`` independently if that
+    window's floor still doesn't fit in its half of the budget - the caller
+    decides how to report a fine-pass abstain from that, per-window.
+    """
+    window_budget = max_request_bytes // 2
+    start_fit = _fit_frames_to_budget(
+        start_frames,
+        prompt_text=prompt_text,
+        max_request_bytes=window_budget,
+        min_frames=start_min_frames,
+    )
+    end_fit = _fit_frames_to_budget(
+        end_frames,
+        prompt_text=prompt_text,
+        max_request_bytes=window_budget,
+        min_frames=end_min_frames,
+    )
+    return start_fit, end_fit
+
+
 def _fit_frames_to_budget(
     frames: list[TimedFrame], *, prompt_text: str, max_request_bytes: int, min_frames: int
 ) -> list[TimedFrame] | None:
@@ -333,13 +419,40 @@ def _grounding_abstain(verdict: TimingVerdict, reason_code: str, detail: str) ->
     )
 
 
+@dataclass(frozen=True)
+class _GroundingRegion:
+    """One claimed boundary's own submitted-frame context.
+
+    ``bounds`` is the window that boundary's claim must fall inside;
+    ``submitted_timestamps_s``/``time_tolerance_s`` describe *only the
+    frames actually sent for this boundary* and the tolerance derived from
+    their own achieved density.
+
+    Kept separate per boundary (rather than one shared set/tolerance across
+    both) because the start and end fine windows can be many seconds apart:
+    merging them first (as an earlier version of this pipeline did) lets
+    the empty space *between* the two windows dominate
+    ``_effective_tolerance_s``, which in turn makes "evidence corresponds
+    to a frame actually sent" and "evidence is near the claimed boundary"
+    far too permissive - a timestamp that was never sent to the provider at
+    all (it falls in the dead zone between the windows) can end up
+    "matching" a real frame purely because the inter-window gap inflated
+    the tolerance, and can even "ground" *both* the start and end claims at
+    once. Keeping each boundary's region separate closes that gap (Codex
+    re-review round 3, finding 1) and also prevents evidence legitimately
+    drawn from one window from grounding the other window's claim.
+    """
+
+    bounds: tuple[float, float]
+    submitted_timestamps_s: tuple[float, ...]
+    time_tolerance_s: float
+
+
 def _validate_grounding(
     verdict: TimingVerdict,
     *,
-    start_bounds: tuple[float, float],
-    end_bounds: tuple[float, float],
-    submitted_timestamps_s: tuple[float, ...],
-    time_tolerance_s: float,
+    start_region: _GroundingRegion,
+    end_region: _GroundingRegion,
     max_uncertainty_s: float,
 ) -> TimingVerdict:
     """Re-check a parsed CONFIRMED verdict against the request it answers.
@@ -352,14 +465,20 @@ def _validate_grounding(
     that: every failure converges on ABSTAIN, same discipline as
     ``parse_raw_response``, just with request-level context it doesn't have.
 
+    ``start_region``/``end_region`` are independent - see
+    :class:`_GroundingRegion`. For the coarse pass (one shared frame batch,
+    not yet split into a start/end window), pass the same region for both;
+    its distinct-regions behaviour only matters once the fine pass has
+    separate windows.
+
     A no-op for an already-ABSTAIN verdict (nothing to ground).
     """
     if verdict.status is not TimingStatus.CONFIRMED:
         return verdict
     assert verdict.start_s is not None and verdict.end_s is not None
 
-    start_lo, start_hi = start_bounds
-    end_lo, end_hi = end_bounds
+    start_lo, start_hi = start_region.bounds
+    end_lo, end_hi = end_region.bounds
 
     if not (start_lo - _BOUNDS_EPSILON_S <= verdict.start_s <= start_hi + _BOUNDS_EPSILON_S):
         return _grounding_abstain(
@@ -391,11 +510,15 @@ def _validate_grounding(
             verdict, "ungrounded_evidence", "no evidence_frame_timestamps_s given"
         )
 
-    def _matches_a_submitted_frame(ts: float) -> bool:
-        return any(abs(ts - sent) <= time_tolerance_s for sent in submitted_timestamps_s)
+    def _matches_region(ts: float, region: _GroundingRegion) -> bool:
+        return any(
+            abs(ts - sent) <= region.time_tolerance_s for sent in region.submitted_timestamps_s
+        )
 
     ungrounded = [
-        ts for ts in verdict.evidence_frame_timestamps_s if not _matches_a_submitted_frame(ts)
+        ts
+        for ts in verdict.evidence_frame_timestamps_s
+        if not _matches_region(ts, start_region) and not _matches_region(ts, end_region)
     ]
     if ungrounded:
         return _grounding_abstain(
@@ -405,11 +528,19 @@ def _validate_grounding(
             f"actually submitted in this request",
         )
 
+    # Evidence grounds a claim only if it both (a) is within that claim's
+    # own region's tolerance of the claim, and (b) actually matches a frame
+    # submitted *for that region* - so evidence legitimately drawn from the
+    # end window (however close it happens to land, numerically, to
+    # start_s) can never ground the start claim, and vice versa.
     near_start = any(
-        abs(ts - verdict.start_s) <= time_tolerance_s for ts in verdict.evidence_frame_timestamps_s
+        abs(ts - verdict.start_s) <= start_region.time_tolerance_s
+        and _matches_region(ts, start_region)
+        for ts in verdict.evidence_frame_timestamps_s
     )
     near_end = any(
-        abs(ts - verdict.end_s) <= time_tolerance_s for ts in verdict.evidence_frame_timestamps_s
+        abs(ts - verdict.end_s) <= end_region.time_tolerance_s and _matches_region(ts, end_region)
+        for ts in verdict.evidence_frame_timestamps_s
     )
     if not (near_start and near_end):
         missing = "start_s" if not near_start else "end_s"
@@ -418,7 +549,7 @@ def _validate_grounding(
             verdict,
             "evidence_far_from_claim",
             f"evidence_frame_timestamps_s={list(verdict.evidence_frame_timestamps_s)} has "
-            f"nothing within {time_tolerance_s:.3f}s of {missing}={claim}",
+            f"nothing within its own window's tolerance of {missing}={claim}",
         )
 
     return verdict
@@ -443,16 +574,12 @@ def _unsent_response(reason: str) -> RawProviderResponse:
     return RawProviderResponse(model_id="", raw_text="", latency_s=0.0, error=reason)
 
 
-def _oversized_abstain(prompt_version: str, pass_name: str, frame_count: int) -> TimingVerdict:
+def _oversized_abstain(prompt_version: str, pass_name: str, detail: str) -> TimingVerdict:
     return TimingVerdict.abstain(
         reason_codes=("request_too_large",),
         model_id="",
         prompt_version=prompt_version,
-        raw_notes=(
-            f"{pass_name} pass: {frame_count} frames still exceed the request byte "
-            f"budget even at the sparsest sampling that meets the target tolerance; "
-            f"never sent to the provider"
-        ),
+        raw_notes=f"{pass_name} pass: {detail}; never sent to the provider",
     )
 
 
@@ -492,17 +619,25 @@ def run_llm_timing(
             jpeg_quality=cfg.jpeg_quality,
         )
         # The coarse pass only has to locate an approximate region, not hit
-        # gate-level precision - 4 frames is enough to bracket "roughly
-        # where", so its floor doesn't scale off target_tolerance_s the way
-        # the fine pass's does.
+        # gate-level precision - but it must be dense enough that *some*
+        # sample lands within fine_margin_s of wherever the true transition
+        # actually is, or the fine window built around the coarse estimate
+        # could miss it entirely. See _min_coarse_frames.
+        coarse_min_frames = _min_coarse_frames(duration_s, cfg.fine_margin_s)
         coarse_frames = _fit_frames_to_budget(
             coarse_frames_dense,
             prompt_text=prompt_text,
             max_request_bytes=cfg.max_request_bytes,
-            min_frames=4,
+            min_frames=coarse_min_frames,
         )
         if coarse_frames is None:
-            abstain = _oversized_abstain(prompt_version, "coarse", len(coarse_frames_dense))
+            abstain = _oversized_abstain(
+                prompt_version,
+                "coarse",
+                f"{len(coarse_frames_dense)} frames still exceed the request byte budget "
+                f"even at the sparsest sampling ({coarse_min_frames} frames) that "
+                f"guarantees coverage within fine_margin_s of the true transition",
+            )
             return _abstain_outcome(abstain, _unsent_response(abstain.raw_notes))
 
         coarse_request = ProviderRequest(
@@ -516,12 +651,17 @@ def run_llm_timing(
             coarse_response, prompt_version=prompt_version, min_confidence=cfg.min_confidence
         )
         coarse_submitted = [frame.timestamp_s for frame in coarse_frames]
-        coarse_verdict = _validate_grounding(
-            coarse_verdict,
-            start_bounds=(0.0, duration_s),
-            end_bounds=(0.0, duration_s),
+        # A single shared frame batch, not yet split into per-boundary
+        # windows - the same region serves both start_s and end_s here.
+        coarse_region = _GroundingRegion(
+            bounds=(0.0, duration_s),
             submitted_timestamps_s=tuple(coarse_submitted),
             time_tolerance_s=_effective_tolerance_s(coarse_submitted, cfg.coarse_step_s),
+        )
+        coarse_verdict = _validate_grounding(
+            coarse_verdict,
+            start_region=coarse_region,
+            end_region=coarse_region,
             max_uncertainty_s=cfg.max_uncertainty_s,
         )
 
@@ -564,45 +704,61 @@ def run_llm_timing(
 
         fps = reader.info.fps
         fine_step_s = 1.0 / fps
-        fine_times = sorted(
-            {
-                round(start_lo + i * fine_step_s, 6)
-                for i in range(int((start_hi - start_lo) / fine_step_s) + 2)
-                if start_lo + i * fine_step_s <= start_hi
-            }
-            | {
-                round(end_lo + i * fine_step_s, 6)
-                for i in range(int((end_hi - end_lo) / fine_step_s) + 2)
-                if end_lo + i * fine_step_s <= end_hi
-            }
-        )
-        fine_frames_dense = _extract_frames(
+        # Each window is extracted, budget-fitted, and grounded on its own
+        # - never merged into one list before thinning - so a busier or
+        # larger-JPEG window can never crowd out the other's density, and
+        # each boundary's grounding tolerance reflects only that window's
+        # own achieved sampling, not the (often much larger) empty gap
+        # between the two windows. See _fit_fine_windows_to_budget and
+        # _GroundingRegion (Codex re-review round 3, finding 1).
+        start_times = _dense_timestamps(start_lo, start_hi, fine_step_s)
+        end_times = _dense_timestamps(end_lo, end_hi, fine_step_s)
+        start_frames_dense = _extract_frames(
             reader,
-            fine_times,
+            start_times,
             max_dimension_px=cfg.max_frame_dimension_px,
             jpeg_quality=cfg.jpeg_quality,
         )
-        # The floor is the sparsest sampling that can still resolve *each*
-        # boundary to within target_tolerance_s - summed across both
-        # windows, since they share one request's byte budget.
-        fine_min_frames = _min_frames_for_window(
-            start_hi - start_lo, cfg.target_tolerance_s
-        ) + _min_frames_for_window(end_hi - end_lo, cfg.target_tolerance_s)
-        fine_frames = _fit_frames_to_budget(
-            fine_frames_dense,
+        end_frames_dense = _extract_frames(
+            reader,
+            end_times,
+            max_dimension_px=cfg.max_frame_dimension_px,
+            jpeg_quality=cfg.jpeg_quality,
+        )
+        start_min_frames = _min_frames_for_window(start_hi - start_lo, cfg.target_tolerance_s)
+        end_min_frames = _min_frames_for_window(end_hi - end_lo, cfg.target_tolerance_s)
+        start_frames, end_frames = _fit_fine_windows_to_budget(
+            start_frames_dense,
+            end_frames_dense,
             prompt_text=prompt_text,
             max_request_bytes=cfg.max_request_bytes,
-            min_frames=fine_min_frames,
+            start_min_frames=start_min_frames,
+            end_min_frames=end_min_frames,
         )
-        if fine_frames is None:
-            abstain = _oversized_abstain(prompt_version, "fine", len(fine_frames_dense))
+        failures = []
+        if start_frames is None:
+            failures.append(
+                f"start window: {len(start_frames_dense)} frames still exceed this "
+                f"window's half of the request byte budget even at the sparsest "
+                f"sampling ({start_min_frames} frames) that meets the target tolerance"
+            )
+        if end_frames is None:
+            failures.append(
+                f"end window: {len(end_frames_dense)} frames still exceed this "
+                f"window's half of the request byte budget even at the sparsest "
+                f"sampling ({end_min_frames} frames) that meets the target tolerance"
+            )
+        if failures:
+            abstain = _oversized_abstain(prompt_version, "fine", "; ".join(failures))
             return PipelineOutcome(
                 verdict=abstain,
                 event=None,
                 coarse_response=coarse_response,
                 fine_response=_unsent_response(abstain.raw_notes),
             )
+        assert start_frames is not None and end_frames is not None
 
+        fine_frames = _merge_frames_sorted(start_frames, end_frames)
         fine_request = ProviderRequest(
             prompt_version=prompt_version,
             prompt_text=prompt_text,
@@ -613,13 +769,20 @@ def run_llm_timing(
         fine_verdict = parse_raw_response(
             fine_response, prompt_version=prompt_version, min_confidence=cfg.min_confidence
         )
-        fine_submitted = [frame.timestamp_s for frame in fine_frames]
+        start_submitted = [frame.timestamp_s for frame in start_frames]
+        end_submitted = [frame.timestamp_s for frame in end_frames]
         fine_verdict = _validate_grounding(
             fine_verdict,
-            start_bounds=(start_lo, start_hi),
-            end_bounds=(end_lo, end_hi),
-            submitted_timestamps_s=tuple(fine_submitted),
-            time_tolerance_s=_effective_tolerance_s(fine_submitted, fine_step_s),
+            start_region=_GroundingRegion(
+                bounds=(start_lo, start_hi),
+                submitted_timestamps_s=tuple(start_submitted),
+                time_tolerance_s=_effective_tolerance_s(start_submitted, fine_step_s),
+            ),
+            end_region=_GroundingRegion(
+                bounds=(end_lo, end_hi),
+                submitted_timestamps_s=tuple(end_submitted),
+                time_tolerance_s=_effective_tolerance_s(end_submitted, fine_step_s),
+            ),
             max_uncertainty_s=cfg.max_uncertainty_s,
         )
 

@@ -511,11 +511,10 @@ several independent third-party pricing aggregators as of August 2026, not
 read directly from Google, and is commented as such in `pricing.py` -
 re-verify against the official source before it's relied on for any real
 billing decision. **Separately, and worth the supervisor's attention
-regardless of pricing**: multiple of those same sources report Google is
-retiring `gemini-2.5-flash-lite` on **2026-10-16**. Pinning this spike's
-default adapter model to one being sunset in under two months is an
-operational risk this module can flag but not resolve - a live rollout
-should confirm the model's support window before depending on it.
+regardless of pricing**: multiple of those same third-party sources
+appeared to report a retirement date for `gemini-2.5-flash-lite`. **This
+claim was wrong** - see §13, finding 3, for the correction after the
+supervisor read the official page directly.
 
 **Gates re-run after all of the above**: `pytest -q` - green (full suite,
 80 tests total across this branch's spike test files); `node --test
@@ -525,3 +524,154 @@ pre-existing, unrelated `app/web/routes.py` finding noted in §11.
 
 Still stopped here: no live gate, no production/UI wiring, without further
 review.
+
+## 13. Codex re-review round (commit TBD) - per-window coverage, 429 retry, pricing correction
+
+A third review pass, after §12's fixes. Three findings, all fixed on this
+branch.
+
+**1. Fine-pass frames were merged across the two boundary windows before
+thinning and before computing grounding tolerance - the biggest of the
+three findings.** `run_llm_timing`'s fine pass previously built one
+combined, sorted set of native-fps timestamps spanning *both* the start
+window and the end window, thinned that single list against the shared
+byte budget, and computed one shared `_effective_tolerance_s` across all
+of it. For a real clip the two windows are typically many seconds apart
+(the zahn_video fixture's are ~14.5s apart: start ~[2.5s, 5.5s], end
+~[20.0s, 23.0s]) - `_effective_tolerance_s` widens to the *largest gap* in
+its input, so that huge inter-window gap, not either window's own achieved
+sampling density, dominated the tolerance used for every grounding check.
+Two concrete consequences, both demonstrated by new tests: a timestamp
+that was *never actually sent to the provider at all* (sitting in the dead
+zone between the two windows) could "match a submitted frame" purely
+because it fell within the inflated tolerance of a real frame at the edge
+of one window, and evidence legitimately drawn from one window could
+"ground" the *other* window's claim.
+
+Fixed by treating the two windows as fully independent from extraction
+through grounding, never merged:
+- `_dense_timestamps(lo, hi, step_s)`: native-fps timestamps for one
+  window only (the old inline set-comprehension, extracted so it can be
+  called once per window).
+- `_fit_fine_windows_to_budget(start_frames, end_frames, ...)`: thins each
+  window against its own half of `PipelineConfig.max_request_bytes`,
+  independently - a window with larger or more numerous frames (a busier
+  scene, a higher-detail boundary) can no longer crowd out the other
+  window's density during thinning. Either half failing to fit its own
+  floor is reported separately in the resulting `request_too_large`
+  abstain's `raw_notes` (which window, how many frames, what floor).
+- `_GroundingRegion` (new frozen dataclass: `bounds`,
+  `submitted_timestamps_s`, `time_tolerance_s`) and a generalized
+  `_validate_grounding(verdict, *, start_region, end_region,
+  max_uncertainty_s)`: each boundary's "does this evidence correspond to a
+  frame actually sent" and "is there evidence near this boundary's claim"
+  checks now use *only that boundary's own* submitted frames and its own
+  `_effective_tolerance_s` (computed from that window's frames alone,
+  never the other window's). Evidence must match a region *and* be near
+  that region's own claim to ground it - evidence from the end window
+  cannot ground the start claim even if it happens to be numerically
+  closer to `start_s` than to `end_s`. The coarse pass (one shared frame
+  batch, not yet split into windows) passes the same region for both
+  `start_region` and `end_region` - its behaviour is unchanged.
+- `_min_coarse_frames(duration_s, fine_margin_s)` replaces the previous
+  flat coarse floor of 4 frames. The fine window built around the coarse
+  estimate only covers +/- `fine_margin_s` around it, so if the coarse
+  pass's own sampling (after budget-driven thinning) has gaps wider than
+  `fine_margin_s`, the true transition could fall in a gap the coarse pass
+  never saw closely enough to estimate, and the resulting fine window
+  could miss it entirely. The new floor
+  (`max(4, ceil(duration_s / fine_margin_s) + 1)`) guarantees some coarse
+  sample lands within `fine_margin_s` of the true transition wherever it
+  is, at the cost of needing more bytes for a long clip's coarse pass -
+  reflected in `_oversized_abstain`'s per-pass detail message if the
+  budget can't support it.
+
+7 new tests in `tests/test_llm_timing_frame_budget.py`: `_min_coarse_frames`
+scaling with duration/`fine_margin_s`; `_fit_fine_windows_to_budget`
+retaining each window's own floor independently of the other window's
+frame size, and reporting each window's failure separately; three
+`_validate_grounding`/`_GroundingRegion` unit tests reproducing the exact
+fabricated-evidence-in-the-gap and evidence-from-the-wrong-window failure
+modes described above (and confirming a genuinely well-grounded verdict
+still confirms); and one full pipeline-level integration test
+(`test_pipeline_abstains_when_fine_evidence_only_exists_in_the_gap_between_windows`)
+reproducing the same fabricated-evidence scenario end-to-end against the
+real, widely-separated zahn_video fine windows.
+
+Existing `tests/test_llm_timing_frame_budget.py` byte-budget integration
+tests were recalibrated against the new coarse floor: the 26s zahn_video
+fixture's coarse floor is now ~19 frames (~163KB) rather than the old flat
+4 frames (~25KB), which made the previous "coarse fits, fine doesn't"
+budget value (50KB) no longer reachable - that scenario now needs a
+tighter `target_tolerance_s` to keep each fine window's own floor above
+the coarse floor's byte requirement (see the updated test's comment for
+the exact figures probed against the real fixture).
+
+**2. Gemini `ClientError` 408/429 were treated as unconditionally
+permanent (never retried).** A 429 (rate limited) or 408 (timeout) is
+exactly the shape of failure a bounded retry is *for* - as a `ClientError`
+(4xx), the previous adapter code retried nothing in that family, wasting
+otherwise-recoverable calls. Fixed:
+- `TransientProviderError` gained an optional `retry_after_s` field - a
+  raiser can supply a server-suggested delay (e.g. from a 429's
+  `Retry-After` header) that overrides `GeminiTimingProvider`'s own
+  computed exponential backoff for the next attempt.
+- `_classify_client_error(exc)` (new, standalone function in
+  `gemini_provider.py`): 408/429 -> `TransientProviderError` (carrying
+  `retry_after_s` when extractable), every other 4xx -> unchanged
+  `PermanentProviderError`. Extracted as a standalone function
+  specifically so the classification *policy* is unit-testable with a
+  fake exception object, independent of whether the real `google-genai`
+  SDK is installed.
+- `_client_error_status_code`/`_client_error_retry_after_s`: best-effort
+  attribute extraction (`code`/`status_code`; `retry_after` or a
+  `response.headers["Retry-After"]`), each explicitly marked
+  **unverified against live SDK documentation** in its own docstring -
+  this sandbox still cannot reach `ai.google.dev` to confirm the exact
+  attribute names the real SDK's exception objects use. Falls back to
+  `None` (never guesses a number) when nothing matches, which
+  `_classify_client_error` and the retry loop both treat safely (no
+  status code -> permanent; no retry-after -> the existing exponential
+  backoff).
+
+10 new tests in `tests/test_llm_timing_gemini_provider.py`: 429/408
+classify transient, 400/401/403/413/422/500 (and an unrecognised bare
+exception) classify permanent, status-code extraction from either
+attribute name, `retry_after_s` extraction from a direct attribute and
+from a response-header mapping, and an adapter-level integration test
+confirming `GeminiTimingProvider.analyze` actually sleeps the
+server-suggested delay (not its own backoff guess) when a raised
+`TransientProviderError` carries one.
+
+**3. Pricing comment stated a false model-retirement claim as fact.**
+§12 flagged - correctly, as an unverified claim needing confirmation -
+that several third-party pricing aggregators appeared to report Google
+retiring `gemini-2.5-flash-lite` on 2026-10-16, and surfaced this as an
+operational risk worth the supervisor's attention. The supervisor's
+review, reading the official pages directly
+(`ai.google.dev/gemini-api/docs/pricing`,
+`ai.google.dev/gemini-api/docs/deprecations`) - something this sandbox
+still cannot do (network egress to `ai.google.dev` remains blocked, tried
+again this round) - reported that claim is **wrong**: no shutdown or
+retirement date is listed for this model on the official deprecations
+page, likely confusion with a different preview/model on the aggregator
+side. `pricing.py`'s sourcing comment has been rewritten to remove the
+false claim entirely and instead: confirm the $0.10/$0.40 per-1M-token
+figures against the official pricing page (per the same review), state
+plainly that this module still can't fetch that page itself and is
+relying on the reviewer's direct reading of it, and note there is no
+listed retirement date - while still flagging that this is worth a
+periodic recheck by whoever *can* reach the official pages, not a
+permanently-settled fact either way. This module continuing to be unable
+to verify its own sourcing claims independently is itself worth carrying
+forward as a standing operational note, not just a one-time correction.
+
+**Gates re-run after all of the above**: `pytest -q` - green (full suite);
+`node --test tests_js/*.test.js` - green, unaffected; `ruff check .` -
+clean; `ruff format --check .` - clean; `mypy app` - clean except the same
+pre-existing, unrelated `app/web/routes.py` finding noted in §11 and §12.
+
+Still stopped here: no live gate, no production/UI wiring, without further
+review. Per the supervisor's round-3 instruction: report the new commit
+and exact tests, then await explicit authorization before the controlled
+real-clip/API-key gate-1 run.
