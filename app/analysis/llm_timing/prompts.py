@@ -56,9 +56,11 @@ asks only about the start, over only a start window, reusing
 grounding then only has one boundary's claim to check, independent of
 anything about the end.
 
-``PROMPT_END_VALIDATE_V1`` is a follow-up, used only after a candidate end
-has already been nominated (originally by the chronological end-scan
-above; now by ``PROMPT_END_COARSE_V1`` below - see
+``PROMPT_END_VALIDATE_V1`` (superseded by V2 below, kept only as the
+historical record of what the first two real reruns of the two-stage
+design were actually scored against) is a follow-up, used only after a
+candidate end has already been nominated (originally by the chronological
+end-scan above; then by ``PROMPT_END_COARSE_V1``/``V2`` below - see
 ``pipeline._build_validation_frames`` and ``pipeline.run_llm_timing``'s
 trend-validation follow-up request). Its own motivation predates the
 end-scan's replacement: a real gate-1 run showed that a single window's
@@ -69,23 +71,55 @@ The onset fix kept that specific case from recurring structurally, but
 the supervisor's own follow-up authorization generalizes the underlying
 lesson: a real break is the onset of a *sustained* shortening trend, not
 a single frame that happens to look shorter - a momentary contrast/camera
-artifact can look identical to a genuine break in one frame alone. This
-prompt asks the model to check ONE already-proposed candidate timestamp
-against the frames that come after it (a bounded validation horizon),
-rather than accepting the first plausible-looking answer on its own - and
-a real, isolated experiment against this exact prompt (one coherent
-request, dense frames, ~1s baseline + ~2s horizon around a known-good
-candidate) confirmed the true break within the gate-1 tolerance, which is
-what motivated retiring the chronological scan around it (see
-``PROMPT_END_COARSE_V1`` below). The candidate frame is identified by a
-distinguishing frame label ("CANDIDATE frame" vs plain "frame" - see
+artifact can look identical to a genuine break in one frame alone. V1
+asked the model to check ONE already-proposed candidate timestamp against
+the frames that come after it (a bounded validation horizon), rather than
+accepting the first plausible-looking answer on its own, and could only
+ever CONFIRM that exact candidate or REJECT it - never propose a
+different, better-supported timestamp from the same evidence it was
+already looking at. The candidate frame is identified by a distinguishing
+frame label ("CANDIDATE frame" vs plain "frame" - see
 ``gemini_provider._build_parts``/``openai_provider._build_parts``) rather
 than a number embedded in the prompt text itself, so this prompt's own
-wording stays static and version-pinned like every other one here. Reuses
-``schema.TimingVerdict``'s existing degenerate-point shape exactly like
-``PROMPT_END_SCAN_V2``/``PROMPT_START_REFINE_V1`` - CONFIRMED means the
-candidate is validated (echo its own timestamp back), ABSTAIN means it is
-rejected (the trend didn't hold) or there isn't enough evidence to judge.
+wording stays static and version-pinned like every other one here.
+
+``PROMPT_END_VALIDATE_V2`` is the live trend-validation prompt. A real
+whole-clip rerun against ``PROMPT_END_COARSE_V2`` (commit `86c083d`)
+improved the sparse nomination from a rejected 18.5s transient to 21.5s -
+closer, but V1's confirm-or-reject-only contract had no way to use the
+dense window's own baseline evidence (which, at the default 1.0s baseline
+margin, already reached back to 20.5s - the true break) to correct a
+sparse candidate that overshot by a second. V2 reframes the CANDIDATE
+frame as a reference point, not a fixed answer to confirm: the model is
+now asked to find the EARLIEST onset of a sustained shortening trend
+anywhere in the window (baseline before the candidate, evidence after),
+using the same trend-vs-transient discipline V1 already had (checkpoint-
+by-checkpoint sustained shortening, brief re-extension tolerated only if
+later frames shorten past the prior deepest point, a return-to-baseline-
+and-stay is a rejected transient) - it may report the candidate's own
+timestamp, an earlier one the window's baseline supports, or occasionally
+a later one, whichever this batch's own evidence actually confirms.
+Structurally this is exactly the same request shape as V1 (same window,
+same call, no pipeline expansion): ``openai_provider._response_schema_for_pass``
+already enum-constrained "end_validate" to every timestamp *submitted* in
+the window, not just the candidate's own, so the schema-level guarantee
+needed no change - only V1's own prompt wording was preventing the model
+from using evidence it could already see. ``pipeline.run_llm_timing``
+correspondingly now reports the *validation* pass's own ``end_s`` as the
+final answer (the refined onset), not the end-coarse candidate's - the
+"report T, not a later point" rule from the previous round is superseded
+here for this reason (it existed to stop the validation call from
+unilaterally drifting past its own candidate; V2 is deliberately allowed
+to refine within its own grounded window instead) - while a new
+structural check enforces that the reported onset still has the full
+``end_validation_horizon_s`` of *actually submitted* future evidence
+after it, in either direction, converging on ABSTAIN
+(``insufficient_future_context``) otherwise rather than trusting an
+onset the model could not have actually confirmed from what it was
+shown. Reuses ``schema.TimingVerdict``'s existing degenerate-point shape
+exactly like ``PROMPT_END_SCAN_V2``/``PROMPT_START_REFINE_V1`` -
+CONFIRMED means an onset was found and confirmed, ABSTAIN means none in
+this window was.
 
 ``PROMPT_END_COARSE_V1`` (superseded by V2 below, kept only as the
 historical record of what the first real whole-clip rerun was actually
@@ -132,8 +166,9 @@ is unchanged, since the whole batch was already visible to the model in
 one request; only the instructions for how to use it changed. Reuses
 ``schema.TimingVerdict``'s existing degenerate-point shape the same way
 every prompt below ``PROMPT_END_SCAN_V1`` does. Its own candidate is never
-trusted on its own - ``PROMPT_END_VALIDATE_V1`` must still confirm it -
-so this prompt only has to localize roughly, not prove anything.
+trusted on its own - ``PROMPT_END_VALIDATE_V2`` must still confirm (and
+may still refine) it - so this prompt only has to localize roughly, not
+prove anything.
 """
 
 from __future__ import annotations
@@ -526,6 +561,116 @@ not invent a confident-sounding validation when the evidence does not
 support one.
 """
 
+PROMPT_END_VALIDATE_V2_ID = "zahn-efflux-end-validate-v2"
+
+PROMPT_END_VALIDATE_V2 = """\
+You are analyzing frames from a Zahn cup viscosity test video: a short
+baseline period, then a region an earlier pass flagged as roughly where
+the break might be, then a horizon of frames after it. One frame in this
+batch is labelled "[CANDIDATE frame at t=...s]" - all the others are
+labelled plainly, "[frame at t=...s]". The CANDIDATE frame is a REFERENCE
+POINT, not a fixed answer: the earlier pass only had sparse frames to work
+from and may not have landed on the exact onset. Your job is to find the
+EARLIEST frame, anywhere in THIS batch, where the connected stream's
+reach begins a genuinely sustained shortening trend - which may be the
+CANDIDATE frame itself, an earlier frame in this batch (the earlier pass
+nominated a point slightly later than the true onset), or occasionally a
+later one, if that is what this batch's own evidence actually supports.
+
+Each frame is labelled with its exact timestamp in seconds. Frame
+selection was done deterministically by the calling pipeline, not by you;
+rely only on the timestamps given.
+
+MEASUREMENT RULE (use exactly this rule, do not invent your own):
+- The earliest frames in this batch establish the baseline: the
+  connected, outlet-attached stream at its established, roughly stable
+  reach, before any shortening.
+- Scan the batch chronologically for the EARLIEST frame whose reach looks
+  shorter than that baseline. Call this an onset candidate.
+- An onset candidate is CONFIRMED only if the frames after it, still
+  within this batch, show a clear, SUSTAINED net-shortening trend:
+  checkpoint by checkpoint, the connected stream's reach keeps getting
+  shorter than it was at the onset candidate - not just that one shorter
+  frame in isolation.
+- A brief re-extension (the reach lengthening slightly at some point after
+  the onset candidate) does not by itself disqualify it, AS LONG AS later
+  frames shorten again and reach a point shorter than any point already
+  seen - the overall trend must still be net shortening, never just
+  recovering back toward the baseline and stopping there.
+- If an onset candidate's reach instead returns to (or back toward) the
+  baseline and STAYS there for the rest of this batch, that onset
+  candidate is a visual/camera/contrast artifact, not the real break:
+  reject it and keep scanning later in the batch for the next
+  shorter-looking frame. Do not report a candidate you have already ruled
+  out this way just because it was the CANDIDATE frame or the first one
+  you noticed.
+- Your answer is the EARLIEST onset candidate that is actually confirmed
+  this way. Do not report a later, "more obvious" break if an earlier one
+  is already confirmed by this batch's own evidence.
+- Drops that have already detached and fallen below the connected
+  stream's own tip are not part of the stream's reach - judge the
+  connected segment only, never any separated droplets below it.
+- Whatever frame you report, you must have enough later frames within
+  THIS batch, after it, to actually confirm the sustained trend - if the
+  only onset candidate you can find is too close to the end of this batch
+  to have that confirming evidence, do not report it. If no onset
+  candidate in this batch is both genuinely shorter than baseline and
+  fully confirmed by this batch's own later frames, report "abstain".
+  Use reason_codes including "insufficient_future_context" (not enough
+  frames after any candidate to judge) or "ambiguous_trend" (frames
+  present, but inconclusive) or "trend_not_sustained" (every candidate
+  you found recovered back toward baseline), as appropriate.
+
+TIMESTAMP RULE (read this carefully): if confirmed, start_s and end_s
+must be COPIED EXACTLY, character-for-character, from one of the "[frame
+at t=...s]" or "[CANDIDATE frame at t=...s]" labels shown above - it does
+not have to be the CANDIDATE frame's own label; report whichever labelled
+frame is actually the confirmed onset. Never compute, estimate, round, or
+interpolate a timestamp between two labelled frames.
+
+HAZARDS SPECIFIC TO THIS FOOTAGE:
+- The cup, stream and background are often close to the same pale/dusty
+  colour (industrial environment) - contrast can be very low. A drop in
+  raw pixel brightness alone is not evidence of shortening: look for the
+  connected stream's own geometric reach, not an absolute brightness
+  threshold.
+- The footage is handheld - there is camera shake. Do not confuse
+  whole-frame motion (camera movement) with real motion of the stream
+  itself.
+- If no clear geometric edge is visible and the evidence is genuinely
+  ambiguous, abstain rather than guess.
+
+OUTPUT: reply with a single JSON object and nothing else (no prose before
+or after it), matching exactly this shape. This reports a single moment
+(the confirmed onset, if any), not an interval - set start_s and end_s to
+the SAME timestamp, and start_uncertainty_s/end_uncertainty_s to the same
+value:
+
+{
+  "status": "confirmed" | "abstain",
+  "start_s": <float seconds, copied exactly from one of the frame labels
+              above - identical to end_s; or null if abstaining>,
+  "end_s": <float seconds, copied exactly from one of the frame labels
+            above - identical to start_s; or null if abstaining>,
+  "start_uncertainty_s": <float, your own +/- bound on the timestamp>,
+  "end_uncertainty_s": <float, the same +/- bound as start_uncertainty_s>,
+  "confidence": <float 0..1>,
+  "reason_codes": [<short machine-readable strings, e.g.
+                     "trend_not_sustained", "insufficient_future_context",
+                     "ambiguous_trend", "weak_contrast", "camera_motion">],
+  "evidence_frame_timestamps_s": [<frame timestamps from THIS batch you
+                                     actually inspected - baseline and
+                                     the checkpoints after your reported
+                                     onset alike>],
+  "raw_notes": "<short free-text explanation, for a human audit log only>"
+}
+
+If you are not confident an onset is fully confirmed by this batch's own
+evidence, set "status" to "abstain", leave start_s/end_s null, and
+explain why in reason_codes. Do not invent a confident-sounding onset
+when the evidence does not support one.
+"""
+
 PROMPT_END_COARSE_V1_ID = "zahn-efflux-end-coarse-v1"
 
 PROMPT_END_COARSE_V1 = """\
@@ -721,6 +866,7 @@ PROMPTS: dict[str, str] = {
     PROMPT_END_SCAN_V2_ID: PROMPT_END_SCAN_V2,
     PROMPT_START_REFINE_V1_ID: PROMPT_START_REFINE_V1,
     PROMPT_END_VALIDATE_V1_ID: PROMPT_END_VALIDATE_V1,
+    PROMPT_END_VALIDATE_V2_ID: PROMPT_END_VALIDATE_V2,
     PROMPT_END_COARSE_V1_ID: PROMPT_END_COARSE_V1,
     PROMPT_END_COARSE_V2_ID: PROMPT_END_COARSE_V2,
 }

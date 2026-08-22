@@ -37,7 +37,7 @@ from app.analysis.llm_timing.openai_provider import (
 )
 from app.analysis.llm_timing.prompts import (
     PROMPT_END_COARSE_V2,
-    PROMPT_END_VALIDATE_V1,
+    PROMPT_END_VALIDATE_V2,
     PROMPT_START_REFINE_V1,
     PROMPT_V1,
 )
@@ -107,7 +107,7 @@ def _truth_aware_response(true_start_s: float, true_end_s: float) -> Callable[[l
                 start_s, end_s, evidence = true_end_s, true_end_s, (true_end_s,)
             else:
                 return json.dumps({"status": "abstain", "reason_codes": ["no_break_found"]})
-        elif prompt_text == PROMPT_END_VALIDATE_V1:
+        elif prompt_text == PROMPT_END_VALIDATE_V2:
             # Perfect trend-validation stub: always confirms whichever
             # candidate the pipeline flagged (these synthetic truths have a
             # single genuine, sustained break with no recovery to reject).

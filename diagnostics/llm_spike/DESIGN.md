@@ -1191,7 +1191,7 @@ instructions together are exactly the bias that selects an early
 transient over a later, better-supported break - and make the true
 candidate unreachable, since there is no second attempt.
 
-**Fix** (commit TBD, prompt-only - "no pipeline expansion or extra
+**Fix** (commit `86c083d`, prompt-only - "no pipeline expansion or extra
 calls" per the authorization): `PROMPT_END_COARSE_V2` rewrites the
 MEASUREMENT RULE to use the whole sparse batch before nominating
 anything, instead of stopping at the first shorter-looking frame. Scan
@@ -1241,3 +1241,99 @@ tests_js/*.test.js` - 44/44, unaffected.
 
 Model configurability and `gpt-4.1-mini` preserved. No UI, no unrelated
 cleanup. PR #5 stays draft - ready for one real whole-clip rerun.
+
+## 21. Trend validation may refine the onset, not only confirm/reject it
+
+A Codex review ran the real clip against commit `86c083d`
+(`PROMPT_END_COARSE_V2`). Result: still safe ABSTAIN, not gate
+acceptance - the coarse nomination improved from the rejected 18.5s
+transient to 21.5s, but dense validation rejected 21.5s itself as
+ambiguous (reach fluctuated/re-extended near baseline; weak contrast;
+camera motion). Truth is ~20.5s ±0.2. 76.985s harness / 55.062s provider,
+162,627 tokens, zero retries.
+
+The gap: `PROMPT_END_VALIDATE_V1`'s contract could only CONFIRM the exact
+sparse candidate or REJECT it outright - never report a different,
+better-supported timestamp from evidence it was already looking at. At
+the default 1.0s baseline margin, the dense window sent for a 21.5s
+candidate already reaches back to 20.5s - the true break - but V1's own
+TIMESTAMP RULE explicitly forbade reporting anything but the CANDIDATE
+frame's own label. This is the same class of gap the isolated experiment
+(§17/§18) already proved works when the dense pass is trusted with its
+own evidence: one coherent request, given the right contract, found
+20.2s (0.3s from truth) unprompted.
+
+**Fix** (commit TBD, no pipeline expansion): `PROMPT_END_VALIDATE_V2`
+reframes the CANDIDATE frame as a reference point, not a fixed answer.
+The model must find the EARLIEST frame anywhere in the window - baseline
+before the candidate, evidence after it - where a SUSTAINED shortening
+trend is confirmed by later checkpoints still within the same batch,
+using the same trend-vs-transient discipline V1 already had (brief
+re-extension tolerated only if later frames shorten past the prior
+deepest point; a return-to-baseline-and-stay is a rejected transient).
+It may report the candidate's own timestamp, an earlier one the
+baseline supports, or occasionally a later one - whichever the batch's
+own evidence actually confirms. The TIMESTAMP RULE now permits copying
+any submitted frame's label, not just the CANDIDATE's.
+
+No pipeline expansion was needed for the *request* shape -
+`openai_provider._response_schema_for_pass` already enum-constrained
+`"end_validate"` to every timestamp *submitted* in the window (not just
+the candidate's own), so the schema-level guarantee needed no change;
+only V1's own prompt wording was preventing the model from using
+evidence already in front of it. Two things did change in `pipeline.py`:
+
+1. `run_llm_timing` now reports the *validation* pass's own `end_s` as
+   the final answer, not the end-coarse candidate's - the "report T, not
+   a later point" rule from §17 is deliberately superseded here (it
+   existed to stop the validation call from unilaterally drifting past
+   its own candidate; V2 is allowed to refine within its own grounded
+   window instead, and `_validate_grounding`'s existing bounds/evidence
+   checks are the safety net, unchanged).
+2. The "at least ~2s future context" structural check (§19) is now
+   re-verified against whatever timestamp validation actually reports,
+   not just the original sparse candidate: `validation_verdict.end_s +
+   end_validation_horizon_s > validation_hi` converges on ABSTAIN
+   (`insufficient_future_context`) rather than trusting an onset the
+   model could not have actually confirmed from what it was shown. Since
+   `validation_hi = candidate_ts + end_validation_horizon_s` is fixed by
+   the pre-flight check already run for `candidate_ts`, this makes
+   backward refinement (toward the baseline) always safe by construction
+   - the window only grows wider from any earlier point - while forward
+   refinement (past the sparse candidate) is structurally always short on
+   trailing evidence and reliably abstains.
+
+The end-coarse candidate itself (`candidate_ts`) is preserved in
+`Event.details["end_coarse_candidate_s"]`, distinct from the final
+(possibly refined) `end_s`, for audit.
+
+**Tests**: `tests/test_llm_timing_pipeline.py` gained three regressions
+matching the four scenarios requested (the fourth - transients still
+abstain - was already covered by the existing
+`test_pipeline_abstains_when_the_only_candidate_fails_trend_validation`,
+unaffected by this round):
+`test_pipeline_accepts_a_validation_refined_onset_earlier_than_the_sparse_candidate`
+(backward refinement, using the real rerun's own numbers - 21.5s sparse,
+20.5s refined - CONFIRMED at 20.5s, not 21.5s),
+`test_pipeline_abstains_when_a_refined_onset_falls_outside_the_validation_window`
+(a refined timestamp outside the submitted window's bounds is rejected,
+proving grounding's existing bounds check still applies under the new
+freedom), and
+`test_pipeline_abstains_when_the_refined_onset_has_no_room_for_its_own_future_horizon`
+(forward refinement past the sparse candidate abstains
+`insufficient_future_context`, proven to happen only after the
+validation call actually ran). The old
+`test_pipeline_accepts_a_validated_candidate_reporting_its_own_t_not_a_later_point`
+tested the now-deliberately-reversed rule and was replaced by these
+three, not left alongside them.
+
+**Gates**: `pytest -q` - green (475 tests total across the full repo);
+`ruff check .` / `ruff format --check .` - clean; `mypy app` - clean
+except the same pre-existing, unrelated `app/web/routes.py:261` finding
+noted since §11; `node --test tests_js/*.test.js` - 44/44, unaffected.
+No real-clip rerun was run from this sandbox (no API key or real clip
+exists here, as every prior round has noted) - the operator runs that
+next, per the standing workflow.
+
+No pipeline expansion, no UI, no unrelated cleanup. PR #5 stays draft -
+ready for one real whole-clip rerun.

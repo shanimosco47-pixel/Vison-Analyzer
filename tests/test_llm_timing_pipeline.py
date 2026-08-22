@@ -865,15 +865,64 @@ def test_pipeline_reaches_the_true_break_in_one_call_when_end_coarse_avoids_the_
     ]
 
 
-def test_pipeline_accepts_a_validated_candidate_reporting_its_own_t_not_a_later_point(zahn_video):
-    """When a candidate is validated, the final result must report the
-    candidate's OWN timestamp T - the first onset frame - never a later
-    point from within the validation window, even if the validation call's
-    own answer names a different (also-plausible) timestamp - e.g. a brief
-    re-extension followed by continued, deeper shortening that a real model
-    might cite as "where it's now clearly shorter"."""
+def test_pipeline_accepts_a_validation_refined_onset_earlier_than_the_sparse_candidate(
+    zahn_video,
+):
+    """Reproduces the shape of a real whole-clip rerun (commit 86c083d):
+    the sparse end-coarse pass nominated 21.5s, a second too late; the
+    dense validation window - which already reaches back to
+    candidate - end_validation_baseline_s by design - contained the true
+    onset at 20.5s. PROMPT_END_VALIDATE_V2 is explicitly allowed to report
+    that earlier, better-supported timestamp instead of only confirming
+    or rejecting the sparse candidate verbatim, and the pipeline must
+    report the validation pass's own (refined) answer, not the coarse
+    candidate that only nominated the window to search."""
+    sparse_candidate_s = 21.5
+    refined_onset_s = 20.5  # exactly at validation_lo with the default 1.0s baseline
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=sparse_candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            return canned_json_response(
+                start_s=refined_onset_s,
+                end_s=refined_onset_s,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(refined_onset_s,),
+            )
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(
+            start_s=sparse_candidate_s,
+            end_s=sparse_candidate_s,
+            confidence=0.9,
+            evidence_frame_timestamps_s=(sparse_candidate_s,),
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.end_s == pytest.approx(refined_onset_s)
+    assert outcome.event.end_s != pytest.approx(sparse_candidate_s)
+    # The original sparse nomination stays visible for audit, distinct
+    # from the final refined answer.
+    assert outcome.event.details["end_coarse_candidate_s"] == pytest.approx(sparse_candidate_s)
+
+
+def test_pipeline_abstains_when_a_refined_onset_falls_outside_the_validation_window(zahn_video):
+    """A validation response naming a timestamp outside its own submitted
+    window's bounds must never be accepted, even under the new freedom to
+    refine - grounding still enforces that every reported timestamp
+    actually falls within the frames that were sent."""
     candidate_s = 10.0
-    deeper_point_s = 11.5  # inside the validation horizon, later than candidate_s
+    out_of_bounds_s = 50.0  # nowhere near the validation window, or the clip
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
@@ -881,14 +930,11 @@ def test_pipeline_accepts_a_validated_candidate_reporting_its_own_t_not_a_later_
         if request.pass_name == "fine":
             return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         if request.pass_name == "end_validate":
-            # Validates the candidate, but (unrealistically, to prove the
-            # pipeline does not just trust this call's own numbers) echoes
-            # back a later, deeper timestamp instead of the candidate's own.
             return canned_json_response(
-                start_s=deeper_point_s,
-                end_s=deeper_point_s,
+                start_s=out_of_bounds_s,
+                end_s=out_of_bounds_s,
                 confidence=0.9,
-                evidence_frame_timestamps_s=(deeper_point_s,),
+                evidence_frame_timestamps_s=(out_of_bounds_s,),
             )
         assert request.pass_name == "end_coarse"
         return canned_json_response(
@@ -905,10 +951,62 @@ def test_pipeline_accepts_a_validated_candidate_reporting_its_own_t_not_a_later_
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
     )
-    assert outcome.verdict.status is TimingStatus.CONFIRMED
-    assert outcome.event is not None
-    assert outcome.event.end_s == pytest.approx(candidate_s)
-    assert outcome.event.end_s != pytest.approx(deeper_point_s)
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "out_of_bounds" in outcome.verdict.reason_codes
+
+
+def test_pipeline_abstains_when_the_refined_onset_has_no_room_for_its_own_future_horizon(
+    zahn_video,
+):
+    """The mandatory future-context rule is re-checked against whatever
+    timestamp validation actually reports, not just the original sparse
+    candidate: refining forward, toward the validation window's own edge,
+    leaves less than the mandatory horizon of submitted evidence after it
+    - the pipeline must catch this structurally rather than trust the
+    model's own compliance, exactly like the pre-flight check for the
+    sparse candidate itself."""
+    candidate_s = 10.0
+    forward_point_s = 11.5  # later than candidate_s - inherently short on trailing evidence
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            return canned_json_response(
+                start_s=forward_point_s,
+                end_s=forward_point_s,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(forward_point_s,),
+            )
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(
+            start_s=candidate_s,
+            end_s=candidate_s,
+            confidence=0.9,
+            evidence_frame_timestamps_s=(candidate_s,),
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "insufficient_future_context" in outcome.verdict.reason_codes
+    # Unlike the pre-flight check for the sparse candidate, this abstain
+    # only happens after the validation call actually ran and answered.
+    assert [c.pass_name for c in provider.calls] == [
+        "coarse",
+        "fine",
+        "end_coarse",
+        "end_validate",
+    ]
 
 
 def test_pipeline_accepts_a_candidate_with_sustained_per_second_shortening(zahn_video):

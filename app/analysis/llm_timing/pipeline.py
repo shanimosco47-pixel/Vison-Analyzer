@@ -31,8 +31,8 @@ from .pricing import PRICING_TABLE_VERSION, ModelPricing, estimate_cost_usd
 from .prompts import (
     PROMPT_END_COARSE_V2,
     PROMPT_END_COARSE_V2_ID,
-    PROMPT_END_VALIDATE_V1,
-    PROMPT_END_VALIDATE_V1_ID,
+    PROMPT_END_VALIDATE_V2,
+    PROMPT_END_VALIDATE_V2_ID,
     PROMPT_START_REFINE_V1,
     PROMPT_START_REFINE_V1_ID,
 )
@@ -929,7 +929,7 @@ def run_llm_timing(
         # versus ~16,000 tokens/~22s for the isolated single-request
         # equivalent of stage 2 below) - supervisor-directed replacement,
         # see diagnostics/llm_spike/DESIGN.md and PROMPT_END_COARSE_V2/
-        # PROMPT_END_VALIDATE_V1. Failed validation now falls back directly
+        # PROMPT_END_VALIDATE_V2. Failed validation now falls back directly
         # to ABSTAIN (assisted/manual workflow) rather than searching for
         # another candidate - single-shot, not a search.
         #
@@ -1020,7 +1020,7 @@ def run_llm_timing(
         # still pass a dense, bounded trend-validation check before being
         # accepted (supervisor-directed generalization: a real break is a
         # *sustained* shortening trend, not a single frame that happens to
-        # look shorter - see PROMPT_END_VALIDATE_V1 and
+        # look shorter - see PROMPT_END_VALIDATE_V2 and
         # diagnostics/llm_spike/DESIGN.md).
         assert end_coarse_verdict.end_s is not None
         candidate_ts = end_coarse_verdict.end_s
@@ -1064,13 +1064,13 @@ def run_llm_timing(
             fine_step_s=fine_step_s,
             max_dimension_px=cfg.max_frame_dimension_px,
             jpeg_quality=cfg.jpeg_quality,
-            prompt_text=PROMPT_END_VALIDATE_V1,
+            prompt_text=PROMPT_END_VALIDATE_V2,
             max_request_bytes=cfg.max_request_bytes,
             target_tolerance_s=cfg.target_tolerance_s,
         )
         if validation_frames is None:
             abstain = _oversized_abstain(
-                PROMPT_END_VALIDATE_V1_ID,
+                PROMPT_END_VALIDATE_V2_ID,
                 "end_validate",
                 f"candidate at t={candidate_ts:.2f}s: validation window "
                 f"[{validation_lo:.2f}, {validation_hi:.2f}]s still exceeds the request "
@@ -1086,15 +1086,15 @@ def run_llm_timing(
             )
 
         validation_request = ProviderRequest(
-            prompt_version=PROMPT_END_VALIDATE_V1_ID,
-            prompt_text=PROMPT_END_VALIDATE_V1,
+            prompt_version=PROMPT_END_VALIDATE_V2_ID,
+            prompt_text=PROMPT_END_VALIDATE_V2,
             frames=tuple(validation_frames),
             pass_name="end_validate",
         )
         validation_response = provider.analyze(validation_request)
         validation_verdict = parse_raw_response(
             validation_response,
-            prompt_version=PROMPT_END_VALIDATE_V1_ID,
+            prompt_version=PROMPT_END_VALIDATE_V2_ID,
             min_confidence=cfg.min_confidence,
         )
         validation_submitted = [frame.timestamp_s for frame in validation_frames]
@@ -1109,6 +1109,29 @@ def run_llm_timing(
             end_region=validation_region,
             max_uncertainty_s=cfg.max_uncertainty_s,
         )
+        if validation_verdict.status is TimingStatus.CONFIRMED:
+            # The validation pass may refine the onset to a different
+            # timestamp than the sparse candidate (see PROMPT_END_VALIDATE_V2)
+            # - so the "full future horizon" guarantee established above for
+            # candidate_ts must be re-checked against whatever timestamp was
+            # actually reported: refining forward, toward the window's own
+            # edge, can leave less than the mandatory horizon of *submitted*
+            # evidence after it, which the pipeline must catch structurally
+            # rather than trust the model's own compliance for
+            # (supervisor-directed, see diagnostics/llm_spike/DESIGN.md).
+            assert validation_verdict.end_s is not None
+            if validation_verdict.end_s + cfg.end_validation_horizon_s > (
+                validation_hi + _BOUNDS_EPSILON_S
+            ):
+                validation_verdict = _grounding_abstain(
+                    validation_verdict,
+                    "insufficient_future_context",
+                    f"refined onset at t={validation_verdict.end_s:.3f}s needs "
+                    f"{cfg.end_validation_horizon_s:.2f}s of future context within this "
+                    f"window, but only {validation_hi - validation_verdict.end_s:.2f}s of "
+                    f"submitted evidence follows it (window ends at "
+                    f"t={validation_hi:.2f}s)",
+                )
         if validation_verdict.status is not TimingStatus.CONFIRMED:
             # Rejected (trend didn't hold) or couldn't be validated at all
             # (insufficient future context, ambiguous, malformed, or
@@ -1124,18 +1147,26 @@ def run_llm_timing(
                 end_validation_response=validation_response,
             )
 
-        # Report the coarse pass's own candidate T - the first onset frame
-        # - never a later point the validation call's own answer might
-        # name (supervisor-directed, see diagnostics/llm_spike/DESIGN.md).
+        # Report the dense validation pass's own (possibly refined) onset,
+        # not the sparse end-coarse candidate that nominated the window it
+        # searched: PROMPT_END_VALIDATE_V2 is deliberately allowed to
+        # localize the true onset anywhere within its own grounded window,
+        # since the sparse pass only has to localize roughly - a real
+        # rerun showed the dense pass's own baseline frames already
+        # contained the true break the sparse candidate overshot by ~1s
+        # (supervisor-directed, see diagnostics/llm_spike/DESIGN.md). The
+        # future-context guarantee for this exact timestamp was already
+        # re-checked above.
+        assert validation_verdict.end_s is not None
         final_confidence = min(
             fine_verdict.confidence, end_coarse_verdict.confidence, validation_verdict.confidence
         )
         final_verdict = TimingVerdict(
             status=TimingStatus.CONFIRMED,
             start_s=locked_start_s,
-            end_s=end_coarse_verdict.end_s,
+            end_s=validation_verdict.end_s,
             start_uncertainty_s=locked_start_uncertainty_s,
-            end_uncertainty_s=end_coarse_verdict.end_uncertainty_s,
+            end_uncertainty_s=validation_verdict.end_uncertainty_s,
             confidence=final_confidence,
             reason_codes=tuple(
                 sorted(
@@ -1151,13 +1182,13 @@ def run_llm_timing(
                     | set(validation_verdict.evidence_frame_timestamps_s)
                 )
             ),
-            model_id=end_coarse_verdict.model_id,
-            prompt_version=PROMPT_END_COARSE_V2_ID,
+            model_id=validation_verdict.model_id,
+            prompt_version=PROMPT_END_VALIDATE_V2_ID,
             raw_notes=(
                 f"start confirmed via {PROMPT_START_REFINE_V1_ID}; candidate break "
-                f"nominated via {PROMPT_END_COARSE_V2_ID} at "
-                f"t={end_coarse_verdict.end_s:.3f}s; validated as a sustained trend via "
-                f"{PROMPT_END_VALIDATE_V1_ID}"
+                f"nominated via {PROMPT_END_COARSE_V2_ID} at t={candidate_ts:.3f}s; "
+                f"refined and confirmed as a sustained trend via "
+                f"{PROMPT_END_VALIDATE_V2_ID} at t={validation_verdict.end_s:.3f}s"
             ),
         )
 
@@ -1169,7 +1200,7 @@ def run_llm_timing(
         event = Event(
             label="Efflux (LLM spike)",
             start_s=locked_start_s,
-            end_s=end_coarse_verdict.end_s,
+            end_s=validation_verdict.end_s,
             confidence=final_verdict.confidence,
             detector="llm_timing_spike",
             status=status,
@@ -1181,9 +1212,10 @@ def run_llm_timing(
                 "model_id": final_verdict.model_id,
                 "start_prompt_version": PROMPT_START_REFINE_V1_ID,
                 "end_coarse_prompt_version": PROMPT_END_COARSE_V2_ID,
-                "end_validate_prompt_version": PROMPT_END_VALIDATE_V1_ID,
+                "end_validate_prompt_version": PROMPT_END_VALIDATE_V2_ID,
                 "coarse_start_s": coarse_verdict.start_s,
                 "coarse_end_s": coarse_verdict.end_s,
+                "end_coarse_candidate_s": candidate_ts,
             },
         )
         return PipelineOutcome(
