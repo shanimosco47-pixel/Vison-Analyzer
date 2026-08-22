@@ -27,24 +27,18 @@ from pathlib import Path
 from ...errors import ConfigurationError
 from .pipeline import PipelineConfig, PipelineOutcome, run_llm_timing
 from .provider import TimingProvider
+from .redaction import sanitize_untrusted_text
 
 # Heuristic patterns for common vendor API key shapes (OpenAI "sk-...",
 # Anthropic "sk-ant-...", generic long opaque tokens). This is a safety net,
 # not a guarantee - it exists to catch the easy mistake of pasting an actual
 # key into what should be a *reference* to one, not to replace secret
 # scanning elsewhere in the toolchain. Anchored, for validating a value that
-# should be nothing *but* a reference.
+# should be nothing *but* a reference (see ``redaction.py`` for the
+# unanchored versions used to scrub a secret out of free text).
 _RAW_SECRET_PATTERNS = (
     re.compile(r"^sk-[A-Za-z0-9_-]{10,}$"),
     re.compile(r"^[A-Za-z0-9_-]{32,}$"),
-)
-
-# The same shapes, unanchored with word boundaries, for scanning a secret
-# out of an arbitrary free-text string (an error message) rather than
-# validating that a whole value is nothing else.
-_RAW_SECRET_SCAN_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b"),
-    re.compile(r"\b[A-Za-z0-9_-]{32,}\b"),
 )
 
 
@@ -71,8 +65,16 @@ class EngineConfig:
             value. Rejected outright if it looks like an actual key (see
             ``_looks_like_a_raw_secret``); a real value belongs in the
             environment or secret store, resolved server-side by the
-            provider implementation, never in this dataclass, never logged,
-            never returned to the browser.
+            provider implementation, never in this dataclass, never logged.
+
+            ``credential_ref`` itself is server-side configuration and is
+            deliberately excluded from :meth:`to_dict` - see that method.
+            A future UI must never read or set it directly: accepting an
+            arbitrary reference from a browser would let a client pick
+            which server secret gets resolved (a secret-selection/oracle
+            surface). A future "add credential" UI action is write-only
+            into a server-side secret store; the reference it produces is
+            never echoed back to the client.
         display_name: optional label for the UI; purely cosmetic.
     """
 
@@ -104,12 +106,20 @@ class EngineConfig:
             )
 
     def to_dict(self) -> dict:
-        """Safe to log/return to a client: never includes a resolved secret."""
+        """The client-safe DTO.
+
+        Deliberately omits ``credential_ref`` - even though it is only a
+        reference, not a secret value, it is still server-side
+        configuration that a client has no legitimate need to see (which
+        env var name, which secret-store key). Only whether a credential is
+        configured is exposed. See the ``credential_ref`` attribute
+        docstring for why a future UI must treat this as write-only.
+        """
         return {
             "engine_id": self.engine_id,
             "provider_name": self.provider_name,
             "model_id": self.model_id,
-            "credential_ref": self.credential_ref,  # a reference, not a value
+            "credential_configured": bool(self.credential_ref),
             "enabled": self.enabled,
             "display_name": self.display_name,
         }
@@ -146,19 +156,6 @@ class EngineOutcome:
             "outcome": self.outcome.to_dict() if self.outcome is not None else None,
             "error_message": self.error_message,
         }
-
-
-def _redact(text: str) -> str:
-    """Best-effort scrub of anything credential-shaped from an error message.
-
-    Defense in depth only: provider implementations are expected to raise
-    clean errors themselves (never echoing a resolved secret). This exists
-    in case a vendor SDK's own exception text does.
-    """
-    redacted = text
-    for pattern in _RAW_SECRET_SCAN_PATTERNS:
-        redacted = re.sub(pattern, "[redacted]", redacted)
-    return redacted
 
 
 def run_llm_timing_for_engines(
@@ -217,7 +214,7 @@ def run_llm_timing_for_engines(
                     provider_name=engine.provider_name,
                     model_id=engine.model_id,
                     status=EngineRunStatus.ENGINE_ERROR,
-                    error_message=_redact(str(exc)),
+                    error_message=sanitize_untrusted_text(str(exc)),
                 )
             )
     return results

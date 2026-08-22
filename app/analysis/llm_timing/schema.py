@@ -13,6 +13,7 @@ free text to find out what the model concluded.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 
@@ -38,6 +39,19 @@ PIPELINE_REASON_CODES = frozenset(
         "malformed_output",  # response did not parse against the schema
         "low_confidence",  # parsed fine, but confidence fell below the config floor
         "invalid_invariant",  # e.g. end_s < start_s, negative uncertainty
+        # The four below are the request-grounding checks (Codex review,
+        # finding 1): a verdict can satisfy every invariant above and still
+        # be untethered from the actual video/frames it was asked about - a
+        # model can hallucinate a finite-looking, internally consistent
+        # answer that is simply about the wrong thing.
+        "out_of_bounds",  # start_s/end_s outside the video, or outside the
+        # window whose frames were actually sent for this pass
+        "ungrounded_evidence",  # evidence_frame_timestamps_s empty, or none
+        # of it corresponds to a frame actually submitted in this request
+        "evidence_far_from_claim",  # evidence exists and is grounded, but
+        # none of it sits near the claimed start_s/end_s
+        "uncertainty_exceeds_cap",  # start/end uncertainty too large to
+        # trust as CONFIRMED, even though it parsed and is non-negative
     }
 )
 
@@ -96,10 +110,24 @@ class TimingVerdict:
     raw_notes: str = ""
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.confidence <= 1.0:
+        # Every numeric field is untrusted (it may have come straight from a
+        # model's JSON output, which - unlike normal application input - can
+        # contain NaN/Infinity: Python's json module accepts those as an
+        # extension). A comparison against NaN is always False, so a naive
+        # range check silently lets NaN through; explicit isfinite() checks
+        # close that gap for every numeric field, not just confidence.
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
             raise ConfigurationError(
-                "A timing verdict's confidence must be between 0 and 1.",
+                "A timing verdict's confidence must be a finite number between 0 and 1.",
                 detail=f"confidence={self.confidence!r}",
+            )
+        if not math.isfinite(self.start_uncertainty_s) or not math.isfinite(self.end_uncertainty_s):
+            raise ConfigurationError(
+                "A timing verdict's uncertainty bounds must be finite numbers.",
+                detail=(
+                    f"start_uncertainty_s={self.start_uncertainty_s!r} "
+                    f"end_uncertainty_s={self.end_uncertainty_s!r}"
+                ),
             )
         if self.start_uncertainty_s < 0.0 or self.end_uncertainty_s < 0.0:
             raise ConfigurationError(
@@ -113,6 +141,11 @@ class TimingVerdict:
             if self.start_s is None or self.end_s is None:
                 raise ConfigurationError(
                     "A CONFIRMED timing verdict must have both start_s and end_s."
+                )
+            if not math.isfinite(self.start_s) or not math.isfinite(self.end_s):
+                raise ConfigurationError(
+                    "A CONFIRMED timing verdict's start_s and end_s must be finite numbers.",
+                    detail=f"start_s={self.start_s!r} end_s={self.end_s!r}",
                 )
             if self.end_s < self.start_s:
                 raise ConfigurationError(

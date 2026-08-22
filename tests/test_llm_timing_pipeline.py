@@ -165,6 +165,48 @@ def test_parse_model_requested_abstain_preserves_reason_codes():
 
 
 # --------------------------------------------------------------------------- #
+# parse_raw_response must be total: NaN/Infinity/non-numeric never raise,
+# in either a "confirmed" or an "abstain" payload (Codex review, finding 2)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        '{"status": "confirmed", "start_s": 4.0, "end_s": 20.6, "confidence": NaN}',
+        '{"status": "confirmed", "start_s": 4.0, "end_s": 20.6, "confidence": Infinity}',
+        '{"status": "confirmed", "start_s": NaN, "end_s": 20.6, "confidence": 0.9}',
+        '{"status": "confirmed", "start_s": 4.0, "end_s": Infinity, "confidence": 0.9}',
+        '{"status": "confirmed", "start_s": "not-a-number", "end_s": 20.6, "confidence": 0.9}',
+        '{"status": "confirmed", "start_s": 4.0, "end_s": 20.6, "confidence": "high"}',
+        '{"status": "confirmed", "start_s": 4.0, "end_s": 20.6, "confidence": 0.9, '
+        '"start_uncertainty_s": NaN}',
+        '{"status": "confirmed", "start_s": 4.0, "end_s": 20.6, "confidence": 0.9, '
+        '"reason_codes": "not-a-list"}',
+    ],
+)
+def test_parse_never_raises_on_confirmed_payload_garbage(raw_text):
+    response = RawProviderResponse(model_id="m", raw_text=raw_text, latency_s=0.0)
+    verdict = parse_raw_response(response, prompt_version=PROMPT_VERSION, min_confidence=0.5)
+    assert verdict.status is TimingStatus.ABSTAIN
+
+
+@pytest.mark.parametrize(
+    "raw_text",
+    [
+        '{"status": "abstain", "confidence": NaN}',
+        '{"status": "abstain", "confidence": Infinity}',
+        '{"status": "abstain", "confidence": "not-a-number"}',
+        '{"status": "abstain", "reason_codes": ["ok"], "confidence": -Infinity}',
+    ],
+)
+def test_parse_never_raises_on_abstain_payload_garbage(raw_text):
+    response = RawProviderResponse(model_id="m", raw_text=raw_text, latency_s=0.0)
+    verdict = parse_raw_response(response, prompt_version=PROMPT_VERSION, min_confidence=0.5)
+    assert verdict.status is TimingStatus.ABSTAIN
+
+
+# --------------------------------------------------------------------------- #
 # pipeline.run_llm_timing: coarse-to-fine orchestration against a real video
 # --------------------------------------------------------------------------- #
 
@@ -174,7 +216,9 @@ def _stub_matching_truth(truth: dict[str, float], *, fine_confidence: float = 0.
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
-            return canned_json_response(start_s=truth["flow_start_s"], end_s=truth["flow_end_s"], confidence=0.8)
+            return canned_json_response(
+                start_s=truth["flow_start_s"], end_s=truth["flow_end_s"], confidence=0.8
+            )
         return canned_json_response(
             start_s=truth["flow_start_s"], end_s=truth["flow_end_s"], confidence=fine_confidence
         )
@@ -295,7 +339,10 @@ def test_pipeline_abstains_when_coarse_window_is_implausibly_wide(zahn_video):
         )
 
     provider = StubTimingProvider(respond)
-    config = PipelineConfig(fine_max_span_s=6.0)
+    # max_uncertainty_s raised so this test isolates the oversized-window
+    # path from the separate uncertainty-cap path (see
+    # test_pipeline_abstains_when_uncertainty_exceeds_cap).
+    config = PipelineConfig(fine_max_span_s=6.0, max_uncertainty_s=20.0)
     outcome = run_llm_timing(
         zahn_video.path,
         provider,
@@ -307,6 +354,128 @@ def test_pipeline_abstains_when_coarse_window_is_implausibly_wide(zahn_video):
     assert outcome.event is None
     assert "ambiguous_evidence" in outcome.verdict.reason_codes
     assert len(provider.calls) == 1  # never sent the (would-be enormous) fine batch
+
+
+def test_pipeline_abstains_when_uncertainty_exceeds_cap(zahn_video):
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        return canned_json_response(
+            start_s=zahn_video.truth["flow_start_s"],
+            end_s=zahn_video.truth["flow_end_s"],
+            start_uncertainty_s=15.0,
+            confidence=0.8,
+        )
+
+    provider = StubTimingProvider(respond)
+    config = PipelineConfig(max_uncertainty_s=5.0)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+        config=config,
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "uncertainty_exceeds_cap" in outcome.verdict.reason_codes
+    assert len(provider.calls) == 1  # rejected at the coarse pass, no fine call
+
+
+# --------------------------------------------------------------------------- #
+# _validate_grounding via run_llm_timing: a CONFIRMED verdict that parses
+# cleanly but isn't tethered to the actual request must still abstain
+# (Codex review, finding 1)
+# --------------------------------------------------------------------------- #
+
+
+def _stub_coarse_ok_fine_custom(truth, fine_response: RawProviderResponse):
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(
+                start_s=truth["flow_start_s"], end_s=truth["flow_end_s"], confidence=0.8
+            )
+        return fine_response
+
+    return StubTimingProvider(respond)
+
+
+def test_pipeline_abstains_when_fine_start_is_outside_its_window(zahn_video):
+    # The fine window is only ~fine_margin_s wide around the coarse
+    # estimate (default 1.5s); 0.0 is nowhere near a true start_s of 4.0.
+    fine_response = canned_json_response(
+        start_s=0.0, end_s=zahn_video.truth["flow_end_s"], confidence=0.9
+    )
+    provider = _stub_coarse_ok_fine_custom(zahn_video.truth, fine_response)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "out_of_bounds" in outcome.verdict.reason_codes
+
+
+def test_pipeline_abstains_when_evidence_is_empty(zahn_video):
+    fine_response = canned_json_response(
+        start_s=zahn_video.truth["flow_start_s"],
+        end_s=zahn_video.truth["flow_end_s"],
+        confidence=0.9,
+        evidence_frame_timestamps_s=(),
+    )
+    provider = _stub_coarse_ok_fine_custom(zahn_video.truth, fine_response)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "ungrounded_evidence" in outcome.verdict.reason_codes
+
+
+def test_pipeline_abstains_when_evidence_matches_no_submitted_frame(zahn_video):
+    fine_response = canned_json_response(
+        start_s=zahn_video.truth["flow_start_s"],
+        end_s=zahn_video.truth["flow_end_s"],
+        confidence=0.9,
+        # A timestamp nowhere near anything the pipeline actually extracted
+        # and sent - a fabricated citation.
+        evidence_frame_timestamps_s=(9999.0,),
+    )
+    provider = _stub_coarse_ok_fine_custom(zahn_video.truth, fine_response)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "ungrounded_evidence" in outcome.verdict.reason_codes
+
+
+def test_pipeline_abstains_when_evidence_is_grounded_but_far_from_the_claim(zahn_video):
+    # start_lo is roughly flow_start_s - fine_margin_s = 4.0 - 1.5 = 2.5;
+    # this is a real, submittable frame timestamp, but nowhere near either
+    # the claimed start_s (4.0) or end_s (21.5).
+    fine_response = canned_json_response(
+        start_s=zahn_video.truth["flow_start_s"],
+        end_s=zahn_video.truth["flow_end_s"],
+        confidence=0.9,
+        evidence_frame_timestamps_s=(2.5,),
+    )
+    provider = _stub_coarse_ok_fine_custom(zahn_video.truth, fine_response)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant for a stub",
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "evidence_far_from_claim" in outcome.verdict.reason_codes
 
 
 def test_pipeline_config_rejects_invalid_bounds():

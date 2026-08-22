@@ -188,11 +188,15 @@ prints says so loudly so its numbers can't be mistaken for gate evidence.
 | `scripts/llm_timing_eval.py` - gate 1/3 metrics harness | Done (stub-only) |
 | Unit/integration tests against `StubTimingProvider` + synthetic fixtures | Done (19 tests, `tests/test_llm_timing_pipeline.py`) |
 | `engine_config.py` - `EngineConfig`, failure-isolated `run_llm_timing_for_engines` | Done (backend only - see §10) |
-| A real vendor provider (OpenAI / Anthropic / Google, behind `TimingProvider`) | **Not started - needs an API key, explicitly deferred** |
+| `redaction.py` - centralized, bounded sanitization for all provider/model free text | Done - see §11 |
+| `pipeline._validate_grounding` - anchors a parsed verdict to the actual video/request | Done - see §11 |
+| `pricing.py` + `PipelineOutcome` cost/usage reporting | Done - pricing table empty until a real model is priced, see §11 |
+| `gemini_provider.py` - `GeminiTimingProvider`, the first real adapter | Done, unit-tested with an injected fake client - **not called anywhere; no live request exists in this spike** |
+| A real vendor provider actually wired to a live key | **Not started - needs an API key, explicitly deferred; `build_default_gemini_client` exists but nothing calls it** |
 | The two real hand-verified clips as committed fixtures | **Not available - real footage isn't committed to this repo; see `tests/conftest.py`'s own docstring on why** |
 | Adversarial regression fixtures (gate 2) | Not started |
 | Blinded 15-20 clip evaluation set (gate 3) | Not started - blocked on both of the above |
-| Cost/token accounting in `RawProviderResponse` | Fields exist (`prompt_tokens`, `completion_tokens`) but nothing populates them yet - depends on a real provider |
+| Populated pricing entries for real models | Not started - `PRICING_TABLE` is empty; add an entry once a model is actually being called |
 | Prompt A/B: raw-video-with-vendor-code-execution vs. our own deterministic frame batching | Open design question - see §8 |
 | Settings UI (engine entries, `+` control, credential fields, connection validation) | **Not started - explicitly deferred until reviewed, see §10** |
 
@@ -333,3 +337,93 @@ the failing engine's error is reported without stopping the batch; a
 being stored; two engines confirming genuinely different, disagreeing
 answers both survive untouched in the output - proving nothing here
 merges or picks a winner.
+
+## 11. Codex review round (commit `76d0ddb`) - findings addressed
+
+A review left directly on PR #5 found five real gaps in the design above.
+All five are fixed on this branch; this section is the record of what
+changed and why, so the fix is traceable back to the finding that demanded
+it.
+
+**1. A verdict wasn't anchored to the actual video/request.** Everything in
+§3/§4 validated a verdict's own internal shape - it had no idea whether
+`start_s` was inside the video, or whether `evidence_frame_timestamps_s`
+corresponded to anything actually sent. A model could return a finite,
+internally-consistent, *fabricated* answer and it would parse as CONFIRMED.
+Fixed with `pipeline._validate_grounding`, run on both the coarse and fine
+verdicts before either is trusted: `start_s`/`end_s` must fall inside the
+window whose frames were actually submitted for that pass (the whole video
+for the coarse pass, the sized fine window for the fine pass); every
+`evidence_frame_timestamps_s` entry must be within a documented, pass-scaled
+tolerance of a frame that was actually sent (`ungrounded_evidence`
+otherwise); at least one evidence timestamp must sit near each claimed
+boundary (`evidence_far_from_claim` otherwise); and a new
+`PipelineConfig.max_uncertainty_s` caps how large `start_uncertainty_s`/
+`end_uncertainty_s` may be on a CONFIRMED verdict (`uncertainty_exceeds_cap`
+otherwise). Every failure converges on ABSTAIN, same discipline as
+`parse_raw_response`. 9 new tests in `tests/test_llm_timing_pipeline.py`.
+
+**2. Malformed ABSTAIN payloads could raise instead of abstaining.**
+`parse_raw_response`'s "abstain" branch built a `TimingVerdict` outside the
+try/except that guarded the "confirmed" branch, so a non-numeric or
+NaN/Infinity `confidence` in an abstain payload could raise instead of
+producing a clean abstain. Fixed by routing both branches
+(`_parse_confirmed`/`_parse_abstain`) through the same try/except, and by
+adding explicit `math.isfinite()` checks to every numeric field in
+`TimingVerdict.__post_init__` (`start_s`, `end_s`, both uncertainties,
+confidence) - a naive range/comparison check silently passes NaN, since any
+comparison against NaN is `False`. 12 new parametrized regression tests
+covering NaN/Infinity/non-numeric in every field, on both payload shapes.
+
+**3. Secret/error redaction had a bypass.** The per-engine redaction in
+`engine_config.py` only ever ran on caught Python exceptions - a provider's
+own reported `error` string, and a model's own `raw_notes` field, reached
+`TimingVerdict.raw_notes` (and from there `to_dict()`, logs, diagnostics)
+unredacted. Fixed by extracting the redaction (and a length bound - "bounded
+sanitization", per the finding) into `redaction.py`, and routing every
+untrusted free-text value through `sanitize_untrusted_text()` before it
+reaches a constructed object: `provider.py`'s `_abstain`/`_parse_confirmed`/
+`_parse_abstain`, and `engine_config.py`'s exception-message path (now
+importing the shared function instead of keeping its own copy).
+
+**4. `credential_ref` was exposed as a client-safe field.** `EngineConfig.to_dict()`
+returned the raw reference (an env var name / secret-store key) - server
+configuration a client has no legitimate need to see, and a future
+free-text-editable field would let a browser pick which server secret gets
+resolved. Fixed: `to_dict()` now returns `credential_configured: bool`
+instead of `credential_ref`. §10.1/§10.3 above are written to match: a
+future "add credential" UI action is write-only into a server-side secret
+store, and the reference it produces is never echoed back to the client.
+
+**5. The evaluation contract lacked cost/token evidence.** Gate 3 needs
+per-analysis cost, and nothing surfaced it. Added `pricing.py`
+(`PRICING_TABLE_VERSION`, an explicitly empty-until-populated
+`PRICING_TABLE`, `estimate_cost_usd` - returns `None`, never a silent `0.0`,
+for an unpriced model or missing usage) and extended `PipelineOutcome` with
+`total_retries`, `total_latency_s`, `total_tokens`, and
+`estimated_cost_usd()`, all surfaced in `to_dict()`. `scripts/llm_timing_eval.py`'s
+`ClipResult`/`_summarize` now report per-clip and aggregate model IDs,
+provider latency, retries, token usage, and cost - `None`/omitted rather
+than fabricated wherever a real provider hasn't reported it yet.
+
+**Then, one real provider adapter.** `gemini_provider.py` adds
+`GeminiTimingProvider`, the first concrete `TimingProvider` implementation,
+pinned to `gemini-2.5-flash-lite` by default (`DEFAULT_GEMINI_MODEL_ID`,
+overridable, never implicit) with a small bounded retry loop. It is built
+around an injected `GeminiClient` protocol specifically so it is fully
+unit-testable (10 tests in `tests/test_llm_timing_gemini_provider.py`) with
+a fake client - no network, no SDK dependency anywhere in the test suite.
+The one function that imports the real `google.generativeai` SDK
+(`build_default_gemini_client`) does so lazily inside its own body and
+reads the API key only from a named environment variable - and **nothing in
+this spike calls it**. No live request exists anywhere on this branch.
+
+**Gates re-run after all of the above**: full Python suite (`pytest -q`) -
+green; the pre-existing Node suite (`node --test tests_js/*.test.js`) -
+green, unaffected (nothing in this round touched the web layer); `ruff
+check .` - clean; `ruff format --check .` - clean; `mypy app` - clean
+except one finding in `app/web/routes.py` confirmed present on `main`
+before this branch existed, unrelated to any of this work.
+
+Still stopped here, per the standing instruction: no live gate, no
+production/UI wiring, without further review.

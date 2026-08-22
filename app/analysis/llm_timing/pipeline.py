@@ -23,6 +23,7 @@ from ...errors import ConfigurationError
 from ...video.metadata import VideoInfo
 from ...video.reader import VideoReader, encode_jpeg
 from ..base_detector import Event, EventStatus
+from .pricing import PRICING_TABLE_VERSION, ModelPricing, estimate_cost_usd
 from .provider import (
     ProviderRequest,
     RawProviderResponse,
@@ -54,6 +55,14 @@ class PipelineConfig:
             ``EventStatus.REVIEW`` instead of ``CONFIRMED`` - plausible, but
             a human should look, per the same vocabulary the classical
             detectors already use.
+        max_uncertainty_s: cap on a CONFIRMED verdict's
+            ``start_uncertainty_s``/``end_uncertainty_s``. A verdict can be
+            internally consistent (``schema.TimingVerdict``'s own
+            invariants) and still be too unsure of itself to trust as
+            CONFIRMED - a provider that says "start_s=4.0 +/- 12s" has not
+            actually located the boundary. Exceeding this cap converges on
+            ABSTAIN (reason code "uncertainty_exceeds_cap"), same as every
+            other grounding failure - see ``_validate_grounding``.
     """
 
     coarse_step_s: float = 0.5
@@ -61,6 +70,7 @@ class PipelineConfig:
     fine_max_span_s: float = 6.0
     min_confidence: float = 0.5
     review_confidence: float = 0.75
+    max_uncertainty_s: float = 5.0
 
     def validate(self) -> None:
         if self.coarse_step_s <= 0:
@@ -72,9 +82,9 @@ class PipelineConfig:
         if not 0.0 <= self.min_confidence <= 1.0:
             raise ConfigurationError("min_confidence must be between 0 and 1.")
         if not self.min_confidence <= self.review_confidence <= 1.0:
-            raise ConfigurationError(
-                "review_confidence must be between min_confidence and 1."
-            )
+            raise ConfigurationError("review_confidence must be between min_confidence and 1.")
+        if self.max_uncertainty_s <= 0:
+            raise ConfigurationError("max_uncertainty_s must be positive.")
 
 
 @dataclass
@@ -91,13 +101,74 @@ class PipelineOutcome:
     coarse_response: RawProviderResponse
     fine_response: RawProviderResponse | None
 
+    @property
+    def total_retries(self) -> int:
+        return self.coarse_response.retries + (
+            self.fine_response.retries if self.fine_response else 0
+        )
+
+    @property
+    def total_latency_s(self) -> float:
+        return self.coarse_response.latency_s + (
+            self.fine_response.latency_s if self.fine_response else 0.0
+        )
+
+    @property
+    def total_tokens(self) -> int | None:
+        """``None`` (unknown) unless every pass that ran reported usage."""
+        parts = [self.coarse_response, self.fine_response]
+        counts = []
+        for response in parts:
+            if response is None:
+                continue
+            if response.prompt_tokens is None or response.completion_tokens is None:
+                return None
+            counts.append(response.prompt_tokens + response.completion_tokens)
+        return sum(counts) if counts else None
+
+    def estimated_cost_usd(self, *, table: dict[str, ModelPricing] | None = None) -> float | None:
+        """Sum of each pass's estimated cost, or ``None`` if any is unknown.
+
+        Deliberately not "sum the known ones and ignore the rest" - a
+        partial total would understate cost silently. See ``pricing.py``.
+        """
+        responses = [self.coarse_response, self.fine_response]
+        total = 0.0
+        for response in responses:
+            if response is None:
+                continue
+            cost = estimate_cost_usd(
+                response.model_id,
+                response.prompt_tokens,
+                response.completion_tokens,
+                table=table,
+            )
+            if cost is None:
+                return None
+            total += cost
+        return total
+
     def to_dict(self) -> dict:
         return {
             "verdict": self.verdict.to_dict(),
             "event": self.event.to_dict() if self.event is not None else None,
             "coarse_model_id": self.coarse_response.model_id,
             "coarse_latency_s": self.coarse_response.latency_s,
+            "coarse_retries": self.coarse_response.retries,
+            "coarse_prompt_tokens": self.coarse_response.prompt_tokens,
+            "coarse_completion_tokens": self.coarse_response.completion_tokens,
+            "fine_model_id": self.fine_response.model_id if self.fine_response else None,
             "fine_latency_s": self.fine_response.latency_s if self.fine_response else None,
+            "fine_retries": self.fine_response.retries if self.fine_response else None,
+            "fine_prompt_tokens": self.fine_response.prompt_tokens if self.fine_response else None,
+            "fine_completion_tokens": (
+                self.fine_response.completion_tokens if self.fine_response else None
+            ),
+            "total_latency_s": self.total_latency_s,
+            "total_retries": self.total_retries,
+            "total_tokens": self.total_tokens,
+            "estimated_cost_usd": self.estimated_cost_usd(),
+            "pricing_table_version": PRICING_TABLE_VERSION,
         }
 
 
@@ -120,6 +191,112 @@ def _coarse_timestamps(duration_s: float, step_s: float) -> list[float]:
         )
     count = max(2, int(duration_s / step_s) + 1)
     return [min(i * step_s, duration_s) for i in range(count)]
+
+
+# Pure float-rounding slack for "is this value inside the window we sized
+# for it" - not a tolerance for the model being approximately right.
+_BOUNDS_EPSILON_S = 1e-6
+
+
+def _grounding_abstain(verdict: TimingVerdict, reason_code: str, detail: str) -> TimingVerdict:
+    return TimingVerdict.abstain(
+        reason_codes=(reason_code,),
+        model_id=verdict.model_id,
+        prompt_version=verdict.prompt_version,
+        confidence=verdict.confidence,
+        raw_notes=detail,
+    )
+
+
+def _validate_grounding(
+    verdict: TimingVerdict,
+    *,
+    start_bounds: tuple[float, float],
+    end_bounds: tuple[float, float],
+    submitted_timestamps_s: tuple[float, ...],
+    time_tolerance_s: float,
+    max_uncertainty_s: float,
+) -> TimingVerdict:
+    """Re-check a parsed CONFIRMED verdict against the request it answers.
+
+    ``provider.parse_raw_response`` only validates a verdict's own internal
+    shape - it has no idea what video or which frames were actually sent, so
+    a well-formed, internally consistent, *fabricated* answer (a timestamp
+    nowhere near the submitted frames, evidence that doesn't correspond to
+    anything actually sent) parses cleanly. This is the check that catches
+    that: every failure converges on ABSTAIN, same discipline as
+    ``parse_raw_response``, just with request-level context it doesn't have.
+
+    A no-op for an already-ABSTAIN verdict (nothing to ground).
+    """
+    if verdict.status is not TimingStatus.CONFIRMED:
+        return verdict
+    assert verdict.start_s is not None and verdict.end_s is not None
+
+    start_lo, start_hi = start_bounds
+    end_lo, end_hi = end_bounds
+
+    if not (start_lo - _BOUNDS_EPSILON_S <= verdict.start_s <= start_hi + _BOUNDS_EPSILON_S):
+        return _grounding_abstain(
+            verdict,
+            "out_of_bounds",
+            f"start_s={verdict.start_s} outside the submitted window "
+            f"[{start_lo:.3f}, {start_hi:.3f}]",
+        )
+    if not (end_lo - _BOUNDS_EPSILON_S <= verdict.end_s <= end_hi + _BOUNDS_EPSILON_S):
+        return _grounding_abstain(
+            verdict,
+            "out_of_bounds",
+            f"end_s={verdict.end_s} outside the submitted window [{end_lo:.3f}, {end_hi:.3f}]",
+        )
+
+    if (
+        verdict.start_uncertainty_s > max_uncertainty_s
+        or verdict.end_uncertainty_s > max_uncertainty_s
+    ):
+        return _grounding_abstain(
+            verdict,
+            "uncertainty_exceeds_cap",
+            f"start_uncertainty_s={verdict.start_uncertainty_s} "
+            f"end_uncertainty_s={verdict.end_uncertainty_s} exceeds cap {max_uncertainty_s}",
+        )
+
+    if not verdict.evidence_frame_timestamps_s:
+        return _grounding_abstain(
+            verdict, "ungrounded_evidence", "no evidence_frame_timestamps_s given"
+        )
+
+    def _matches_a_submitted_frame(ts: float) -> bool:
+        return any(abs(ts - sent) <= time_tolerance_s for sent in submitted_timestamps_s)
+
+    ungrounded = [
+        ts for ts in verdict.evidence_frame_timestamps_s if not _matches_a_submitted_frame(ts)
+    ]
+    if ungrounded:
+        return _grounding_abstain(
+            verdict,
+            "ungrounded_evidence",
+            f"evidence timestamps {ungrounded} do not correspond to any frame "
+            f"actually submitted in this request",
+        )
+
+    near_start = any(
+        abs(ts - verdict.start_s) <= time_tolerance_s for ts in verdict.evidence_frame_timestamps_s
+    )
+    near_end = any(
+        abs(ts - verdict.end_s) <= time_tolerance_s for ts in verdict.evidence_frame_timestamps_s
+    )
+    if not (near_start and near_end):
+        missing = "start_s" if not near_start else "end_s"
+        claim = verdict.start_s if not near_start else verdict.end_s
+        return _grounding_abstain(
+            verdict,
+            "evidence_far_from_claim",
+            f"evidence_frame_timestamps_s={list(verdict.evidence_frame_timestamps_s)} has "
+            f"nothing within {time_tolerance_s:.3f}s of {missing}={claim}",
+        )
+
+    return verdict
 
 
 def _abstain_outcome(
@@ -169,6 +346,14 @@ def run_llm_timing(
         coarse_response = provider.analyze(coarse_request)
         coarse_verdict = parse_raw_response(
             coarse_response, prompt_version=prompt_version, min_confidence=cfg.min_confidence
+        )
+        coarse_verdict = _validate_grounding(
+            coarse_verdict,
+            start_bounds=(0.0, duration_s),
+            end_bounds=(0.0, duration_s),
+            submitted_timestamps_s=tuple(coarse_times),
+            time_tolerance_s=cfg.coarse_step_s,
+            max_uncertainty_s=cfg.max_uncertainty_s,
         )
 
         if coarse_verdict.status is not TimingStatus.CONFIRMED:
@@ -232,6 +417,14 @@ def run_llm_timing(
         fine_response = provider.analyze(fine_request)
         fine_verdict = parse_raw_response(
             fine_response, prompt_version=prompt_version, min_confidence=cfg.min_confidence
+        )
+        fine_verdict = _validate_grounding(
+            fine_verdict,
+            start_bounds=(start_lo, start_hi),
+            end_bounds=(end_lo, end_hi),
+            submitted_timestamps_s=tuple(fine_times),
+            time_tolerance_s=2.0 * fine_step_s,
+            max_uncertainty_s=cfg.max_uncertainty_s,
         )
 
         if fine_verdict.status is not TimingStatus.CONFIRMED:

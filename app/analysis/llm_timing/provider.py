@@ -19,6 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from .redaction import sanitize_untrusted_text
 from .schema import TimingStatus, TimingVerdict
 
 
@@ -113,10 +114,20 @@ def canned_json_response(
     end_uncertainty_s: float = 0.1,
     confidence: float = 0.9,
     reason_codes: tuple[str, ...] = (),
-    evidence_frame_timestamps_s: tuple[float, ...] = (),
+    evidence_frame_timestamps_s: tuple[float, ...] | None = None,
     latency_s: float = 0.01,
 ) -> RawProviderResponse:
-    """Build a well-formed CONFIRMED raw response - the common test case."""
+    """Build a well-formed CONFIRMED raw response - the common test case.
+
+    ``evidence_frame_timestamps_s`` defaults to ``(start_s, end_s)`` rather
+    than empty - a confirmed answer with no cited evidence would (correctly)
+    fail ``pipeline._validate_grounding``'s grounding checks, and most
+    callers of this helper are testing something else and don't want to
+    think about evidence timestamps. Pass an explicit value (including
+    ``()``) to test grounding failures themselves.
+    """
+    if evidence_frame_timestamps_s is None:
+        evidence_frame_timestamps_s = (start_s, end_s)
     payload = {
         "status": "confirmed",
         "start_s": start_s,
@@ -127,9 +138,7 @@ def canned_json_response(
         "reason_codes": list(reason_codes),
         "evidence_frame_timestamps_s": list(evidence_frame_timestamps_s),
     }
-    return RawProviderResponse(
-        model_id=model_id, raw_text=json.dumps(payload), latency_s=latency_s
-    )
+    return RawProviderResponse(model_id=model_id, raw_text=json.dumps(payload), latency_s=latency_s)
 
 
 def _abstain(
@@ -139,7 +148,52 @@ def _abstain(
         reason_codes=(reason_code,),
         model_id=model_id,
         prompt_version=prompt_version,
-        raw_notes=raw_notes,
+        raw_notes=sanitize_untrusted_text(raw_notes),
+    )
+
+
+def _parse_confirmed(
+    payload: dict,
+    reason_codes: tuple[str, ...],
+    response: RawProviderResponse,
+    prompt_version: str,
+) -> TimingVerdict:
+    """Build the CONFIRMED verdict, or raise so the caller converges on ABSTAIN.
+
+    Every conversion from an untrusted payload value happens here, inside
+    one narrow scope, so the caller only needs two except clauses to make
+    the whole thing total (see :func:`parse_raw_response`).
+    """
+    evidence = tuple(float(t) for t in (payload.get("evidence_frame_timestamps_s") or ()))
+    return TimingVerdict(
+        status=TimingStatus.CONFIRMED,
+        start_s=float(payload["start_s"]),
+        end_s=float(payload["end_s"]),
+        start_uncertainty_s=float(payload.get("start_uncertainty_s", 0.0)),
+        end_uncertainty_s=float(payload.get("end_uncertainty_s", 0.0)),
+        confidence=float(payload["confidence"]),
+        reason_codes=reason_codes,
+        evidence_frame_timestamps_s=evidence,
+        model_id=response.model_id,
+        prompt_version=prompt_version,
+        raw_notes=sanitize_untrusted_text(str(payload.get("raw_notes", ""))),
+    )
+
+
+def _parse_abstain(
+    payload: dict,
+    reason_codes: tuple[str, ...],
+    response: RawProviderResponse,
+    prompt_version: str,
+) -> TimingVerdict:
+    """Build the model-requested ABSTAIN verdict, or raise (see :func:`_parse_confirmed`)."""
+    codes = reason_codes or ("no_continuous_stream_found",)
+    return TimingVerdict.abstain(
+        reason_codes=codes,
+        model_id=response.model_id,
+        prompt_version=prompt_version,
+        confidence=float(payload.get("confidence", 0.0) or 0.0),
+        raw_notes=sanitize_untrusted_text(str(payload.get("raw_notes", ""))),
     )
 
 
@@ -149,9 +203,19 @@ def parse_raw_response(
     """Turn an untrusted raw response into a validated verdict.
 
     Every failure mode - a provider-level error, unparseable JSON, a missing
-    field, a value that fails :class:`TimingVerdict`'s own invariants, or
-    confidence below ``min_confidence`` - converges on ABSTAIN. Nothing here
-    ever fabricates a start/end time to paper over a gap.
+    field, a non-numeric or NaN/Infinity numeric field (in either a
+    "confirmed" or an "abstain" payload), a value that fails
+    :class:`TimingVerdict`'s own invariants, or confidence below
+    ``min_confidence`` - converges on ABSTAIN. This function must be total:
+    no shape or content of ``response.raw_text`` may raise out of it.
+    Nothing here ever fabricates a start/end time to paper over a gap.
+
+    This only validates the verdict's own internal shape (finite numbers,
+    ``end_s >= start_s``, etc.) - it does not know whether ``start_s`` falls
+    inside the video, or whether ``evidence_frame_timestamps_s`` corresponds
+    to frames actually sent. That context-aware check happens in
+    ``pipeline.py``'s ``_validate_verdict_against_request``, which has the
+    video duration and the exact frames of this request.
     """
     if response.error is not None:
         return _abstain(
@@ -188,40 +252,31 @@ def parse_raw_response(
             raw_notes=f"unrecognised status: {status_raw!r}",
         )
 
-    reason_codes = tuple(payload.get("reason_codes") or ())
-    if not all(isinstance(code, str) for code in reason_codes):
+    reason_codes_raw = payload.get("reason_codes")
+    if reason_codes_raw is None:
+        reason_codes_raw = []
+    if not isinstance(reason_codes_raw, list) or not all(
+        isinstance(code, str) for code in reason_codes_raw
+    ):
         return _abstain(
             reason_code="malformed_output",
             model_id=response.model_id,
             prompt_version=prompt_version,
-            raw_notes="reason_codes contained a non-string entry",
+            raw_notes="reason_codes was not a list of strings",
         )
+    reason_codes = tuple(reason_codes_raw)
 
-    if status_raw == "abstain":
-        codes = reason_codes or ("no_continuous_stream_found",)
-        return TimingVerdict.abstain(
-            reason_codes=codes,
-            model_id=response.model_id,
-            prompt_version=prompt_version,
-            confidence=float(payload.get("confidence", 0.0) or 0.0),
-            raw_notes=str(payload.get("raw_notes", "")),
-        )
-
+    # Both branches below convert untrusted values (float(), TimingVerdict's
+    # own invariants) and must therefore be wrapped identically: a
+    # non-numeric/missing field is a schema violation (malformed_output); a
+    # numeric value that is finite-but-invalid (NaN, Infinity, out of [0,1],
+    # end before start) fails TimingVerdict.__post_init__'s ConfigurationError
+    # (invalid_invariant). Neither may escape this function.
     try:
-        evidence = tuple(float(t) for t in (payload.get("evidence_frame_timestamps_s") or ()))
-        verdict = TimingVerdict(
-            status=TimingStatus.CONFIRMED,
-            start_s=float(payload["start_s"]),
-            end_s=float(payload["end_s"]),
-            start_uncertainty_s=float(payload.get("start_uncertainty_s", 0.0)),
-            end_uncertainty_s=float(payload.get("end_uncertainty_s", 0.0)),
-            confidence=float(payload["confidence"]),
-            reason_codes=reason_codes,
-            evidence_frame_timestamps_s=evidence,
-            model_id=response.model_id,
-            prompt_version=prompt_version,
-            raw_notes=str(payload.get("raw_notes", "")),
-        )
+        if status_raw == "abstain":
+            verdict = _parse_abstain(payload, reason_codes, response, prompt_version)
+        else:
+            verdict = _parse_confirmed(payload, reason_codes, response, prompt_version)
     except (KeyError, TypeError, ValueError) as exc:
         return _abstain(
             reason_code="malformed_output",
@@ -236,6 +291,9 @@ def parse_raw_response(
             prompt_version=prompt_version,
             raw_notes=str(exc),
         )
+
+    if verdict.status is TimingStatus.ABSTAIN:
+        return verdict
 
     if verdict.confidence < min_confidence:
         return _abstain(

@@ -65,7 +65,15 @@ def test_engine_config_accepts_a_plausible_env_var_reference():
         engine_id="e1", provider_name="openai", model_id="gpt-x", credential_ref="OPENAI_API_KEY"
     )
     assert cfg.credential_ref == "OPENAI_API_KEY"
-    assert cfg.to_dict()["credential_ref"] == "OPENAI_API_KEY"
+
+
+def test_engine_config_to_dict_never_exposes_credential_ref():
+    cfg = EngineConfig(
+        engine_id="e1", provider_name="openai", model_id="gpt-x", credential_ref="OPENAI_API_KEY"
+    )
+    dto = cfg.to_dict()
+    assert "credential_ref" not in dto
+    assert dto["credential_configured"] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -160,9 +168,11 @@ def test_results_are_never_aggregated_even_when_engines_disagree(zahn_video):
 
     def factory(engine):
         if engine.engine_id == "early":
+
             def respond(request):
                 return canned_json_response(start_s=4.0, end_s=10.0, confidence=0.9)
         else:
+
             def respond(request):
                 return canned_json_response(start_s=4.0, end_s=21.5, confidence=0.9)
 

@@ -67,7 +67,13 @@ class ClipResult:
     within_tolerance: bool | None  # None when abstained (not applicable)
     false_confident: bool  # CONFIRMED but wrong by more than tolerance
     reason_codes: list[str]
-    total_latency_s: float
+    harness_latency_s: float  # end-to-end wall time (frame extraction + calls + parsing)
+    coarse_model_id: str
+    fine_model_id: str | None
+    provider_latency_s: float  # sum of the passes' own reported latency_s
+    total_retries: int
+    total_tokens: int | None  # None unless every pass that ran reported usage
+    estimated_cost_usd: float | None  # None unless every pass's model is priced
 
 
 def _load_manifest(path: Path) -> list[dict]:
@@ -123,11 +129,17 @@ def _evaluate_clip(entry: dict, provider_name: str, config: PipelineConfig) -> C
         prompt_text=PROMPT_V1,
         config=config,
     )
-    total_latency_s = time.monotonic() - started
+    harness_latency_s = time.monotonic() - started
 
     true_start_s = float(entry["true_start_s"])
     true_end_s = float(entry["true_end_s"])
     verdict = outcome.verdict
+    coarse_model_id = outcome.coarse_response.model_id
+    fine_model_id = outcome.fine_response.model_id if outcome.fine_response else None
+    provider_latency_s = outcome.total_latency_s
+    total_retries = outcome.total_retries
+    total_tokens = outcome.total_tokens
+    estimated_cost_usd = outcome.estimated_cost_usd()
 
     if verdict.status is not TimingStatus.CONFIRMED:
         return ClipResult(
@@ -143,7 +155,13 @@ def _evaluate_clip(entry: dict, provider_name: str, config: PipelineConfig) -> C
             within_tolerance=None,
             false_confident=False,
             reason_codes=list(verdict.reason_codes),
-            total_latency_s=total_latency_s,
+            harness_latency_s=harness_latency_s,
+            coarse_model_id=coarse_model_id,
+            fine_model_id=fine_model_id,
+            provider_latency_s=provider_latency_s,
+            total_retries=total_retries,
+            total_tokens=total_tokens,
+            estimated_cost_usd=estimated_cost_usd,
         )
 
     assert verdict.start_s is not None and verdict.end_s is not None
@@ -167,7 +185,13 @@ def _evaluate_clip(entry: dict, provider_name: str, config: PipelineConfig) -> C
         within_tolerance=within_tolerance,
         false_confident=not within_tolerance,
         reason_codes=list(verdict.reason_codes),
-        total_latency_s=total_latency_s,
+        harness_latency_s=harness_latency_s,
+        coarse_model_id=coarse_model_id,
+        fine_model_id=fine_model_id,
+        provider_latency_s=provider_latency_s,
+        total_retries=total_retries,
+        total_tokens=total_tokens,
+        estimated_cost_usd=estimated_cost_usd,
     )
 
 
@@ -199,7 +223,20 @@ def _summarize(results: list[ClipResult]) -> dict:
         "duration_error_s": _stats(
             [r.duration_error_s for r in confirmed if r.duration_error_s is not None]
         ),
-        "latency_s": _stats([r.total_latency_s for r in results]),
+        "harness_latency_s": _stats([r.harness_latency_s for r in results]),
+        "provider_latency_s": _stats([r.provider_latency_s for r in results]),
+        "total_retries": sum(r.total_retries for r in results),
+        "total_tokens": (
+            sum(t for r in results if (t := r.total_tokens) is not None)
+            if any(r.total_tokens is not None for r in results)
+            else None
+        ),
+        "total_cost_usd": (
+            sum(c for r in results if (c := r.estimated_cost_usd) is not None)
+            if any(r.estimated_cost_usd is not None for r in results)
+            else None
+        ),
+        "n_clips_with_unknown_cost": sum(1 for r in results if r.estimated_cost_usd is None),
         "tolerance_s": DEFAULT_TOLERANCE_S,
     }
 
