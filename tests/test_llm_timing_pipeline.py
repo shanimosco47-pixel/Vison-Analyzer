@@ -17,7 +17,11 @@ from __future__ import annotations
 import pytest
 
 from app.analysis.base_detector import EventStatus
-from app.analysis.llm_timing.pipeline import PipelineConfig, run_llm_timing
+from app.analysis.llm_timing.pipeline import (
+    PipelineConfig,
+    _nearest_grounded_evidence_ts,
+    run_llm_timing,
+)
 from app.analysis.llm_timing.prompts import PROMPT_END_COARSE_V2_ID
 from app.analysis.llm_timing.provider import (
     ProviderRequest,
@@ -1323,6 +1327,179 @@ def test_pipeline_on_stage_can_abort_the_run_by_raising(zahn_video):
             prompt_text="irrelevant for a stub",
             on_stage=on_stage,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Auditability: pass_frames (actual submitted timestamps) and grounded
+# evidence-image timestamp selection - supervisor-directed requirement, see
+# diagnostics/llm_spike/DESIGN.md.
+# --------------------------------------------------------------------------- #
+
+
+def test_pipeline_records_pass_frames_matching_the_actual_submitted_requests(zahn_video):
+    """``PipelineOutcome.pass_frames`` must reflect exactly what was sent to
+    the provider - not a reconstruction from config - for every pass that
+    ran."""
+    candidate_s = 12.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+            return canned_json_response(start_s=ts, end_s=ts, confidence=0.9)
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert set(outcome.pass_frames) == {"coarse", "fine", "end_coarse", "end_validate"}
+    calls_by_pass = {c.pass_name: c for c in provider.calls}
+    for pass_name, call in calls_by_pass.items():
+        expected = tuple(sorted(f.timestamp_s for f in call.frames))
+        actual = tuple(sorted(outcome.pass_frames[pass_name]))
+        assert actual == expected, pass_name
+
+
+def test_pipeline_pass_frames_omits_passes_that_never_ran(zahn_video):
+    """A run that abstains before end_coarse/end_validate must not claim
+    those passes sent anything - the frontend's "Not run" state depends on
+    the key being absent, not present-with-an-empty-list."""
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=21.5, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert set(outcome.pass_frames) == {"coarse", "fine", "end_coarse"}
+    assert "end_validate" not in outcome.pass_frames
+
+
+def test_pipeline_thinned_pass_frames_match_the_frames_actually_sent(zahn_video):
+    """Under a tight byte budget that forces thinning, ``pass_frames`` must
+    reflect the *thinned* request, never the dense pre-thinning extraction
+    plan - the exact failure mode this feature exists to prevent."""
+    candidate_s = 12.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(
+                start_s=4.0, end_s=4.0, confidence=0.9, evidence_frame_timestamps_s=(4.0,)
+            )
+        if request.pass_name == "end_validate":
+            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+            return canned_json_response(start_s=ts, end_s=ts, confidence=0.9)
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
+
+    provider = StubTimingProvider(respond)
+    config = PipelineConfig(max_request_bytes=300_000)
+    outcome = run_llm_timing(
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        config=config,
+    )
+    fine_call = next(c for c in provider.calls if c.pass_name == "fine")
+    # The tight budget must actually have forced thinning for this
+    # assertion to mean anything - native-fps density over the fine window
+    # would be dozens of frames.
+    assert len(fine_call.frames) < 30
+    expected = tuple(sorted(f.timestamp_s for f in fine_call.frames))
+    assert tuple(sorted(outcome.pass_frames["fine"])) == expected
+
+
+def test_pipeline_confirmed_result_exposes_grounded_evidence_timestamps(zahn_video):
+    """A CONFIRMED result's Event.details carries start/end evidence
+    timestamps that are themselves drawn from what was actually submitted
+    to the deciding pass - never an arbitrary or interpolated value."""
+    candidate_s = 12.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+            return canned_json_response(start_s=ts, end_s=ts, confidence=0.9)
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+    assert outcome.event is not None
+    start_evidence_s = outcome.event.details["start_evidence_s"]
+    end_evidence_s = outcome.event.details["end_evidence_s"]
+    assert start_evidence_s is not None
+    assert end_evidence_s is not None
+    assert start_evidence_s in outcome.pass_frames["fine"]
+    assert end_evidence_s in outcome.pass_frames["end_validate"]
+
+
+def test_pipeline_abstain_outcome_has_no_event_and_therefore_no_evidence(zahn_video):
+    """ABSTAIN must never present fabricated evidence - the absence of
+    ``event`` (already the contract for every other field) covers this
+    too: there is nowhere for a frontend to even find an evidence
+    timestamp when the run abstained."""
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+
+
+class TestNearestGroundedEvidenceTs:
+    def test_picks_the_evidence_timestamp_closest_to_the_boundary(self):
+        result = _nearest_grounded_evidence_ts(
+            evidence_ts=(2.0, 4.0, 6.0), submitted_ts=(2.0, 4.0, 6.0), boundary_ts=5.5
+        )
+        assert result == 6.0
+
+    def test_snaps_to_the_nearest_actually_submitted_timestamp(self):
+        # The evidence value itself (4.0) is not among the submitted
+        # timestamps - the returned value must still come from what was
+        # actually sent, never the raw (unsnapped) evidence value.
+        result = _nearest_grounded_evidence_ts(
+            evidence_ts=(4.0,), submitted_ts=(3.96, 8.0), boundary_ts=4.0
+        )
+        assert result == 3.96
+
+    def test_returns_none_when_there_is_no_evidence(self):
+        assert _nearest_grounded_evidence_ts((), (1.0, 2.0), 1.5) is None
+
+    def test_returns_none_when_nothing_was_submitted(self):
+        assert _nearest_grounded_evidence_ts((1.0,), (), 1.0) is None
 
 
 def test_pipeline_config_rejects_invalid_bounds():

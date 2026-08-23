@@ -99,7 +99,7 @@ class TestEngineCrud:
             "/api/llm-engines",
             json={
                 "provider_name": "openai",
-                "model_id": "gpt-5-mini",
+                "model_id": "gpt-4.1-mini",
                 "display_name": "My OpenAI engine",
                 "env_var": "OPENAI_API_KEY",
             },
@@ -107,7 +107,7 @@ class TestEngineCrud:
         assert response.status_code == 200
         payload = response.get_json()
         assert payload["provider_name"] == "openai"
-        assert payload["model_id"] == "gpt-5-mini"
+        assert payload["model_id"] == "gpt-4.1-mini"
         assert payload["credential_configured"] is True
         assert "credential_ref" not in payload
         assert "env_var" not in payload
@@ -115,7 +115,7 @@ class TestEngineCrud:
 
     def test_create_without_a_credential_is_rejected(self, client):
         response = client.post(
-            "/api/llm-engines", json={"provider_name": "openai", "model_id": "gpt-5-mini"}
+            "/api/llm-engines", json={"provider_name": "openai", "model_id": "gpt-4.1-mini"}
         )
         assert response.status_code == 400
         assert "error" in response.get_json()
@@ -134,7 +134,7 @@ class TestEngineCrud:
         never leaking the submitted key."""
         response = client.post(
             "/api/llm-engines",
-            json={"provider_name": "openai", "model_id": "gpt-5-mini", "api_key": "sk-abc123"},
+            json={"provider_name": "openai", "model_id": "gpt-4.1-mini", "api_key": "sk-abc123"},
         )
         assert response.status_code == 400
         body = response.get_json()
@@ -143,7 +143,7 @@ class TestEngineCrud:
     def test_create_with_an_api_key_saves_it_write_only(self, client, working_secret_store):
         response = client.post(
             "/api/llm-engines",
-            json={"provider_name": "openai", "model_id": "gpt-5-mini", "api_key": "sk-abc123"},
+            json={"provider_name": "openai", "model_id": "gpt-4.1-mini", "api_key": "sk-abc123"},
         )
         assert response.status_code == 200
         body = response.get_json()
@@ -160,7 +160,7 @@ class TestEngineCrud:
             "/api/llm-engines",
             json={
                 "provider_name": "openai",
-                "model_id": "gpt-5-mini",
+                "model_id": "gpt-4.1-mini",
                 "api_key": "sk-super-secret",
             },
         )
@@ -172,7 +172,7 @@ class TestEngineCrud:
             "/api/llm-engines",
             json={
                 "provider_name": "openai",
-                "model_id": "gpt-5-mini",
+                "model_id": "gpt-4.1-mini",
                 "display_name": "A",
                 "env_var": "A_KEY",
             },
@@ -181,7 +181,7 @@ class TestEngineCrud:
             "/api/llm-engines",
             json={
                 "provider_name": "gemini",
-                "model_id": "gemini-2.5-flash",
+                "model_id": "gemini-3.5-flash",
                 "display_name": "B",
                 "env_var": "B_KEY",
             },
@@ -198,7 +198,11 @@ class TestEngineCrud:
     def test_update_changes_the_display_name(self, client):
         engine = client.post(
             "/api/llm-engines",
-            json={"provider_name": "openai", "model_id": "gpt-5-mini", "env_var": "OPENAI_API_KEY"},
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
         ).get_json()
         response = client.put(
             f"/api/llm-engines/{engine['engine_id']}", json={"display_name": "Renamed"}
@@ -213,7 +217,11 @@ class TestEngineCrud:
     def test_delete_removes_the_engine(self, client):
         engine = client.post(
             "/api/llm-engines",
-            json={"provider_name": "openai", "model_id": "gpt-5-mini", "env_var": "OPENAI_API_KEY"},
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
         ).get_json()
         response = client.delete(f"/api/llm-engines/{engine['engine_id']}")
         assert response.status_code == 200
@@ -228,7 +236,7 @@ class TestEngineCrud:
             "/api/llm-engines",
             json={
                 "provider_name": "openai",
-                "model_id": "gpt-5-mini",
+                "model_id": "gpt-4.1-mini",
                 "env_var": "THIS_VAR_IS_NEVER_SET",
             },
         ).get_json()
@@ -249,7 +257,11 @@ class TestLLMRuns:
         video = upload(client, zahn_video.path).get_json()
         engine = client.post(
             "/api/llm-engines",
-            json={"provider_name": "openai", "model_id": "gpt-5-mini", "env_var": "OPENAI_API_KEY"},
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
         ).get_json()
 
         monkeypatch.setattr(
@@ -277,7 +289,7 @@ class TestLLMRuns:
             "/api/llm-engines",
             json={
                 "provider_name": "openai",
-                "model_id": "gpt-5-mini",
+                "model_id": "gpt-4.1-mini",
                 "env_var": "THIS_VAR_IS_NEVER_SET",
             },
         ).get_json()
@@ -292,7 +304,11 @@ class TestLLMRuns:
     def test_run_against_an_unknown_video_is_404(self, client):
         engine = client.post(
             "/api/llm-engines",
-            json={"provider_name": "openai", "model_id": "gpt-5-mini", "env_var": "OPENAI_API_KEY"},
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
         ).get_json()
         response = client.post(
             "/api/videos/does-not-exist/llm-runs", json={"engine_id": engine["engine_id"]}
@@ -310,7 +326,11 @@ class TestLLMRuns:
         video = upload(client, zahn_video.path).get_json()
         engine = client.post(
             "/api/llm-engines",
-            json={"provider_name": "openai", "model_id": "gpt-5-mini", "env_var": "OPENAI_API_KEY"},
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
         ).get_json()
 
         # Fill every worker slot so the new run stays queued long enough to cancel.
@@ -337,3 +357,182 @@ class TestLLMRuns:
 
     def test_status_of_an_unknown_run_is_404(self, client):
         assert client.get("/api/llm-runs/does-not-exist").status_code == 404
+
+    def test_confirmed_run_exposes_pass_frames_and_evidence_timestamps(
+        self, app, client, zahn_video, monkeypatch
+    ):
+        video = upload(client, zahn_video.path).get_json()
+        engine = client.post(
+            "/api/llm-engines",
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
+        ).get_json()
+        monkeypatch.setattr(
+            app.extensions["llm_engine_store"],
+            "build_provider",
+            lambda e: _confirmed_stub_provider(),
+        )
+        started = client.post(
+            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+        ).get_json()
+        payload = _wait_for_run(client, started["run_id"])
+
+        assert set(payload["outcome"]["pass_frames"]) == {
+            "coarse",
+            "fine",
+            "end_coarse",
+            "end_validate",
+        }
+        assert payload["start_evidence_s"] is not None
+        assert payload["end_evidence_s"] is not None
+        assert payload["start_evidence_s"] in payload["outcome"]["pass_frames"]["fine"]
+        assert payload["end_evidence_s"] in payload["outcome"]["pass_frames"]["end_validate"]
+
+    def test_evidence_image_endpoint_serves_a_jpeg_for_a_confirmed_run(
+        self, app, client, zahn_video, monkeypatch
+    ):
+        video = upload(client, zahn_video.path).get_json()
+        engine = client.post(
+            "/api/llm-engines",
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
+        ).get_json()
+        monkeypatch.setattr(
+            app.extensions["llm_engine_store"],
+            "build_provider",
+            lambda e: _confirmed_stub_provider(),
+        )
+        started = client.post(
+            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+        ).get_json()
+        _wait_for_run(client, started["run_id"])
+
+        for boundary in ("start", "end"):
+            response = client.get(f"/api/llm-runs/{started['run_id']}/evidence/{boundary}")
+            assert response.status_code == 200
+            assert response.mimetype == "image/jpeg"
+            assert len(response.data) > 0
+
+    def test_evidence_image_endpoint_uses_the_server_stored_timestamp_not_a_client_supplied_one(
+        self, app, client, zahn_video, monkeypatch
+    ):
+        """The endpoint must never let a caller relabel an arbitrary frame
+        as "evidence" by supplying its own ``t`` - it always serves the
+        timestamp this run itself selected and grounded."""
+        video = upload(client, zahn_video.path).get_json()
+        engine = client.post(
+            "/api/llm-engines",
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
+        ).get_json()
+        monkeypatch.setattr(
+            app.extensions["llm_engine_store"],
+            "build_provider",
+            lambda e: _confirmed_stub_provider(),
+        )
+        started = client.post(
+            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+        ).get_json()
+        payload = _wait_for_run(client, started["run_id"])
+        assert payload["start_evidence_s"] is not None
+
+        import app.web.llm_engine_routes as routes_module
+
+        real_video_reader = routes_module.VideoReader
+        seen_timestamps: list[float] = []
+
+        class _SpyVideoReader:
+            def __init__(self, path, info):
+                self._inner = real_video_reader(path, info)
+
+            def __enter__(self):
+                self._reader = self._inner.__enter__()
+                return self
+
+            def __exit__(self, *exc_info):
+                return self._inner.__exit__(*exc_info)
+
+            def frame_at(self, timestamp_s):
+                seen_timestamps.append(timestamp_s)
+                return self._reader.frame_at(timestamp_s)
+
+        monkeypatch.setattr(routes_module, "VideoReader", _SpyVideoReader)
+
+        response = client.get(f"/api/llm-runs/{started['run_id']}/evidence/start?t=999.0&t=-5")
+        assert response.status_code == 200
+        assert seen_timestamps == [payload["start_evidence_s"]]
+
+    def test_evidence_endpoint_rejects_an_unknown_boundary(self, client, zahn_video):
+        video = upload(client, zahn_video.path).get_json()
+        engine = client.post(
+            "/api/llm-engines",
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
+        ).get_json()
+        started = client.post(
+            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+        ).get_json()
+        response = client.get(f"/api/llm-runs/{started['run_id']}/evidence/middle")
+        assert response.status_code == 400
+
+    def test_evidence_endpoint_404s_rather_than_fabricating_for_an_abstained_run(
+        self, app, client, zahn_video, monkeypatch
+    ):
+        video = upload(client, zahn_video.path).get_json()
+        engine = client.post(
+            "/api/llm-engines",
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
+        ).get_json()
+
+        def respond(request: ProviderRequest) -> RawProviderResponse:
+            return RawProviderResponse(
+                model_id="stub-model",
+                raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+                latency_s=0.01,
+            )
+
+        monkeypatch.setattr(
+            app.extensions["llm_engine_store"],
+            "build_provider",
+            lambda e: StubTimingProvider(respond),
+        )
+        started = client.post(
+            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+        ).get_json()
+        payload = _wait_for_run(client, started["run_id"])
+        assert payload["status"] == "complete"
+        assert payload["outcome"]["verdict"]["status"] == "abstain"
+
+        for boundary in ("start", "end"):
+            response = client.get(f"/api/llm-runs/{started['run_id']}/evidence/{boundary}")
+            assert response.status_code == 404
+
+
+class TestLLMModelOptions:
+    def test_model_options_endpoint_returns_the_server_side_allowlist(self, client):
+        response = client.get("/api/llm-model-options")
+        assert response.status_code == 200
+        body = response.get_json()
+        assert "openai" in body and "gemini" in body
+        assert "gpt-4.1-mini" in body["openai"]
+        # The list is not empty for either provider and every model in it
+        # is actually accepted by engine creation - proven indirectly by
+        # the allowlist tests in test_llm_engine_store.py; here we just
+        # confirm the wire shape.
+        assert all(isinstance(models, list) and models for models in body.values())

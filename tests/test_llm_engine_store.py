@@ -59,7 +59,7 @@ def test_create_with_an_api_key_saves_it_via_the_secret_store(
 ):
     engine = store.create(
         provider_name="openai",
-        model_id="gpt-5-mini",
+        model_id="gpt-4.1-mini",
         display_name="OpenAI mini",
         api_key="sk-abc123",
     )
@@ -71,7 +71,7 @@ def test_create_with_an_env_var_never_touches_the_secret_store(
     store: LLMEngineStore, secret_store: SecretStore
 ):
     engine = store.create(
-        provider_name="gemini", model_id="gemini-2.5-flash", env_var="MY_GEMINI_KEY"
+        provider_name="gemini", model_id="gemini-3.5-flash", env_var="MY_GEMINI_KEY"
     )
     assert engine.credential_ref == "env:MY_GEMINI_KEY"
     assert secret_store.resolve(engine.engine_id) is None
@@ -81,7 +81,7 @@ def test_create_rejects_both_api_key_and_env_var(store: LLMEngineStore):
     with pytest.raises(AnalyzerError):
         store.create(
             provider_name="openai",
-            model_id="gpt-5-mini",
+            model_id="gpt-4.1-mini",
             api_key="sk-abc",
             env_var="OPENAI_API_KEY",
         )
@@ -89,12 +89,12 @@ def test_create_rejects_both_api_key_and_env_var(store: LLMEngineStore):
 
 def test_create_rejects_neither_api_key_nor_env_var(store: LLMEngineStore):
     with pytest.raises(AnalyzerError):
-        store.create(provider_name="openai", model_id="gpt-5-mini")
+        store.create(provider_name="openai", model_id="gpt-4.1-mini")
 
 
 def test_create_rejects_an_invalid_env_var_name(store: LLMEngineStore):
     with pytest.raises(AnalyzerError):
-        store.create(provider_name="openai", model_id="gpt-5-mini", env_var="not a valid name!")
+        store.create(provider_name="openai", model_id="gpt-4.1-mini", env_var="not a valid name!")
 
 
 def test_create_rejects_an_unsupported_provider(store: LLMEngineStore):
@@ -107,8 +107,23 @@ def test_create_rejects_an_empty_model_id(store: LLMEngineStore):
         store.create(provider_name="openai", model_id="   ", env_var="OPENAI_API_KEY")
 
 
+def test_create_rejects_a_model_not_on_the_allowlist(store: LLMEngineStore):
+    """The model allowlist is enforced server-side unconditionally - a
+    request that bypasses the UI dropdown entirely (a hand-crafted call, a
+    tampered DOM) cannot select an arbitrary model just because it claims
+    one, e.g. the vendor's own default that this codebase has never
+    actually verified a real call against."""
+    with pytest.raises(AnalyzerError):
+        store.create(provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY")
+
+
+def test_create_rejects_a_model_belonging_to_a_different_provider(store: LLMEngineStore):
+    with pytest.raises(AnalyzerError):
+        store.create(provider_name="gemini", model_id="gpt-4.1-mini", env_var="GEMINI_API_KEY")
+
+
 def test_created_engine_to_dict_never_includes_the_credential_ref(store: LLMEngineStore):
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-abc123")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", api_key="sk-abc123")
     payload = engine.to_dict()
     assert "credential_ref" not in payload
     assert "sk-abc123" not in json.dumps(payload)
@@ -118,7 +133,7 @@ def test_created_engine_to_dict_never_includes_the_credential_ref(store: LLMEngi
 def test_the_persisted_file_never_contains_the_raw_api_key(
     store: LLMEngineStore, config: AppConfig
 ):
-    store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-super-secret-value")
+    store.create(provider_name="openai", model_id="gpt-4.1-mini", api_key="sk-super-secret-value")
     raw = (config.data_dir / "llm_engines.json").read_text()
     assert "sk-super-secret-value" not in raw
     assert "secret:" in raw
@@ -131,10 +146,10 @@ def test_the_persisted_file_never_contains_the_raw_api_key(
 
 def test_multiple_engines_are_listed_independently(store: LLMEngineStore):
     a = store.create(
-        provider_name="openai", model_id="gpt-5-mini", display_name="A", env_var="A_KEY"
+        provider_name="openai", model_id="gpt-4.1-mini", display_name="A", env_var="A_KEY"
     )
     b = store.create(
-        provider_name="gemini", model_id="gemini-2.5-flash", display_name="B", env_var="B_KEY"
+        provider_name="gemini", model_id="gemini-3.5-flash", display_name="B", env_var="B_KEY"
     )
     listed = {e.engine_id: e for e in store.list()}
     assert set(listed) == {a.engine_id, b.engine_id}
@@ -151,10 +166,10 @@ def test_entries_survive_a_reload_from_the_same_data_dir(
     config: AppConfig, secret_store: SecretStore
 ):
     store = LLMEngineStore(config, secret_store)
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY")
 
     reloaded = LLMEngineStore(config, secret_store)
-    assert reloaded.get(engine.engine_id).model_id == "gpt-5-mini"
+    assert reloaded.get(engine.engine_id).model_id == "gpt-4.1-mini"
 
 
 # --------------------------------------------------------------------------- #
@@ -165,7 +180,7 @@ def test_entries_survive_a_reload_from_the_same_data_dir(
 def test_update_changing_only_display_name_leaves_the_credential_untouched(
     store: LLMEngineStore, secret_store: SecretStore
 ):
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-abc123")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", api_key="sk-abc123")
     updated = store.update(engine.engine_id, display_name="Renamed")
     assert updated.display_name == "Renamed"
     assert updated.credential_ref == engine.credential_ref
@@ -175,7 +190,7 @@ def test_update_changing_only_display_name_leaves_the_credential_untouched(
 def test_update_rotating_the_api_key_deletes_the_old_secret(
     store: LLMEngineStore, secret_store: SecretStore
 ):
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-old-value")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", api_key="sk-old-value")
     store.update(engine.engine_id, api_key="sk-new-value")
     assert secret_store.resolve(engine.engine_id) == "sk-new-value"
 
@@ -183,7 +198,7 @@ def test_update_rotating_the_api_key_deletes_the_old_secret(
 def test_update_switching_from_api_key_to_env_var_deletes_the_saved_secret(
     store: LLMEngineStore, secret_store: SecretStore
 ):
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-old-value")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", api_key="sk-old-value")
     updated = store.update(engine.engine_id, env_var="OPENAI_API_KEY")
     assert updated.credential_ref == "env:OPENAI_API_KEY"
     assert secret_store.resolve(engine.engine_id) is None
@@ -194,13 +209,47 @@ def test_update_of_an_unknown_engine_raises_not_found(store: LLMEngineStore):
         store.update("does-not-exist", display_name="x")
 
 
+def test_update_changing_only_display_name_preserves_the_existing_valid_model(
+    store: LLMEngineStore,
+):
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY")
+    updated = store.update(engine.engine_id, display_name="Renamed")
+    assert updated.model_id == "gpt-4.1-mini"
+
+
+def test_update_rejects_a_model_not_on_the_allowlist(store: LLMEngineStore):
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY")
+    with pytest.raises(AnalyzerError):
+        store.update(engine.engine_id, model_id="gpt-5-mini")
+
+
+def test_update_switching_provider_requires_a_model_valid_for_the_new_provider(
+    store: LLMEngineStore,
+):
+    """Changing provider without also picking a new model must not
+    silently keep the old (now-invalid-for-this-provider) model_id - the
+    user has to explicitly choose one that's actually supported."""
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY")
+    with pytest.raises(AnalyzerError):
+        store.update(engine.engine_id, provider_name="gemini")
+
+
+def test_update_switching_provider_with_a_valid_new_model_succeeds(store: LLMEngineStore):
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY")
+    updated = store.update(
+        engine.engine_id, provider_name="gemini", model_id="gemini-3.5-flash-lite"
+    )
+    assert updated.provider_name == "gemini"
+    assert updated.model_id == "gemini-3.5-flash-lite"
+
+
 # --------------------------------------------------------------------------- #
 # delete()
 # --------------------------------------------------------------------------- #
 
 
 def test_delete_removes_the_engine_and_its_secret(store: LLMEngineStore, secret_store: SecretStore):
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-abc123")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", api_key="sk-abc123")
     store.delete(engine.engine_id)
     with pytest.raises(NotFoundError):
         store.get(engine.engine_id)
@@ -215,7 +264,7 @@ def test_delete_of_an_unknown_engine_raises_not_found(store: LLMEngineStore):
 def test_delete_of_an_env_var_engine_does_not_touch_the_secret_store(
     store: LLMEngineStore, secret_store: SecretStore, monkeypatch: pytest.MonkeyPatch
 ):
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY")
     calls = []
     monkeypatch.setattr(secret_store, "delete", lambda key: calls.append(key))
     store.delete(engine.engine_id)
@@ -238,7 +287,7 @@ def test_build_provider_passes_a_saved_secret_directly_never_via_os_environ(
     lifetime, defeating the point of the OS-protected secret store."""
     import os
 
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-abc123")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", api_key="sk-abc123")
     env_snapshot_before = dict(os.environ)
 
     seen: dict[str, object] = {}
@@ -273,7 +322,7 @@ def test_build_provider_uses_the_operators_own_env_var_for_the_env_reference(
     store: LLMEngineStore, monkeypatch: pytest.MonkeyPatch
 ):
     engine = store.create(
-        provider_name="gemini", model_id="gemini-2.5-flash", env_var="MY_GEMINI_KEY"
+        provider_name="gemini", model_id="gemini-3.5-flash", env_var="MY_GEMINI_KEY"
     )
     monkeypatch.setenv("MY_GEMINI_KEY", "raw-dev-key")
 
@@ -298,7 +347,7 @@ def test_build_provider_uses_the_operators_own_env_var_for_the_env_reference(
 def test_build_provider_raises_a_safe_error_when_the_saved_secret_is_missing(
     store: LLMEngineStore, secret_store: SecretStore
 ):
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-abc123")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", api_key="sk-abc123")
     secret_store.delete(engine.engine_id)  # simulate it having disappeared from the OS store
     with pytest.raises(AnalyzerError):
         store.build_provider(engine)
@@ -307,7 +356,7 @@ def test_build_provider_raises_a_safe_error_when_the_saved_secret_is_missing(
 def test_test_endpoint_helper_reports_ok_when_the_client_builds(
     store: LLMEngineStore, monkeypatch: pytest.MonkeyPatch
 ):
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-abc123")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", api_key="sk-abc123")
 
     class _FakeClient:
         pass
@@ -323,7 +372,7 @@ def test_test_endpoint_helper_reports_ok_when_the_client_builds(
 def test_test_endpoint_helper_reports_a_safe_message_when_resolution_fails(
     store: LLMEngineStore, secret_store: SecretStore
 ):
-    engine = store.create(provider_name="openai", model_id="gpt-5-mini", api_key="sk-abc123")
+    engine = store.create(provider_name="openai", model_id="gpt-4.1-mini", api_key="sk-abc123")
     secret_store.delete(engine.engine_id)
     result = store.test(engine.engine_id)
     assert result["ok"] is False

@@ -98,7 +98,7 @@ def test_a_run_completes_and_reports_a_confirmed_outcome(
     engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
 ):
     engine = engine_store.create(
-        provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY"
+        provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
     )
     monkeypatch.setattr(engine_store, "build_provider", lambda e: _confirmed_stub_provider())
 
@@ -115,7 +115,7 @@ def test_a_run_reports_abstain_without_crashing(
     engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
 ):
     engine = engine_store.create(
-        provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY"
+        provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
     )
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
@@ -141,7 +141,7 @@ def test_a_missing_credential_fails_the_run_with_a_safe_message(
     # env_var references a variable that was never actually set - build_provider
     # (the real one, not mocked) will fail resolving it.
     engine = engine_store.create(
-        provider_name="openai", model_id="gpt-5-mini", env_var="THIS_VAR_IS_NEVER_SET"
+        provider_name="openai", model_id="gpt-4.1-mini", env_var="THIS_VAR_IS_NEVER_SET"
     )
 
     job = run_service.submit(record, engine)
@@ -156,7 +156,7 @@ def test_disabled_engine_is_rejected_before_any_run_is_queued(
     engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord
 ):
     engine = engine_store.create(
-        provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY", enabled=False
+        provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY", enabled=False
     )
     with pytest.raises(AnalyzerError):
         run_service.submit(record, engine)
@@ -166,7 +166,7 @@ def test_cancel_before_the_run_starts_marks_it_cancelled_immediately(
     engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
 ):
     engine = engine_store.create(
-        provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY"
+        provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
     )
 
     # Block the executor with an unrelated slow task so our real job stays
@@ -194,7 +194,7 @@ def test_cancel_mid_run_stops_before_the_next_pass_completes(
     honoured before the fine pass ever starts - proven by asserting the
     fine pass's request never arrives at the provider."""
     engine = engine_store.create(
-        provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY"
+        provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
     )
 
     seen_passes: list[str] = []
@@ -229,7 +229,7 @@ def test_cancel_of_a_running_job_reports_an_honest_stopping_message(
     actually finished) says so, distinct from "Cancelled before it
     started" (the queued case) and from the final "Run cancelled"."""
     engine = engine_store.create(
-        provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY"
+        provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
     )
     seen_message_at_cancel_time: dict[str, str] = {}
 
@@ -266,7 +266,7 @@ def test_a_frames_only_provider_request_never_carries_the_video_file(
         return canned_json_response(start_s=4.0, end_s=12.0, confidence=0.9)
 
     engine = engine_store.create(
-        provider_name="openai", model_id="gpt-5-mini", env_var="OPENAI_API_KEY"
+        provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
     )
     monkeypatch.setattr(engine_store, "build_provider", lambda e: StubTimingProvider(respond))
 

@@ -28,9 +28,10 @@ from typing import Any
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
-from ..errors import AnalyzerError
-from ..services.llm_engine_store import LLMEngineStore
+from ..errors import AnalyzerError, NotFoundError
+from ..services.llm_engine_store import SUPPORTED_MODELS, LLMEngineStore
 from ..services.llm_run_service import LLMRunService
+from ..video.reader import VideoReader, encode_jpeg
 
 llm_engines = Blueprint("llm_engines", __name__)
 
@@ -57,6 +58,17 @@ def _json_body() -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Engine configuration
 # --------------------------------------------------------------------------- #
+
+
+@llm_engines.get("/llm-model-options")
+def llm_model_options() -> Response:
+    """The single server-side source of truth for which model IDs are
+    selectable per provider - see ``llm_engine_store.SUPPORTED_MODELS``'s
+    own docstring for how this list is curated. The frontend's Model
+    dropdown is populated from this, but ``LLMEngineStore.create``/
+    ``update`` enforce the same allowlist independently either way - this
+    endpoint only saves the browser from hard-coding a duplicate copy."""
+    return jsonify({provider: list(models) for provider, models in SUPPORTED_MODELS.items()})
 
 
 @llm_engines.get("/llm-engines")
@@ -130,6 +142,36 @@ def llm_run_status(run_id: str) -> Response:
 @llm_engines.post("/llm-runs/<run_id>/cancel")
 def cancel_llm_run(run_id: str) -> Response:
     return jsonify(_llm_run_service().cancel(run_id).to_dict())
+
+
+@llm_engines.get("/llm-runs/<run_id>/evidence/<boundary>")
+def llm_run_evidence_frame(run_id: str, boundary: str) -> Response:
+    """The one decisive still frame for ``boundary`` ("start" or "end"),
+    at the timestamp *this run itself* selected and grounded - see
+    ``pipeline._nearest_grounded_evidence_ts``. Deliberately takes no
+    timestamp from the request: unlike ``/videos/<id>/frame`` (a general
+    frame-preview endpoint driven by whatever time the browser is
+    scrubbed to), this endpoint always serves the server-stored audit
+    timestamp for this specific run, so a client can never relabel an
+    arbitrary frame as "the evidence" by supplying its own ``t`` - that
+    was an explicit supervisor requirement (see
+    diagnostics/llm_spike/DESIGN.md). 404s - never a fabricated image -
+    when the run has no grounded evidence for this boundary at all
+    (abstained, failed, or the deciding pass cited none)."""
+    if boundary not in ("start", "end"):
+        raise AnalyzerError("Unknown evidence boundary - expected 'start' or 'end'.")
+
+    job = _llm_run_service().get(run_id)
+    timestamp_s = job.start_evidence_s if boundary == "start" else job.end_evidence_s
+    if timestamp_s is None:
+        raise NotFoundError("No grounded evidence image is available for this run.")
+
+    record = _video_store().get(job.video_id)
+    with VideoReader(record.path, record.info) as reader:
+        frame = reader.frame_at(timestamp_s)
+    response = Response(encode_jpeg(frame), mimetype="image/jpeg")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def _optional_str(value: Any) -> str | None:

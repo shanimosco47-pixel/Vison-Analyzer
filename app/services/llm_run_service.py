@@ -89,6 +89,25 @@ class LLMRunJob:
     def cancelled(self) -> bool:
         return self._cancel.is_set()
 
+    @property
+    def start_evidence_s(self) -> float | None:
+        """The grounded, actually-submitted timestamp nearest the reported
+        start boundary - see ``pipeline._nearest_grounded_evidence_ts`` -
+        or ``None`` when unavailable (abstained, or no grounded evidence).
+        Read from ``event_dict`` (the single source of truth already
+        produced by the pipeline) rather than stored separately, so there
+        is no way for this to drift out of sync with it."""
+        if self.event_dict is None:
+            return None
+        return self.event_dict.get("details", {}).get("start_evidence_s")
+
+    @property
+    def end_evidence_s(self) -> float | None:
+        """The end-boundary counterpart of :attr:`start_evidence_s`."""
+        if self.event_dict is None:
+            return None
+        return self.event_dict.get("details", {}).get("end_evidence_s")
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -106,6 +125,8 @@ class LLMRunJob:
             ),
             "outcome": self.outcome_dict,
             "event": self.event_dict,
+            "start_evidence_s": self.start_evidence_s,
+            "end_evidence_s": self.end_evidence_s,
             "experimental": True,
         }
 

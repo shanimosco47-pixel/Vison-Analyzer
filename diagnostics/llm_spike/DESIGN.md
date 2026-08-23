@@ -1793,3 +1793,203 @@ is tested).
 
 No real vendor call was made from this sandbox (still no SDK installed,
 no API key here). PR #5 stays draft, not marked ready.
+
+## 25. Frame auditability, evidence images, a model selector, and a browser regression gate
+
+A supervisor change request, quoted here for the product principle it's
+built to satisfy: "for every AI timing result, I must be able to answer,
+from the website itself, *what exactly did the AI see, and which two
+submitted frames support the reported start and end?*" Four requirements,
+none of which change the classical Zahn detector, the LLM prompt/pipeline
+strategy, or the timing defaults themselves (explicitly out of scope -
+the ±1.5s fine-refine margin, the coarse/end-scan windows, etc. are
+unchanged; this round only makes the *existing* windows auditable).
+
+### 1. What was actually sent to the AI
+
+`PipelineOutcome` gained `pass_frames: dict[str, tuple[float, ...]]` -
+one entry per pass that actually ran ("coarse"/"fine"/"end_coarse"/
+"end_validate"; a pass that never ran is simply absent, not an empty
+tuple, so the UI's "Not run" state is driven by key absence rather than
+an ambiguous zero-frame range). Populated in `run_llm_timing` at the
+exact point each pass's `ProviderRequest.frames` is built - after
+`_fit_frames_to_budget`'s thinning, never before - so a regression
+(`test_pipeline_thinned_pass_frames_match_the_frames_actually_sent`)
+proves that when a tight byte budget forces the fine pass down to fewer
+than 30 frames, `pass_frames["fine"]` is exactly that thinned set, not
+the denser pre-thinning plan. The frontend's new "Frames sent to AI"
+`<details>` section (`buildLLMFramesSentSection` in `app.js`) renders one
+row per pass with a first/last/count summary
+(`llmPassFrameSummary`) and a nested expandable list of every individual
+submitted timestamp (`llmFormatFrameTimestamps`, all to 0.1s) - so a
+sparse, thinned request can't be misread as a continuous range. A static
+explanation of the fine pass's default ±1.5s margin sits alongside the
+*actual* computed range for the current run, satisfying requirement #3
+without touching the margin itself.
+
+### 2. The two decisive evidence images
+
+A new pure selector, `pipeline._nearest_grounded_evidence_ts(evidence_ts,
+submitted_ts, boundary_ts)`, picks the grounded verdict's own cited
+evidence timestamp nearest the reported boundary, then snaps to the
+nearest entry in that pass's *actual submitted* timestamps - so the
+result is always an exact frame that pass really sent, never an
+interpolated or reconstructed one. Returns `None` (never fabricates) when
+either input is empty. `run_llm_timing`'s final CONFIRMED block computes
+`start_evidence_s`/`end_evidence_s` this way and stores them in
+`Event.details`; ABSTAIN produces no `Event` at all, so there is no
+per-boundary special-casing needed to keep ABSTAIN from presenting a
+fabricated image - it's structural. `LLMRunJob` exposes both as
+properties read straight from `event_dict` (single source of truth, no
+separate field to drift out of sync) and a new endpoint,
+`GET /api/llm-runs/<run_id>/evidence/<start|end>`, serves the frame at
+that server-stored timestamp - deliberately taking **no** timestamp from
+the request, so a client can never relabel an arbitrary frame as "the
+evidence" by supplying its own `t`
+(`test_evidence_image_endpoint_uses_the_server_stored_timestamp_not_a_client_supplied_one`
+proves a spoofed `?t=` query param is ignored). 404s, never a fabricated
+image, when a run has no grounded evidence for that boundary
+(`test_evidence_endpoint_404s_rather_than_fabricating_for_an_abstained_run`).
+The frontend renders both images with a floating timestamp-overlay label
+(`llmEvidenceLabel`) or an explicit "No grounded evidence image
+available" message when `None`.
+
+### 3. A server-side model allowlist, not free text
+
+`llm_engine_store.py` gained `SUPPORTED_MODELS: dict[str, tuple[str,
+...]]` - the single source of truth for which model IDs are selectable
+per provider, deliberately curated from this repository's own real-call
+history in this file (§14 onward) rather than "whatever the vendor
+happens to offer": `openai: ("gpt-4.1-mini",)` (the model behind every
+real gate-1 rerun from §15 onward) and `gemini: ("gemini-3.5-flash-lite",
+"gemini-3.5-flash")` (both completed real, schema-conformant calls in
+§14's four-model round, even though their timing accuracy was poor - a
+separate question from whether this code has verified they accept the
+required image + structured-output request shape). Each provider
+module's own no-`model_id`-given fallback (`gpt-5-mini`,
+`gemini-2.5-flash-lite`) is deliberately *not* on the list - neither has a
+real-call record here, and `LLMEngineStore` always passes an explicit
+`model_id`, so those defaults are never reached through this UI anyway.
+`_validated_model_id` enforces the allowlist independently inside both
+`create()` and `update()` - not just in the new `GET
+/api/llm-model-options` endpoint the frontend's `<select>` populates from
+- so DOM or request tampering can't select an unsupported model either
+way. `update()`'s edit semantics: the existing model is preserved only if
+it's still valid for the (possibly just-changed) provider; otherwise
+`_validated_model_id` raises, and the frontend shows a disabled
+placeholder option plus a visible warning rather than silently falling
+back to some other model
+(`test_update_switching_provider_requires_a_model_valid_for_the_new_provider`).
+
+### 4. A browser regression gate with a deterministic stub provider
+
+`tests_js/playwright/` is new: `e2e_server.py` builds the real
+`create_app()` against a throwaway data directory and monkeypatches
+`LLMEngineStore.build_provider` at the class level to a
+`StubTimingProvider` (the same stubbing pattern
+`tests/test_llm_run_service.py` already uses) - so this suite needs no
+API key, makes no network call, and costs nothing, while still exercising
+the real pipeline, real frame extraction, and real HTTP layer end to end
+(a real `werkzeug` server on an ephemeral port, not `app.test_client()` -
+Playwright needs an actual socket). `llm_flow.test.js` drives a headless
+Chromium through the complete flow end to end: upload a synthetic video,
+add an engine through the Provider/Model dropdowns, run it, verify the
+result card's Start/End/Duration/Confidence/Uncertainty, verify the
+Frames-sent-to-AI section names all four passes with non-"Not run"
+frame-range summaries and an expandable full timestamp list, verify both
+evidence images load with a correctly formatted `t = X.Xs` overlay label,
+exercise Test/Edit/Delete, and confirm a page reload preserves the
+configured engine (re-uploading afterward, since `#step-llm` -
+like every other step in this wizard - goes back to its
+`pointer-events: none` "disabled" styling on reload until a video is
+re-selected; that's pre-existing, uniform behavior across all five steps,
+not something this round introduced or was asked to change). A final
+assertion confirms zero console errors and zero HTTP responses ≥400
+occurred anywhere during the run. Two real bugs surfaced and were fixed
+because of this suite, not despite it:
+
+- `buildLLMFramesSentSection` appended each pass's `<dt>`/`<dd>` directly
+  as siblings into the `.details-grid` container instead of wrapping them
+  in a `<div>` the way the existing `appendDetail` helper does - since
+  `.details-grid` is a CSS grid over its *direct* children, this silently
+  misaligned every pass's label from its own value (visible in the first
+  screenshot taken; invisible to any DOM-content assertion that doesn't
+  look at layout). Fixed by wrapping each pair in its own `div`, matching
+  the established convention.
+- The two `page.waitForSelector("#llm-engine-form.hidden")` calls timed
+  out once exercised end to end, because Playwright's default `state:
+  "visible"` can never be satisfied by an element matching a selector
+  that requires the CSS class making it `display: none` - a genuine
+  contradiction in the original selector, not a flaky wait. Replaced with
+  `waitForSelector("#llm-engine-form", { state: "hidden" })`.
+
+Run with `NODE_PATH=/opt/node22/lib/node_modules node --test
+tests_js/playwright/llm_flow.test.js` (Playwright is preinstalled
+globally in this sandbox, not as a repo dependency - see the file's own
+header comment); intentionally **not** part of `node --test
+tests_js/*.test.js` since it needs a live server and a browser, not just
+Node. 13/13 passed (1 wrapper + 12 subtests), ~3.5s.
+
+### Screenshots inspected
+
+Two screenshots were captured by the suite (desktop 1280px and narrow
+375px viewports, both `fullPage`) and visually inspected as part of this
+round, not just asserted on programmatically: the result card's badges,
+detail grid, Frames-sent-to-AI section (all four passes correctly
+aligned after the grid fix above), and both evidence images with their
+timestamp overlays all remain legible at both widths - the narrow layout
+reflows the frame-summary grid to a single column rather than
+overflowing or truncating. Not committed to the repository (generated
+artifacts, regenerable by re-running the suite).
+
+### Files changed
+
+- `app/analysis/llm_timing/pipeline.py` - `pass_frames` field +
+  threading through every `PipelineOutcome`/`_abstain_outcome` call site;
+  `_nearest_grounded_evidence_ts`; `start_evidence_s`/`end_evidence_s` in
+  the CONFIRMED `Event.details`.
+- `app/services/llm_engine_store.py` - `SUPPORTED_MODELS`,
+  `_validated_model_id`, wired into `create()`/`update()`.
+- `app/services/llm_run_service.py` - `LLMRunJob.start_evidence_s`/
+  `.end_evidence_s` properties, exposed in `to_dict()`.
+- `app/web/llm_engine_routes.py` - `GET /api/llm-model-options`,
+  `GET /api/llm-runs/<id>/evidence/<boundary>`.
+- `app/web/templates/index.html` - Model `<input>` replaced with a
+  `<select>` plus a warning-hint `<span>`.
+- `app/web/static/app.js` - model-dropdown population/preservation logic,
+  the Frames-sent-to-AI and evidence-image builders, three new pure
+  helpers (`llmPassFrameSummary`, `llmFormatFrameTimestamps`,
+  `llmEvidenceLabel`).
+- `app/web/static/styles.css` - `.llm-frames-sent`, `.llm-frame-
+  timestamps`, `.llm-evidence-*`.
+- `tests/test_llm_timing_pipeline.py`, `tests/test_llm_engine_store.py`,
+  `tests/test_web_llm_engines.py` - new coverage per requirement above,
+  plus mechanical `gpt-5-mini`/`gemini-2.5-flash` -> `gpt-4.1-mini`/
+  `gemini-3.5-flash` renames forced by the new allowlist.
+- `tests_js/llm_engines.test.js` - unit tests for the three new pure
+  helpers.
+- `tests_js/playwright/e2e_server.py`, `tests_js/playwright/
+  llm_flow.test.js` - new browser regression suite (see above).
+
+### Gates
+
+`pytest -q` - 578 passed (up from 557; +21: 9 in
+`test_llm_timing_pipeline.py` for `pass_frames`/evidence-timestamp
+selection, 6 in `test_llm_engine_store.py` for the model allowlist, 6 in
+`test_web_llm_engines.py` for the evidence endpoint and
+`/api/llm-model-options`). `ruff check .` - clean (one line-length fix in
+`pipeline.py` along the way). `ruff format --check .` - clean (one file
+reformatted, `test_web_llm_engines.py`). `mypy app` - clean except the
+same pre-existing, unrelated `app/web/routes.py:273` finding noted since
+§11/§24 (confirmed unrelated to this round: reproduces identically with
+this round's changes stashed out). `node --test tests_js/*.test.js` -
+82/82 (up from 69; +13 for the three new pure helpers). New browser
+suite: 13/13 (see above). At least one deterministic stub-provider run
+covers the complete flow end to end; no real-provider smoke test was
+possible from this sandbox (no vendor SDK installed, no API key here) -
+the same limitation noted in every prior round of this file.
+
+No known limitation remains for requirements #1, #2, or #4. Requirement
+#3's UI half is the static explanation text plus the actual per-run
+range shown inside the Frames-sent-to-AI section - no numeric default
+changed. Per the request: **not merged**, PR #5 stays draft.

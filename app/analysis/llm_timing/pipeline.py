@@ -243,6 +243,17 @@ class PipelineOutcome:
     diagnostics/llm_spike/DESIGN.md). ``TimingVerdict.raw_notes`` is already
     sanitized/bounded (see ``redaction.py``); nothing here ever carries
     image bytes or credentials."""
+    pass_frames: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    """Every pass's *actual* submitted frame timestamps, keyed by the same
+    pass names as ``pass_verdicts`` - captured at the point each
+    ``ProviderRequest`` is built, so this reflects frames *after* any
+    budget-driven thinning (``_fit_frames_to_budget``), never the
+    theoretical extraction plan. Supervisor-directed auditability
+    requirement: a caller must be able to show exactly what was sent to a
+    provider, not reconstruct it later from config defaults, which could
+    silently misrepresent a thinned/sparse request as a continuous range
+    (see diagnostics/llm_spike/DESIGN.md). Only timestamps - never image
+    bytes."""
 
     @property
     def total_retries(self) -> int:
@@ -347,6 +358,7 @@ class PipelineOutcome:
             "estimated_cost_usd": self.estimated_cost_usd(),
             "pricing_table_version": PRICING_TABLE_VERSION,
             "pass_verdicts": {name: v.to_dict() for name, v in self.pass_verdicts.items()},
+            "pass_frames": {name: list(times) for name, times in self.pass_frames.items()},
         }
 
 
@@ -623,6 +635,29 @@ def _grounding_abstain(verdict: TimingVerdict, reason_code: str, detail: str) ->
     )
 
 
+def _nearest_grounded_evidence_ts(
+    evidence_ts: tuple[float, ...],
+    submitted_ts: tuple[float, ...],
+    boundary_ts: float,
+) -> float | None:
+    """The audit-safe timestamp for a boundary's "evidence image": among a
+    grounded verdict's own cited ``evidence_frame_timestamps_s`` (already
+    validated by ``_validate_grounding`` to correspond to a frame actually
+    submitted to the provider), the one nearest ``boundary_ts`` - then
+    snapped to its own nearest entry in ``submitted_ts`` so the result is
+    always an exact frame timestamp this pass actually sent, never an
+    approximate or interpolated value a browser-supplied timestamp could
+    otherwise be used to spoof. Returns ``None`` - never a fabricated
+    guess - when there is no cited evidence or nothing was submitted for
+    this pass at all (supervisor-directed auditability requirement, see
+    diagnostics/llm_spike/DESIGN.md: "do not fake an image; show an
+    explicit no-evidence state")."""
+    if not evidence_ts or not submitted_ts:
+        return None
+    closest_evidence = min(evidence_ts, key=lambda ts: abs(ts - boundary_ts))
+    return min(submitted_ts, key=lambda ts: abs(ts - closest_evidence))
+
+
 @dataclass(frozen=True)
 class _GroundingRegion:
     """One claimed boundary's own submitted-frame context.
@@ -764,6 +799,7 @@ def _abstain_outcome(
     coarse_response: RawProviderResponse,
     *,
     pass_verdicts: dict[str, TimingVerdict] | None = None,
+    pass_frames: dict[str, tuple[float, ...]] | None = None,
 ) -> PipelineOutcome:
     return PipelineOutcome(
         verdict=verdict,
@@ -771,6 +807,7 @@ def _abstain_outcome(
         coarse_response=coarse_response,
         fine_response=None,
         pass_verdicts=dict(pass_verdicts) if pass_verdicts else {},
+        pass_frames=dict(pass_frames) if pass_frames else {},
     )
 
 
@@ -826,6 +863,7 @@ def run_llm_timing(
     cfg = config or PipelineConfig()
     cfg.validate()
     pass_verdicts: dict[str, TimingVerdict] = {}
+    pass_frames: dict[str, tuple[float, ...]] = {}
 
     with VideoReader(video_path, video_info).open() as reader:
         duration_s = reader.info.duration_s
@@ -876,6 +914,7 @@ def run_llm_timing(
             coarse_response, prompt_version=prompt_version, min_confidence=cfg.min_confidence
         )
         coarse_submitted = [frame.timestamp_s for frame in coarse_frames]
+        pass_frames["coarse"] = tuple(coarse_submitted)
         # A single shared frame batch, not yet split into per-boundary
         # windows - the same region serves both start_s and end_s here.
         coarse_region = _GroundingRegion(
@@ -892,7 +931,12 @@ def run_llm_timing(
 
         pass_verdicts["coarse"] = coarse_verdict
         if coarse_verdict.status is not TimingStatus.CONFIRMED:
-            return _abstain_outcome(coarse_verdict, coarse_response, pass_verdicts=pass_verdicts)
+            return _abstain_outcome(
+                coarse_verdict,
+                coarse_response,
+                pass_verdicts=pass_verdicts,
+                pass_frames=pass_frames,
+            )
 
         assert coarse_verdict.start_s is not None and coarse_verdict.end_s is not None
         # The fine pass now asks about the start ONLY - a single window,
@@ -956,6 +1000,7 @@ def run_llm_timing(
                 coarse_response=coarse_response,
                 fine_response=_unsent_response(abstain.raw_notes),
                 pass_verdicts=dict(pass_verdicts),
+                pass_frames=dict(pass_frames),
             )
 
         fine_request = ProviderRequest(
@@ -973,6 +1018,7 @@ def run_llm_timing(
             min_confidence=cfg.min_confidence,
         )
         start_submitted = [frame.timestamp_s for frame in start_frames]
+        pass_frames["fine"] = tuple(start_submitted)
         start_region = _GroundingRegion(
             bounds=(start_lo, start_hi),
             submitted_timestamps_s=tuple(start_submitted),
@@ -996,6 +1042,7 @@ def run_llm_timing(
                 coarse_response=coarse_response,
                 fine_response=fine_response,
                 pass_verdicts=dict(pass_verdicts),
+                pass_frames=dict(pass_frames),
             )
 
         # The end is nominated by ONE whole-clip (post-start), sparsely
@@ -1065,6 +1112,7 @@ def run_llm_timing(
                 coarse_response=coarse_response,
                 fine_response=fine_response,
                 pass_verdicts=dict(pass_verdicts),
+                pass_frames=dict(pass_frames),
             )
 
         end_coarse_request = ProviderRequest(
@@ -1082,6 +1130,7 @@ def run_llm_timing(
             min_confidence=cfg.min_confidence,
         )
         end_coarse_submitted = [frame.timestamp_s for frame in end_coarse_frames]
+        pass_frames["end_coarse"] = tuple(end_coarse_submitted)
         end_coarse_region = _GroundingRegion(
             bounds=(scan_from_s, duration_s),
             submitted_timestamps_s=tuple(end_coarse_submitted),
@@ -1102,6 +1151,7 @@ def run_llm_timing(
                 fine_response=fine_response,
                 end_coarse_response=end_coarse_response,
                 pass_verdicts=dict(pass_verdicts),
+                pass_frames=dict(pass_frames),
             )
 
         # A sparse coarse candidate is never trusted on its own - it must
@@ -1157,6 +1207,7 @@ def run_llm_timing(
                 fine_response=fine_response,
                 end_coarse_response=end_coarse_response,
                 pass_verdicts=dict(pass_verdicts),
+                pass_frames=dict(pass_frames),
             )
 
         validation_request = ProviderRequest(
@@ -1174,6 +1225,7 @@ def run_llm_timing(
             min_confidence=cfg.min_confidence,
         )
         validation_submitted = [frame.timestamp_s for frame in validation_frames]
+        pass_frames["end_validate"] = tuple(validation_submitted)
         validation_region = _GroundingRegion(
             bounds=(validation_lo, validation_hi),
             submitted_timestamps_s=tuple(validation_submitted),
@@ -1225,6 +1277,7 @@ def run_llm_timing(
                 end_coarse_response=end_coarse_response,
                 end_validation_response=validation_response,
                 pass_verdicts=dict(pass_verdicts),
+                pass_frames=dict(pass_frames),
             )
 
         # Report the dense validation pass's own (possibly refined) onset,
@@ -1277,6 +1330,18 @@ def run_llm_timing(
             if final_verdict.confidence >= cfg.review_confidence
             else EventStatus.REVIEW
         )
+        # The two decisive "evidence image" timestamps - see
+        # _nearest_grounded_evidence_ts's own docstring. Computed from each
+        # boundary's own grounded pass (fine for start, end_validate for
+        # end), never fabricated: None when that pass cited no evidence.
+        start_evidence_s = _nearest_grounded_evidence_ts(
+            start_side_evidence, pass_frames.get("fine", ()), locked_start_s
+        )
+        end_evidence_s = _nearest_grounded_evidence_ts(
+            validation_verdict.evidence_frame_timestamps_s,
+            pass_frames.get("end_validate", ()),
+            validation_verdict.end_s,
+        )
         event = Event(
             label="Efflux (LLM spike)",
             start_s=locked_start_s,
@@ -1297,6 +1362,8 @@ def run_llm_timing(
                 "coarse_end_s": coarse_verdict.end_s,
                 "end_coarse_candidate_s": candidate_ts,
                 "end_validation_window_s": [validation_lo, validation_hi],
+                "start_evidence_s": start_evidence_s,
+                "end_evidence_s": end_evidence_s,
             },
         )
         return PipelineOutcome(
@@ -1307,4 +1374,5 @@ def run_llm_timing(
             end_coarse_response=end_coarse_response,
             end_validation_response=validation_response,
             pass_verdicts=dict(pass_verdicts),
+            pass_frames=dict(pass_frames),
         )

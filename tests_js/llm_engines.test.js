@@ -21,6 +21,9 @@ const {
   llmResultBadge,
   llmRunStatusLine,
   validateLLMEngineForm,
+  llmPassFrameSummary,
+  llmFormatFrameTimestamps,
+  llmEvidenceLabel,
 } = require("../app/web/static/app.js");
 
 test("llmEngineSubtitle", async (t) => {
@@ -186,5 +189,55 @@ test("validateLLMEngineForm - write-only secret behaviour", async (t) => {
       envVar: "",
     });
     assert.ok(errors.length > 0);
+  });
+});
+
+test("llmPassFrameSummary", async (t) => {
+  await t.test("a pass that never ran (undefined) reads 'Not run'", () => {
+    assert.equal(llmPassFrameSummary(undefined), "Not run");
+  });
+
+  await t.test("an empty list also reads 'Not run', not a zero-frame range", () => {
+    assert.equal(llmPassFrameSummary([]), "Not run");
+  });
+
+  await t.test("summarizes an unsorted list as first-to-last with a frame count", () => {
+    assert.equal(llmPassFrameSummary([4.02, 1.0, 2.56]), "1.0s to 4.0s - 3 frames");
+  });
+
+  await t.test("uses the singular 'frame' for exactly one submitted timestamp", () => {
+    assert.equal(llmPassFrameSummary([7.3]), "7.3s to 7.3s - 1 frame");
+  });
+});
+
+test("llmFormatFrameTimestamps", async (t) => {
+  await t.test("sorts and formats every timestamp to 0.1s, comma-joined", () => {
+    assert.equal(llmFormatFrameTimestamps([4.02, 1.0, 2.56]), "1.0s, 2.6s, 4.0s");
+  });
+
+  await t.test("an undefined or empty list formats as an empty string", () => {
+    assert.equal(llmFormatFrameTimestamps(undefined), "");
+    assert.equal(llmFormatFrameTimestamps([]), "");
+  });
+
+  await t.test("does not mutate the input array", () => {
+    const timestamps = [3.0, 1.0, 2.0];
+    llmFormatFrameTimestamps(timestamps);
+    assert.deepEqual(timestamps, [3.0, 1.0, 2.0]);
+  });
+});
+
+test("llmEvidenceLabel", async (t) => {
+  await t.test("a numeric timestamp reads 't = X.Xs'", () => {
+    assert.equal(llmEvidenceLabel(12.34), "t = 12.3s");
+  });
+
+  await t.test("null (no grounded evidence) reads the explicit no-evidence message", () => {
+    assert.equal(llmEvidenceLabel(null), "No grounded evidence image available");
+  });
+
+  await t.test("undefined and non-finite values also read the no-evidence message", () => {
+    assert.equal(llmEvidenceLabel(undefined), "No grounded evidence image available");
+    assert.equal(llmEvidenceLabel(NaN), "No grounded evidence image available");
   });
 });

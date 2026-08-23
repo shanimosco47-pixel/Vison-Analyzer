@@ -1036,10 +1036,23 @@ function updateReviewBoundaryMarkers() {
 
 const LLM_POLL_INTERVAL_MS = 1200;
 
+// Order the "Frames sent to AI" section is rendered in, and the label shown
+// for each pass - mirrors the pipeline's own pass names (see
+// PipelineOutcome.pass_frames / Event stage names) so this can never drift
+// from what the backend actually calls each pass.
+const LLM_PASS_ORDER = ["coarse", "fine", "end_coarse", "end_validate"];
+const LLM_PASS_LABELS = {
+  coarse: "Start coarse",
+  fine: "Start refine",
+  end_coarse: "End coarse",
+  end_validate: "End validate",
+};
+
 const llmState = {
   engines: [],
   editingEngineId: null,
   runs: {}, // engine_id -> { runId }
+  modelOptions: {}, // provider_name -> [model_id, ...], from GET /api/llm-model-options
 };
 
 /** Pure: "provider / model" subtitle line for an engine card. */
@@ -1078,7 +1091,7 @@ function llmRunStatusLine(job) {
 function validateLLMEngineForm(form) {
   const errors = [];
   if (!form.providerName) errors.push("Choose a provider.");
-  if (!form.modelId || !form.modelId.trim()) errors.push("Enter a model ID.");
+  if (!form.modelId || !form.modelId.trim()) errors.push("Choose a model.");
   if (form.credentialMode === "api_key") {
     if (!form.apiKey || !form.apiKey.trim()) {
       errors.push("Paste an API key, or switch to the environment-variable option.");
@@ -1093,14 +1106,101 @@ function validateLLMEngineForm(form) {
   return errors;
 }
 
+/** Pure: "Not run", or "first.Ts to last.Ts - N frame(s)", for one pass's
+ * actual submitted timestamps. `timestamps` is undefined/empty for a pass
+ * that never ran (see PipelineOutcome.pass_frames' absent-key contract) -
+ * both are treated the same way, deliberately, rather than showing an
+ * empty range that could be misread as "ran with zero frames". */
+function llmPassFrameSummary(timestamps) {
+  if (!timestamps || !timestamps.length) return "Not run";
+  const sorted = [...timestamps].slice().sort((a, b) => a - b);
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  const frameWord = sorted.length === 1 ? "frame" : "frames";
+  return `${first.toFixed(1)}s to ${last.toFixed(1)}s - ${sorted.length} ${frameWord}`;
+}
+
+/** Pure: every actual submitted timestamp for a pass, sorted, comma-joined,
+ * each to 0.1s - so a sparse/thinned request is shown as the exact discrete
+ * timestamps sent, never collapsed back into a misleading continuous range. */
+function llmFormatFrameTimestamps(timestamps) {
+  if (!timestamps || !timestamps.length) return "";
+  return timestamps
+    .slice()
+    .sort((a, b) => a - b)
+    .map((t) => `${t.toFixed(1)}s`)
+    .join(", ");
+}
+
+/** Pure: the overlay label for an evidence image, or the explicit
+ * no-evidence message - never fabricates a timestamp. */
+function llmEvidenceLabel(evidenceS) {
+  if (typeof evidenceS !== "number" || !Number.isFinite(evidenceS)) {
+    return "No grounded evidence image available";
+  }
+  return `t = ${evidenceS.toFixed(1)}s`;
+}
+
 function initLLMSection() {
   el("llm-add-engine").addEventListener("click", () => openLLMEngineForm(null));
   el("llm-engine-cancel").addEventListener("click", closeLLMEngineForm);
   el("llm-engine-form").addEventListener("submit", onLLMEngineFormSubmit);
+  el("llm-engine-provider").addEventListener("change", () => populateLLMModelSelect());
   document.querySelectorAll('input[name="llm-credential-mode"]').forEach((radio) => {
     radio.addEventListener("change", updateLLMCredentialFieldVisibility);
   });
+  loadLLMModelOptions();
   loadLLMEngines();
+}
+
+/** Fetches the server-side model allowlist per provider - the single
+ * source of truth also enforced independently by LLMEngineStore.create/
+ * update, so DOM/request tampering can't select an unsupported model. */
+async function loadLLMModelOptions() {
+  try {
+    llmState.modelOptions = await getJSON("/api/llm-model-options");
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+/** Repopulates the Model <select> from llmState.modelOptions for the
+ * currently-chosen provider. When `selectedModelId` is given but is not on
+ * that provider's allowlist (e.g. editing an engine whose saved model was
+ * since removed, or the provider was just switched), this deliberately
+ * does NOT silently fall back to the first available model - it shows a
+ * disabled placeholder plus a visible warning and requires an explicit new
+ * selection, per the supervisor's requirement. */
+function populateLLMModelSelect(selectedModelId) {
+  const select = el("llm-engine-model-id");
+  const hint = el("llm-engine-model-hint");
+  const provider = el("llm-engine-provider").value;
+  const options = llmState.modelOptions[provider] || [];
+  select.innerHTML = "";
+
+  const isKnownSelection = !!selectedModelId && options.includes(selectedModelId);
+  if (selectedModelId && !isKnownSelection) {
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Choose a model";
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    select.appendChild(placeholder);
+    hint.textContent =
+      `"${selectedModelId}" is no longer a supported model for this provider. Choose a new one.`;
+    hint.classList.remove("hidden");
+  } else {
+    hint.textContent = "";
+    hint.classList.add("hidden");
+  }
+
+  options.forEach((modelId) => {
+    const option = document.createElement("option");
+    option.value = modelId;
+    option.textContent = modelId;
+    if (modelId === selectedModelId) option.selected = true;
+    select.appendChild(option);
+  });
 }
 
 function updateLLMCredentialFieldVisibility() {
@@ -1358,6 +1458,135 @@ function renderLLMResult(container, job) {
     notes.textContent = `Notes: ${verdict.reason_codes.join(", ")}`;
     container.appendChild(notes);
   }
+
+  // Auditability: exactly what was sent to the AI, and (on a confirmed
+  // result) the two decisive evidence frames - see
+  // diagnostics/llm_spike/DESIGN.md's "what did the AI see" requirement.
+  const framesSection = buildLLMFramesSentSection(job);
+  if (framesSection) container.appendChild(framesSection);
+
+  if (verdict && verdict.status === "confirmed") {
+    container.appendChild(buildLLMEvidenceSection(job));
+  }
+}
+
+/** The "Frames sent to AI" audit section: one row per pipeline pass, each
+ * showing the actual submitted-frame range/count (never the theoretical
+ * extraction plan - see PipelineOutcome.pass_frames), with an expandable
+ * list of every individual submitted timestamp so a sparse/thinned
+ * request can never be misrepresented as a continuous range. Returns
+ * `null` when the outcome has no pass_frames at all (e.g. a failed run
+ * that never reached the pipeline). */
+function buildLLMFramesSentSection(job) {
+  const passFrames = job.outcome && job.outcome.pass_frames;
+  if (!passFrames) return null;
+
+  const details = document.createElement("details");
+  details.className = "llm-frames-sent";
+  const summary = document.createElement("summary");
+  summary.textContent = "Frames sent to AI";
+  details.appendChild(summary);
+
+  const explanation = document.createElement("p");
+  explanation.className = "hint";
+  explanation.textContent =
+    "Each pass below sees a different range of the video - the frames actually " +
+    "submitted after budget thinning, not a plan. Start refine is centered on the " +
+    "coarse start estimate; current default margin is ±1.5 s (3.0 s total), " +
+    "widened if the reported uncertainty is larger.";
+  details.appendChild(explanation);
+
+  const fineFrames = passFrames.fine;
+  if (fineFrames && fineFrames.length) {
+    const actualRange = document.createElement("p");
+    actualRange.className = "hint";
+    actualRange.textContent = `Actual start-refine range used for this run: ${llmPassFrameSummary(fineFrames)}.`;
+    details.appendChild(actualRange);
+  }
+
+  const dl = document.createElement("dl");
+  dl.className = "details-grid";
+  LLM_PASS_ORDER.forEach((passName) => {
+    const timestamps = passFrames[passName];
+    // .details-grid is a CSS grid over its *direct* children (see
+    // appendDetail above) - each dt/dd pair must be wrapped in its own
+    // div, or the grid places dt and dd as separate cells and the labels
+    // drift out of alignment with their values.
+    const wrap = document.createElement("div");
+    const dt = document.createElement("dt");
+    dt.textContent = LLM_PASS_LABELS[passName];
+    const dd = document.createElement("dd");
+    dd.textContent = llmPassFrameSummary(timestamps);
+
+    if (timestamps && timestamps.length) {
+      const passDetail = document.createElement("details");
+      passDetail.className = "llm-frame-timestamps";
+      const passSummary = document.createElement("summary");
+      passSummary.textContent = `All ${timestamps.length} submitted timestamps`;
+      passDetail.appendChild(passSummary);
+      const list = document.createElement("p");
+      list.textContent = llmFormatFrameTimestamps(timestamps);
+      passDetail.appendChild(list);
+      dd.appendChild(passDetail);
+    }
+
+    wrap.appendChild(dt);
+    wrap.appendChild(dd);
+    dl.appendChild(wrap);
+  });
+  details.appendChild(dl);
+
+  return details;
+}
+
+/** The two decisive evidence images (Start/End) for a confirmed result -
+ * see pipeline._nearest_grounded_evidence_ts for how the server selects
+ * (and grounds) each timestamp; this only ever renders what the server
+ * already decided, never a client-chosen frame. */
+function buildLLMEvidenceSection(job) {
+  const section = document.createElement("div");
+  section.className = "llm-evidence-section";
+  const heading = document.createElement("h4");
+  heading.className = "llm-evidence-heading";
+  heading.textContent = "Decisive evidence";
+  section.appendChild(heading);
+
+  const grid = document.createElement("div");
+  grid.className = "llm-evidence-grid";
+  grid.appendChild(buildLLMEvidenceFigure(job, "start", "Start evidence", job.start_evidence_s));
+  grid.appendChild(buildLLMEvidenceFigure(job, "end", "End evidence", job.end_evidence_s));
+  section.appendChild(grid);
+  return section;
+}
+
+function buildLLMEvidenceFigure(job, boundary, label, evidenceS) {
+  const figure = document.createElement("figure");
+  figure.className = "llm-evidence-figure";
+  const caption = document.createElement("figcaption");
+  caption.textContent = label;
+  figure.appendChild(caption);
+
+  if (typeof evidenceS !== "number" || !Number.isFinite(evidenceS)) {
+    const missing = document.createElement("p");
+    missing.className = "hint";
+    missing.textContent = llmEvidenceLabel(evidenceS);
+    figure.appendChild(missing);
+    return figure;
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "llm-evidence-image-wrap";
+  const img = document.createElement("img");
+  img.className = "llm-evidence-image";
+  img.src = `/api/llm-runs/${job.run_id}/evidence/${boundary}`;
+  img.alt = `${label} frame`;
+  const timestampLabel = document.createElement("span");
+  timestampLabel.className = "llm-evidence-timestamp-label";
+  timestampLabel.textContent = llmEvidenceLabel(evidenceS);
+  wrap.appendChild(img);
+  wrap.appendChild(timestampLabel);
+  figure.appendChild(wrap);
+  return figure;
 }
 
 function cancelLLMRun(engineId) {
@@ -1385,7 +1614,7 @@ function openLLMEngineForm(engine) {
   llmState.editingEngineId = engine ? engine.engine_id : null;
   el("llm-engine-display-name").value = engine ? engine.display_name : "";
   el("llm-engine-provider").value = engine ? engine.provider_name : "openai";
-  el("llm-engine-model-id").value = engine ? engine.model_id : "";
+  populateLLMModelSelect(engine ? engine.model_id : null);
   el("llm-engine-api-key").value = "";
   el("llm-engine-env-var").value = "";
   document.querySelector('input[name="llm-credential-mode"][value="api_key"]').checked = true;
@@ -1512,5 +1741,8 @@ if (typeof module !== "undefined" && module.exports) {
     llmResultBadge,
     llmRunStatusLine,
     validateLLMEngineForm,
+    llmPassFrameSummary,
+    llmFormatFrameTimestamps,
+    llmEvidenceLabel,
   };
 }

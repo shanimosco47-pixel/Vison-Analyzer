@@ -50,6 +50,37 @@ logger = get_logger(__name__)
 
 SUPPORTED_PROVIDERS: tuple[str, ...] = ("openai", "gemini")
 
+# The one server-side source of truth for which model IDs a user can select
+# for each provider - deliberately not "whatever the vendor happens to
+# offer": per the supervisor's explicit instruction, a model is listed only
+# once this codebase has actually called it, with a real key, against a
+# real clip, and confirmed it returns schema-conformant structured output
+# for the image-batch requests this pipeline sends - never merely because
+# the vendor's catalog includes it. See diagnostics/llm_spike/DESIGN.md for
+# each entry's provenance:
+#
+# - "gpt-4.1-mini": the model behind every real gate-1 rerun from the
+#   chronological end-scan experiments through the two-stage/wide-window
+#   redesign and the app-integration acceptance (DESIGN.md sections 14-24)
+#   - dozens of real, schema-conformant calls on record.
+# - "gemini-3.5-flash-lite"/"gemini-3.5-flash": both completed real calls
+#   successfully in the four-model gate-1 round (DESIGN.md section 14) -
+#   the reported *timing accuracy* was poor for both, but that is a
+#   separate question from "does this model accept the required image +
+#   structured-output request shape", which this list is scoped to.
+#
+# openai_provider.DEFAULT_OPENAI_MODEL_ID ("gpt-5-mini") and
+# gemini_provider.DEFAULT_GEMINI_MODEL_ID ("gemini-2.5-flash-lite") are
+# each module's own fallback when no model_id is given at all - unrelated
+# to this list, and not automatically eligible for it: LLMEngineStore
+# always passes an explicit model_id, so those defaults are never actually
+# reached via this UI. Neither has a real-call record in this repository's
+# own history; add it here only once one exists.
+SUPPORTED_MODELS: dict[str, tuple[str, ...]] = {
+    "openai": ("gpt-4.1-mini",),
+    "gemini": ("gemini-3.5-flash-lite", "gemini-3.5-flash"),
+}
+
 _SECRET_REF_PREFIX = "secret:"
 _ENV_REF_PREFIX = "env:"
 
@@ -141,9 +172,7 @@ class LLMEngineStore:
         enabled: bool = True,
     ) -> EngineConfig:
         provider_name = _validated_provider_name(provider_name)
-        model_id = (model_id or "").strip()
-        if not model_id:
-            raise AnalyzerError("Choose a model ID for this engine.")
+        model_id = _validated_model_id(provider_name, model_id)
 
         engine_id = uuid.uuid4().hex
         credential_ref = self._new_credential_ref(
@@ -193,10 +222,25 @@ class LLMEngineStore:
             new_display_name = (
                 existing.display_name if display_name is None else display_name.strip()
             )
+            new_provider_name = _validated_provider_name(provider_name or existing.provider_name)
+            # A model_id is only re-validated (and required) when either it
+            # was explicitly given, or the provider changed - preserving an
+            # untouched, still-valid model across an edit that only renames
+            # the engine, say, rather than forcing a reselection every time.
+            # If the provider changed and the *existing* model_id is not on
+            # the new provider's list, this raises rather than silently
+            # keeping a now-invalid model or silently swapping to some
+            # arbitrary default - the user must explicitly choose one for
+            # the new provider (supervisor-directed, see
+            # diagnostics/llm_spike/DESIGN.md).
+            if model_id is not None or new_provider_name != existing.provider_name:
+                new_model_id = _validated_model_id(new_provider_name, model_id or existing.model_id)
+            else:
+                new_model_id = existing.model_id
             updated = EngineConfig(
                 engine_id=engine_id,
-                provider_name=_validated_provider_name(provider_name or existing.provider_name),
-                model_id=(model_id or existing.model_id).strip() or existing.model_id,
+                provider_name=new_provider_name,
+                model_id=new_model_id,
                 credential_ref=credential_ref,
                 enabled=existing.enabled if enabled is None else enabled,
                 display_name=new_display_name,
@@ -341,6 +385,22 @@ def _validated_provider_name(provider_name: str) -> str:
             + ", ".join(SUPPORTED_PROVIDERS)
         )
     return provider_name
+
+
+def _validated_model_id(provider_name: str, model_id: str | None) -> str:
+    """Reject anything not on ``SUPPORTED_MODELS[provider_name]`` - the
+    single server-side allowlist. Called on every create/update
+    unconditionally, so a request that bypasses the dropdown (a hand-
+    crafted API call, a tampered DOM) can never select an unlisted model
+    just because the client claimed one."""
+    model_id = (model_id or "").strip()
+    allowed = SUPPORTED_MODELS.get(provider_name, ())
+    if model_id not in allowed:
+        raise AnalyzerError(
+            f"'{model_id or '(empty)'}' is not a supported model for {provider_name}. "
+            f"Choose one of: {', '.join(allowed) if allowed else '(none available)'}."
+        )
+    return model_id
 
 
 def _secret_key_of(credential_ref: str) -> str | None:
