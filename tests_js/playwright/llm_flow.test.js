@@ -424,7 +424,12 @@ test("Experimental LLM analysis - the wrong-candidate audit trail explains itsel
     });
     assert.notEqual(rows["End coarse"], "Not run");
     assert.notEqual(rows["End validate"], "Not run");
-    assert.match(rows["End validate"], /1\.5s to 11\.5s/);
+    // The dense validation window itself is still [1.5, 11.5]s (see the
+    // "How the AI decided" assertions below), but the actual submitted
+    // range now also includes the sparse, bounded future checkpoints added
+    // beyond it (up to the clip's own end, 26.0s here) - advisory-only
+    // evidence sent in the same request, not a second scan.
+    assert.match(rows["End validate"], /1\.5s to 26\.0s/);
   });
 
   await t.test("How the AI decided explains the candidate -> window -> abstain chain", async () => {
@@ -471,5 +476,111 @@ test("Experimental LLM analysis - the wrong-candidate audit trail explains itsel
       els.map((el) => el.textContent)
     );
     assert.ok(badgeTexts.some((t) => /abstain/i.test(t)));
+  });
+});
+
+test("Experimental LLM analysis - a candidate conflict explains itself and resolves correctly", async (t) => {
+  // CODEX REAL-RUN AUDIT DIAGNOSIS regression (run
+  // bcf2dc44cffe48f3bf3cd32de8e44e81, commit 4dfb2d1): unlike the
+  // wrong_candidate scenario above (where the coarse pass's own end
+  // estimate happens to equal the wrong candidate, so no conflict fires),
+  // this scenario's coarse pass reports a genuinely different, independent
+  // end estimate (21.0s) - triggering the bounded second validation call
+  // and proving, on the page itself, that the pipeline never reports the
+  // early false candidate (5.5s) as the answer, and that the conflict and
+  // its resolution are explained without DevTools.
+  const { proc: serverProc, port, videoPath } = await startServer("conflict");
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  const browser = await chromium.launch({ headless: true });
+  t.after(async () => {
+    await browser.close().catch(() => {});
+    serverProc.kill();
+  });
+
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+
+  await t.test("run the engine and confirm the later, correctly-grounded break", async () => {
+    await page.goto(baseUrl, { waitUntil: "load" });
+    await page.setInputFiles("#file-input", videoPath);
+    await page.waitForSelector("#video-details:not(.hidden)", { timeout: 15000 });
+
+    await page.click("#llm-add-engine");
+    await page.waitForSelector("#llm-engine-form:not(.hidden)");
+    await page.fill("#llm-engine-display-name", "Conflict Engine");
+    await page.selectOption("#llm-engine-provider", "openai");
+    await page.waitForFunction(
+      () => document.querySelector("#llm-engine-model-id").options.length > 0
+    );
+    await page.check('input[name="llm-credential-mode"][value="env_var"]');
+    await page.fill("#llm-engine-env-var", "STUB_ENV_VAR_NOT_ACTUALLY_USED");
+    await page.click("#llm-engine-save");
+    await page.waitForSelector("#llm-engine-form", { state: "hidden" });
+
+    await page.click(".llm-run-btn");
+    await page.waitForSelector(".llm-result:not(.hidden)", { timeout: RUN_TIMEOUT_MS });
+    await page.waitForSelector(".llm-how-decided", { timeout: 10000 });
+
+    const badgeTexts = await page.$$eval(".llm-result .badge", (els) =>
+      els.map((el) => el.textContent)
+    );
+    assert.ok(
+      badgeTexts.some((t) => /confirmed/i.test(t)),
+      `expected a Confirmed badge, got: ${badgeTexts.join(", ")}`
+    );
+    const resultRows = await page.$eval(".llm-result > .details-grid", (dl) => {
+      const dts = Array.from(dl.querySelectorAll("dt")).map((el) => el.textContent);
+      const dds = Array.from(dl.querySelectorAll("dd")).map((el) => el.textContent);
+      return Object.fromEntries(dts.map((label, i) => [label, dds[i]]));
+    });
+    const endValue = parseFloat(resultRows["End"]);
+    assert.ok(Math.abs(endValue - 20.5) < 1.0, `expected End near 20.5s, got ${resultRows["End"]}`);
+    assert.notEqual(endValue, 5.5);
+  });
+
+  await t.test("Frames sent to AI includes the End validate (conflict check) row", async () => {
+    await page.click(".llm-frames-sent > summary");
+    const rows = await page.$eval(".llm-frames-sent .details-grid", (dl) => {
+      const dts = Array.from(dl.querySelectorAll("dt")).map((el) => el.textContent);
+      const dds = Array.from(dl.querySelectorAll("dd")).map(
+        (el) => el.childNodes[0] && el.childNodes[0].textContent
+      );
+      return Object.fromEntries(dts.map((label, i) => [label, dds[i]]));
+    });
+    assert.notEqual(rows["End validate (conflict check)"], undefined);
+    assert.notEqual(rows["End validate (conflict check)"], "Not run");
+  });
+
+  await t.test("How the AI decided explains the conflict and its resolution", async () => {
+    await page.click(".llm-how-decided > summary");
+    const blocks = await page.$$eval(".llm-how-decided-pass", (els) =>
+      els.map((block) => ({
+        heading: block.querySelector("h5").textContent,
+        text: Array.from(block.querySelectorAll("p"))
+          .map((p) => p.textContent)
+          .join(" "),
+      }))
+    );
+
+    const conflictBlock = blocks.find((b) => b.heading === "Candidate conflict");
+    assert.ok(conflictBlock, "no Candidate conflict block found");
+    assert.match(conflictBlock.text, /5\.5s/);
+    assert.match(conflictBlock.text, /21\.0s/);
+    assert.match(conflictBlock.text, /coarse pass's own end estimate held up/);
+  });
+
+  await t.test("Download audit report (JSON) records the conflict resolution", async () => {
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      page.click(".llm-audit-actions a"),
+    ]);
+    const downloadPath = await download.path();
+    const audit = JSON.parse(fs.readFileSync(downloadPath, "utf8"));
+    assert.equal(audit["final_verdict"]["status"], "confirmed");
+    assert.equal(audit["derived"]["candidate_conflict"], true);
+    assert.equal(audit["derived"]["conflict_resolution"], "coarse_estimate_confirmed");
+    assert.equal(audit["derived"]["confirmed_end_source"], "coarse_estimate");
+    assert.notEqual(audit["final_verdict"]["end_s"], 5.5);
+    assert.ok(Math.abs(audit["final_verdict"]["end_s"] - 20.5) < 1.0);
   });
 });

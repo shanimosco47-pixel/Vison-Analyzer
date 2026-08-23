@@ -46,17 +46,22 @@ def _respond_confirming_every_pass(
     *, model_id: str, latency_s: float, retries: int, prompt_tokens: int, completion_tokens: int
 ):
     """Coarse/fine confirm against the manifest truth as usual; the single
-    whole-clip end-coarse call immediately confirms against its own first
-    submitted frame's timestamp (trivially within its own bounds/evidence),
-    and the one resulting trend-validation call immediately confirms the
+    whole-clip end-coarse call immediately confirms against whichever of its
+    own submitted frames sits closest to the coarse pass's own end estimate
+    (so the two passes agree and no cross-pass conflict is triggered), and
+    the one resulting trend-validation call immediately confirms the
     flagged candidate too - so exactly one end-coarse call and one
     end-validate call happen, deterministic, so these cost/usage tests
     don't depend on any real model behaviour.
     """
+    coarse_end_estimate_s = 21.5
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "end_coarse":
-            ts = request.frames[0].timestamp_s
+            ts = min(
+                (f.timestamp_s for f in request.frames),
+                key=lambda t: abs(t - coarse_end_estimate_s),
+            )
             base = canned_json_response(
                 start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
             )
@@ -70,7 +75,7 @@ def _respond_confirming_every_pass(
             # point, never the (discarded) end.
             base = canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         else:
-            base = canned_json_response(start_s=4.0, end_s=21.5, confidence=0.9)
+            base = canned_json_response(start_s=4.0, end_s=coarse_end_estimate_s, confidence=0.9)
         return RawProviderResponse(
             model_id=model_id,
             raw_text=base.raw_text,

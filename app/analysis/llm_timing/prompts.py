@@ -144,6 +144,54 @@ new version was needed for this fix - only how wide a window the
 pipeline builds around the candidate before asking (supervisor-directed,
 see diagnostics/llm_spike/DESIGN.md).
 
+``PROMPT_END_VALIDATE_V3`` is the live trend-validation prompt, superseding
+V2 above after a real audited hands-on run (using the automatic audit trail
+this same round of work introduced) exposed a concrete false-confirmation:
+the coarse pass had already, independently, nominated the end near 21.0s;
+end-coarse instead nominated 5.5s; the dense window built around 5.5s
+([1.5, 11.5]s) never contained the 21.0s region at all; and V2's own
+wording - "the connected stream's reach keeps getting shorter than it was
+at the onset candidate" - was satisfied by an early step-down at ~5.5s
+followed by a flat plateau through 11.5s, because "stays shorter than the
+onset" and "continues shortening" read as the same thing to the model,
+though they are not. V2 was confidently wrong, not merely imprecise - the
+exact failure mode this whole design exists to prevent - and none of it
+was visible without the audit trail. Three changes, all evidence-driven,
+not speculative:
+
+1. The MEASUREMENT RULE now says explicitly that "stays shorter than the
+   onset" is NOT sufficient - the checkpoints after the onset must show
+   the reach getting *shorter than the previous checkpoint*, progressively,
+   at more than one later point; a single step down followed by a stable
+   plateau (the reach stops changing, even though it is still shorter than
+   the pre-onset baseline) must be REJECTED, with the new example spelled
+   out directly (this is not a hypothetical - it is the exact failure
+   mode found).
+2. A new SPARSE FUTURE CHECKPOINTS section explains a handful of widely-
+   spaced frames the pipeline now includes beyond the dense window (see
+   ``pipeline._sparse_future_checkpoints``) - sparse, not dense, so the
+   model does not mistake them for the checkpoint-by-checkpoint evidence
+   the dense window provides, but present specifically so a long plateau
+   that looks locally sustained can be checked against what the clip
+   actually does later, without a second dense scan.
+3. The evidence field is now bounded and role-shaped rather than open-
+   ended: at most a handful of representative checkpoints (never "every
+   frame in the batch"), including at least one at-or-before the reported
+   onset (baseline) and at least one strictly after it (a continuation
+   checkpoint) - enforced structurally by
+   ``pipeline._validate_end_validate_checkpoints``, not only requested in
+   the prompt, after the same real run cited essentially all ~300
+   submitted frames as "evidence" for its (wrong) candidate: a generic
+   trend assertion that satisfied the pre-existing grounding check without
+   showing which specific checkpoints actually demonstrated anything.
+
+Structurally this is still the same request shape as V1/V2 - one call, no
+pipeline expansion for this pass itself (the cross-pass conflict check
+that also came out of this same audited run is a separate mechanism, see
+``pipeline._candidates_conflict``/``run_llm_timing`` and
+diagnostics/llm_spike/DESIGN.md - it can add a second, differently-anchored
+call to this same prompt, not a different prompt).
+
 ``PROMPT_END_COARSE_V1`` (superseded by V2 below, kept only as the
 historical record of what the first real whole-clip rerun was actually
 scored against) was the single whole-clip (post-start), sparsely sampled
@@ -694,6 +742,151 @@ explain why in reason_codes. Do not invent a confident-sounding onset
 when the evidence does not support one.
 """
 
+PROMPT_END_VALIDATE_V3_ID = "zahn-efflux-end-validate-v3"
+
+PROMPT_END_VALIDATE_V3 = """\
+You are analyzing frames from a Zahn cup viscosity test video: a short
+baseline period, then a region an earlier pass flagged as roughly where
+the break might be, then a horizon of frames after it - and, at the very
+end of the batch, a handful of widely-spaced frames from much later in
+the clip (see SPARSE FUTURE CHECKPOINTS below). One frame is labelled
+"[CANDIDATE frame at t=...s]" - all the others are labelled plainly,
+"[frame at t=...s]". The CANDIDATE frame is a REFERENCE POINT, not a fixed
+answer: the earlier pass only had sparse frames to work from and may not
+have landed on the exact onset. Your job is to find the EARLIEST frame,
+anywhere in the DENSE part of this batch, where the connected stream's
+reach begins a genuinely sustained shortening trend - which may be the
+CANDIDATE frame itself, an earlier frame (the earlier pass nominated a
+point slightly later than the true onset), or occasionally a later one,
+if that is what this batch's own evidence actually supports.
+
+Each frame is labelled with its exact timestamp in seconds. Frame
+selection was done deterministically by the calling pipeline, not by you;
+rely only on the timestamps given.
+
+MEASUREMENT RULE (use exactly this rule, do not invent your own):
+- The earliest frames in this batch establish the baseline: the
+  connected, outlet-attached stream at its established, roughly stable
+  reach, before any shortening.
+- Scan the dense part of the batch chronologically for the EARLIEST frame
+  whose reach looks shorter than that baseline. Call this an onset
+  candidate.
+- An onset candidate is CONFIRMED only if the frames after it, still
+  within the dense part of this batch, show the reach getting
+  PROGRESSIVELY shorter at more than one later checkpoint - not merely
+  staying at or below the level it dropped to at the onset. "The reach
+  stayed shorter than the onset" is NOT the same claim as "the reach kept
+  shortening" - only the second one is a sustained trend.
+- REJECT an onset candidate whose reach drops once and then goes flat - a
+  single step down followed by a stable plateau through the rest of the
+  dense window, even though every later frame is still shorter than the
+  pre-onset baseline. Example of what to reject: reach is long at t=1s,
+  shortens sharply by t=6s, and stays at roughly that same shortened
+  length from t=6s through t=11s with no further change - that is a step
+  plus a plateau, not a sustained trend, and must be rejected even though
+  every frame from t=6s onward looks "shorter than baseline".
+- A brief re-extension (the reach lengthening slightly at some point after
+  the onset candidate) does not by itself disqualify it, AS LONG AS later
+  frames shorten again and reach a point shorter than any point already
+  seen - the trend must still be net PROGRESSIVE shortening, never just a
+  single drop followed by no further change.
+- If an onset candidate's reach instead returns to (or back toward) the
+  baseline and STAYS there for the rest of the dense batch, that onset
+  candidate is a visual/camera/contrast artifact, not the real break:
+  reject it and keep scanning later in the dense part of the batch for
+  the next shorter-looking frame. Do not report a candidate you have
+  already ruled out this way just because it was the CANDIDATE frame or
+  the first one you noticed.
+- Your answer is the EARLIEST onset candidate that is actually confirmed
+  this way. Do not report a later, "more obvious" break if an earlier one
+  is already confirmed by this batch's own evidence.
+- Drops that have already detached and fallen below the connected
+  stream's own tip are not part of the stream's reach - judge the
+  connected segment only, never any separated droplets below it.
+- Whatever frame you report, you must have enough later frames within the
+  DENSE part of this batch, after it, to actually confirm the sustained
+  trend - if the only onset candidate you can find is too close to the
+  end of the dense window to have that confirming evidence, do not report
+  it. If no onset candidate is both genuinely shorter than baseline and
+  fully confirmed by the dense batch's own later frames, report "abstain".
+  Use reason_codes including "insufficient_future_context" (not enough
+  dense frames after any candidate to judge), "ambiguous_trend" (frames
+  present, but inconclusive), or "trend_not_sustained" (every candidate
+  you found either recovered back toward baseline, or stepped down once
+  and then went flat), as appropriate.
+
+SPARSE FUTURE CHECKPOINTS: a small number of frames near the end of this
+batch are spaced much further apart than the dense frames above (seconds
+apart, not fractions of a second) and come from well beyond the dense
+window - use them only as a sanity check on a candidate you are otherwise
+ready to confirm from the dense evidence: do a plateau you saw in the
+dense window actually continue unchanged this far out, or has the stream
+clearly changed further by then? Sparse checkpoints showing further,
+unambiguous shortening or the stream's disappearance are a sign the dense
+window's own candidate was premature (a step-then-plateau, not the real
+break) - reject that candidate and report "abstain" rather than confirm
+it, even if nothing in the sparse checkpoints lets you identify exactly
+where the real break is. Do not use the sparse checkpoints to confirm a
+trend by themselves - they are too far apart for that; a CONFIRMED answer
+must always be established by the dense evidence around it, the sparse
+checkpoints can only ever argue against a dense-window candidate, never
+for one on their own.
+
+TIMESTAMP RULE (read this carefully): if confirmed, start_s and end_s
+must be COPIED EXACTLY, character-for-character, from one of the "[frame
+at t=...s]" or "[CANDIDATE frame at t=...s]" labels shown above - it does
+not have to be the CANDIDATE frame's own label; report whichever labelled
+frame is actually the confirmed onset. Never compute, estimate, round, or
+interpolate a timestamp between two labelled frames.
+
+HAZARDS SPECIFIC TO THIS FOOTAGE:
+- The cup, stream and background are often close to the same pale/dusty
+  colour (industrial environment) - contrast can be very low. A drop in
+  raw pixel brightness alone is not evidence of shortening: look for the
+  connected stream's own geometric reach, not an absolute brightness
+  threshold.
+- The footage is handheld - there is camera shake. Do not confuse
+  whole-frame motion (camera movement) with real motion of the stream
+  itself.
+- If no clear geometric edge is visible and the evidence is genuinely
+  ambiguous, abstain rather than guess.
+
+OUTPUT: reply with a single JSON object and nothing else (no prose before
+or after it), matching exactly this shape. This reports a single moment
+(the confirmed onset, if any), not an interval - set start_s and end_s to
+the SAME timestamp, and start_uncertainty_s/end_uncertainty_s to the same
+value. evidence_frame_timestamps_s is a SMALL, SELECTIVE list - a
+handful of the specific checkpoints that actually demonstrate your
+answer, never every frame in the batch: include at least one baseline
+checkpoint at or before the reported onset, and at least one checkpoint
+strictly after it showing continued shortening.
+
+{
+  "status": "confirmed" | "abstain",
+  "start_s": <float seconds, copied exactly from one of the frame labels
+              above - identical to end_s; or null if abstaining>,
+  "end_s": <float seconds, copied exactly from one of the frame labels
+            above - identical to start_s; or null if abstaining>,
+  "start_uncertainty_s": <float, your own +/- bound on the timestamp>,
+  "end_uncertainty_s": <float, the same +/- bound as start_uncertainty_s>,
+  "confidence": <float 0..1>,
+  "reason_codes": [<short machine-readable strings, e.g.
+                     "trend_not_sustained", "insufficient_future_context",
+                     "ambiguous_trend", "weak_contrast", "camera_motion">],
+  "evidence_frame_timestamps_s": [<a small, selective set of specific
+                                     checkpoint timestamps - a baseline
+                                     point and the later point(s) that
+                                     show continued shortening, never
+                                     every frame you looked at>],
+  "raw_notes": "<short free-text explanation, for a human audit log only>"
+}
+
+If you are not confident an onset is fully confirmed by this batch's own
+evidence, set "status" to "abstain", leave start_s/end_s null, and
+explain why in reason_codes. Do not invent a confident-sounding onset
+when the evidence does not support one.
+"""
+
 PROMPT_END_COARSE_V1_ID = "zahn-efflux-end-coarse-v1"
 
 PROMPT_END_COARSE_V1 = """\
@@ -890,6 +1083,7 @@ PROMPTS: dict[str, str] = {
     PROMPT_START_REFINE_V1_ID: PROMPT_START_REFINE_V1,
     PROMPT_END_VALIDATE_V1_ID: PROMPT_END_VALIDATE_V1,
     PROMPT_END_VALIDATE_V2_ID: PROMPT_END_VALIDATE_V2,
+    PROMPT_END_VALIDATE_V3_ID: PROMPT_END_VALIDATE_V3,
     PROMPT_END_COARSE_V1_ID: PROMPT_END_COARSE_V1,
     PROMPT_END_COARSE_V2_ID: PROMPT_END_COARSE_V2,
 }

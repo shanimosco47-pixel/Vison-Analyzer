@@ -18,13 +18,17 @@ the browser test can upload a real, valid file without committing a binary
 fixture to the repository.
 
 Usage: ``python e2e_server.py [scenario]``, where ``scenario`` is
-``confirmed`` (default) or ``wrong_candidate`` - the latter reproduces the
-exact wrong-result shape a real operator reported (an end-coarse pass
-nominating a too-early candidate, whose own dense validation window is
-consequently too narrow to see the clip's actual continuation), so the
-browser suite can prove the "How the AI decided" section explains that
-chain, not just the happy path. Prints exactly one line to stdout once
-ready:
+``confirmed`` (default), ``wrong_candidate``, or ``conflict``.
+``wrong_candidate`` reproduces the exact wrong-result shape a real
+operator reported (an end-coarse pass nominating a too-early candidate,
+whose own dense validation window is consequently too narrow to see the
+clip's actual continuation), so the browser suite can prove the "How the
+AI decided" section explains that chain, not just the happy path.
+``conflict`` extends that same shape with a coarse pass whose own end
+estimate lands far enough away to trigger a genuine cross-pass conflict,
+proving the "End validate (conflict check)" pass and "Candidate conflict"
+explanation are visible on the result card itself. Prints exactly one
+line to stdout once ready:
 
     LISTENING <port> <video_path>
 
@@ -122,9 +126,57 @@ def _wrong_candidate_respond(request: ProviderRequest) -> RawProviderResponse:
     )
 
 
+def _conflict_respond(request: ProviderRequest) -> RawProviderResponse:
+    """CODEX REAL-RUN AUDIT DIAGNOSIS regression (run
+    bcf2dc44cffe48f3bf3cd32de8e44e81, commit 4dfb2d1): end-coarse nominates
+    the same too-early candidate (5.5s) as the wrong_candidate scenario
+    above, but this time the coarse pass's own, independent end estimate
+    (21.0s) sits far enough away that neither candidate's own validation
+    window contains the other - a genuine cross-pass conflict. The
+    resulting bounded second validation call (anchored on the coarse
+    estimate, never a second dense scan) correctly rejects the early
+    candidate and confirms the clip's real, later break (~20.5s), so the
+    pipeline never reports the false 5.5s answer. Same numbers as
+    tests/test_llm_timing_pipeline.py::
+    test_pipeline_reaches_the_true_late_break_via_the_conflict_secondary_validation
+    - this is the browser-level half of that same regression, proving the
+    "End validate (conflict check)" pass and the "Candidate conflict"
+    explanation are visible on the result card itself, without DevTools."""
+    false_candidate_s = 5.5
+    coarse_estimate_s = 21.0
+    true_break_s = 20.5
+    if request.pass_name == "coarse":
+        return canned_json_response(start_s=1.0, end_s=coarse_estimate_s, confidence=0.9)
+    if request.pass_name == "fine":
+        return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
+    if request.pass_name == "end_coarse":
+        ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - false_candidate_s))
+        return canned_json_response(
+            start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
+        )
+    assert request.pass_name == "end_validate"
+    candidate_ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+    if candidate_ts < 15.0:
+        # The early, wrong candidate's own narrow window: a correctly-
+        # behaving model rejects it (step-then-plateau, not a sustained
+        # trend) rather than repeating the real reported bug.
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+    # The coarse-estimate-anchored window: independently confirms the real,
+    # later break.
+    ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - true_break_s))
+    return canned_json_response(
+        start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
+    )
+
+
 _SCENARIOS = {
     "confirmed": _confirmed_respond,
     "wrong_candidate": _wrong_candidate_respond,
+    "conflict": _conflict_respond,
 }
 
 

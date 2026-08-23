@@ -1557,6 +1557,143 @@ def test_pipeline_derived_decisions_survive_a_rejected_end_candidate(zahn_video)
     assert outcome.pass_verdicts["end_validate"].status is TimingStatus.ABSTAIN
 
 
+# --------------------------------------------------------------------------- #
+# CODEX REAL-RUN AUDIT DIAGNOSIS regression: run bcf2dc44cffe48f3bf3cd32de8e44e81,
+# commit 4dfb2d1. A real hands-on run confirmed end_s=5.5s: end-coarse
+# nominated 5.5s, its own dense validation window ([1.5, 11.5]s under the
+# default margins) contained nothing but a step-then-plateau, and the model
+# wrongly confirmed a "sustained trend" there while citing essentially every
+# frame in the window as evidence - all while the coarse pass's own,
+# unrelated end estimate (~21.0s) was silently discarded and the clip's true
+# break (near the end of the clip) was never re-examined at all. These two
+# tests reproduce the exact reported numbers (coarse end estimate 21.0s,
+# end-coarse candidate 5.5s, validation window [1.5, 11.5]s) and assert the
+# pipeline never reports 5.5s as the confirmed end - it either safely
+# abstains (both anchors independently "confirm", which is genuinely
+# ambiguous) or reaches the later, correctly-grounded break via the bounded
+# second validation call against the coarse pass's own estimate. See
+# diagnostics/llm_spike/DESIGN.md.
+# --------------------------------------------------------------------------- #
+
+
+def test_pipeline_never_confirms_the_false_early_candidate_when_both_anchors_confirm(
+    zahn_video,
+):
+    false_candidate_s = 5.5  # end-coarse's wrong nomination, per the real audit
+    coarse_estimate_s = 21.0  # the coarse pass's own, independent end estimate
+    true_break_s = 20.5  # what the coarse-estimate-anchored window actually finds
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=1.0, end_s=coarse_estimate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
+        if request.pass_name == "end_coarse":
+            ts = min(
+                (f.timestamp_s for f in request.frames),
+                key=lambda t: abs(t - false_candidate_s),
+            )
+            return canned_json_response(
+                start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
+            )
+        assert request.pass_name == "end_validate"
+        candidate_ts = _candidate_timestamp(request)
+        if candidate_ts < 15.0:
+            # The exact reported bug: the model confirms a step-then-plateau
+            # inside the early, wrong candidate's own narrow window as if it
+            # were a sustained trend.
+            return canned_json_response(
+                start_s=candidate_ts,
+                end_s=candidate_ts,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(candidate_ts,),
+            )
+        # The coarse-estimate-anchored window independently confirms the
+        # real, later break.
+        ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - true_break_s))
+        return canned_json_response(
+            start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+
+    # Never a confidently-wrong CONFIRMED result at the false candidate.
+    assert outcome.event is None
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.verdict.end_s != pytest.approx(false_candidate_s)
+
+    assert outcome.derived["candidate_conflict"] is True
+    assert outcome.derived["end_coarse_candidate_s"] == pytest.approx(false_candidate_s)
+    assert outcome.derived["coarse_end_estimate_s"] == pytest.approx(coarse_estimate_s)
+    lo, hi = outcome.derived["end_validation_window_s"]
+    assert lo == pytest.approx(1.5)
+    assert hi == pytest.approx(11.5)
+    assert outcome.derived["conflict_resolution"] == "both_confirmed_conflict_abstain"
+    assert "ambiguous_evidence" in outcome.verdict.reason_codes
+    # Both independently-confirmed candidates stay visible for audit, even
+    # though the run abstained.
+    assert outcome.pass_verdicts["end_validate"].status is TimingStatus.CONFIRMED
+    assert outcome.pass_verdicts["end_validate_conflict"].status is TimingStatus.CONFIRMED
+
+
+def test_pipeline_reaches_the_true_late_break_via_the_conflict_secondary_validation(
+    zahn_video,
+):
+    false_candidate_s = 5.5  # end-coarse's wrong nomination, per the real audit
+    coarse_estimate_s = 21.0  # the coarse pass's own, independent end estimate
+    true_break_s = 20.5  # what the coarse-estimate-anchored window actually finds
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=1.0, end_s=coarse_estimate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
+        if request.pass_name == "end_coarse":
+            ts = min(
+                (f.timestamp_s for f in request.frames),
+                key=lambda t: abs(t - false_candidate_s),
+            )
+            return canned_json_response(
+                start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
+            )
+        assert request.pass_name == "end_validate"
+        candidate_ts = _candidate_timestamp(request)
+        if candidate_ts < 15.0:
+            # A correctly-behaving model (the point of PROMPT_END_VALIDATE_V3's
+            # step-vs-plateau rule) rejects the early window - it is a step
+            # plus a plateau, not a sustained trend.
+            return RawProviderResponse(
+                model_id="stub-model",
+                raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+                latency_s=0.01,
+            )
+        ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - true_break_s))
+        return canned_json_response(
+            start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.end_s != pytest.approx(false_candidate_s)
+    assert outcome.event.end_s == pytest.approx(true_break_s, abs=0.5)
+
+    assert outcome.derived["candidate_conflict"] is True
+    assert outcome.derived["conflict_resolution"] == "coarse_estimate_confirmed"
+    assert outcome.derived["confirmed_end_source"] == "coarse_estimate"
+    assert outcome.event.details["candidate_conflict"] is True
+    assert outcome.event.details["conflict_resolution"] == "coarse_estimate_confirmed"
+    assert outcome.event.details["end_coarse_candidate_s"] == pytest.approx(false_candidate_s)
+    assert outcome.event.details["coarse_end_estimate_s"] == pytest.approx(coarse_estimate_s)
+
+
 class TestNearestGroundedEvidenceTs:
     def test_picks_the_evidence_timestamp_closest_to_the_boundary(self):
         result = _nearest_grounded_evidence_ts(

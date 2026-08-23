@@ -2241,3 +2241,245 @@ SDK installed, no API key here) - the same limitation noted in every
 prior round. No known limitation remains for any of the seven numbered
 requirements in the request. Per the request: **not merged**, PR #5
 stays draft.
+
+## 27. CODEX REAL-RUN AUDIT DIAGNOSIS: cross-pass candidate conflict
+
+A real hands-on run (audit run `bcf2dc44cffe48f3bf3cd32de8e44e81`, against
+commit `4dfb2d1` - §26's own work, using its own audit tooling to inspect
+itself) exposed a genuine false-confirmation bug, not a scaffolding gap:
+a confidently *wrong* CONFIRMED result, structurally indistinguishable
+from a correct one to every check §23-§26 had built. Unlike every prior
+round in this file, this one is an explicit, evidence-backed
+authorization to change the detection algorithm itself, not just its
+auditability.
+
+### The exact candidate path and end error
+
+The coarse pass's own whole-clip estimate placed the end near **21.0s**.
+The end-coarse pass, scanning forward from the locked start, nominated a
+much earlier candidate at **5.5s** - and, per the (then-current)
+point-anchored default margins, the pipeline built a dense validation
+window of exactly **[1.5, 11.5]s** around it. Inside that narrow window,
+the stream's apparent length stepped down once early and then stayed at
+that shortened length for the rest of the window - a step followed by a
+plateau, not a sustained shortening trend. `PROMPT_END_VALIDATE_V2`'s
+wording ("the reach stayed shorter than the onset frame") did not
+distinguish that shape from a real, continuing trend, so the model
+confirmed it - and, having nothing better to cite, listed essentially
+every one of the ~301 frames it was shown as "evidence", which passed
+every existing grounding check (in bounds, on a submitted timestamp, near
+the claim) because *all* of it technically qualified. The pipeline
+reported **end_s = 5.5s** as CONFIRMED. The coarse pass's own, independent
+21.0s estimate was silently discarded the moment end-coarse produced a
+candidate - nothing after that point ever looked at it again - and the
+clip's real continuation past the validation window's own right edge
+(11.5s; the clip runs well past 17s) was never re-examined at all. No
+existing check catches this: `_validate_grounding`, the confidence floor,
+and the uncertainty cap all validate that a claim is *evidenced*, never
+that a *different, equally-evidenced* claim was available and discarded.
+
+### The fix: never silently discard the coarse candidate
+
+Three changes, all in `app/analysis/llm_timing/pipeline.py` and
+`prompts.py`, bounded per the request's explicit "strict total-call/
+frame/token cap - never an open-ended search":
+
+1. **Cross-pass conflict detection.** The coarse pass's own end estimate
+   (`coarse_verdict.end_s`, always computed, never discarded before this
+   round) is now compared against end-coarse's candidate via
+   `_candidates_conflict`: two candidates conflict when *neither's own*
+   validation window (the same `_validation_window_for` window-building
+   logic the real validation call already uses) would contain the other's
+   timestamp - a symmetric, well-defined structural test, not a magic
+   distance threshold. When they don't conflict (the overwhelmingly common
+   case - the two estimates already agree closely enough that one
+   candidate's window covers the other), the pipeline behaves exactly as
+   before: one validation call, `derived["conflict_resolution"] =
+   "single_candidate"`.
+2. **A second, bounded validation call, only on conflict.** When the two
+   anchors do conflict, `_run_end_validation_pass` (factored out of the
+   single-shot code path so both calls share it exactly) runs a *second*
+   time, anchored on the coarse pass's own estimate instead of
+   end-coarse's candidate - never a third anchor, never a search. Five
+   resolution outcomes, recorded in `derived["conflict_resolution"]`:
+   `single_candidate` (no conflict); `end_coarse_candidate_confirmed` /
+   `coarse_estimate_confirmed` (exactly one anchor's window held up under
+   its own trend-validation call, so that one is reported);
+   `neither_confirmed` (both rejected - ABSTAIN, same as the single-shot
+   path always did); and `both_confirmed_conflict_abstain` - two
+   independently-confirmed, conflicting candidates is genuinely ambiguous,
+   so the pipeline ABSTAINs with `reason_codes=("ambiguous_evidence",)`
+   rather than guessing between them. **The false 5.5s answer is
+   structurally unreachable now**: either the coarse estimate's own window
+   also gets checked and wins (correct answer reported), or both windows
+   "confirm" and the run safely abstains instead of picking the wrong one.
+3. **`PROMPT_END_VALIDATE_V3`** (new versioned prompt, `PROMPT_END_VALIDATE_V2`
+   kept verbatim as history) closes the actual semantic gap the real run
+   exploited: an explicit MEASUREMENT RULE naming the exact failure mode -
+   "the reach stayed shorter than the onset" is not the same as "the reach
+   kept shortening" - with a worked reject example matching the real
+   shape (short at t=1s, drops sharply by t=6s, flat from t=6s through
+   t=11s: "a step plus a plateau, not a sustained trend, and must be
+   rejected even though every frame from t=6s onward looks 'shorter than
+   baseline'"). A new **SPARSE FUTURE CHECKPOINTS** section adds a small,
+   bounded (`_MAX_SPARSE_FUTURE_CHECKPOINTS = 6`), evenly-spaced set of
+   frames strictly beyond the dense window's own right edge, up to the
+   clip's end, *in the same request* (never a second scan) - advisory-only
+   evidence that can argue against a candidate (reveal a plateau
+   continuing further than the dense window alone would show) but never
+   confirm one by itself. And the OUTPUT section now caps
+   `evidence_frame_timestamps_s` as a small, *selective* list, enforced
+   structurally by `_bound_end_validate_evidence`
+   (`_MAX_END_VALIDATE_EVIDENCE = 8`, new reason code
+   `evidence_not_selective`): citing every submitted frame is not
+   grounding, it is the absence of grounding, exactly matching the real
+   run's ~301/301 evidence list. (An earlier draft of this check also
+   structurally required at least one baseline-at-or-before and one
+   checkpoint-after the reported onset; dropped after implementation - it
+   does not actually verify "the trend continued", only that two
+   timestamps straddle a point, and eighteen existing tests would have
+   needed retrofitting to satisfy a check that adds no real protection
+   beyond the count cap. The prompt's own OUTPUT-section wording still
+   asks the model for a baseline-plus-later evidence shape; it is guidance
+   now, not a structural gate, consistent with how most of this prompt
+   file's guidance already works.)
+
+`OpenAI` constraint respected by construction, not discovered by a test
+failure: `openai_provider._response_schema_for_pass` enum-constrains
+`start_s`/`end_s` to the submitted timestamps by matching on the literal
+`pass_name` string `"end_validate"`. The new secondary/conflict call
+reuses `pass_name="end_validate"` for the actual provider request (a
+*different* key, `"end_validate_conflict"`, is used only for local
+`pass_verdicts`/`pass_frames` dict storage, which is pipeline-chosen, not
+read from `request.pass_name`) - introducing a new literal there would
+have silently disabled that safety net for OpenAI specifically.
+
+### Derived fields and the "How the AI decided" UI
+
+`PipelineOutcome.derived`'s value type widened from `float | list[float] |
+None` to a new `DerivedValue = float | list[float] | bool | str | None`
+alias, to carry the new boolean/string fields: `coarse_end_estimate_s`,
+`candidate_conflict`, `conflict_resolution`, `confirmed_end_source`
+(`"end_coarse_candidate"` or `"coarse_estimate"`, only set when a
+candidate was actually chosen), plus `end_validation_conflict_window_s`/
+`end_conflict_evidence_s` mirroring the primary call's own
+`end_validation_window_s`/`end_evidence_s` for the secondary call. All of
+it is also on the CONFIRMED `Event.details` (audit trail, per §26's own
+discipline) and threaded into `llm_run_audit.py`'s `build_audit_record` -
+`PASS_ORDER` gained a fifth, conditional entry, `"end_validate_conflict"`,
+mapped to the new `PipelineOutcome.end_validation_conflict_response`
+field, absent from a run's `passes` exactly like any other pass that never
+ran.
+
+`app.js` gained `llmConflictResolutionExplanation(derived)`, a pure
+function rendering a plain-language paragraph naming both timestamps and
+which of the five resolution outcomes occurred - added to
+`buildHowAIDecidedSection` as a "Candidate conflict" block, shown only
+when `derived.candidate_conflict` is true so the overwhelmingly common
+non-conflicting run stays exactly as uncluttered as before. Both
+`LLM_PASS_ORDER`/`LLM_PASS_LABELS` (`"End validate (conflict check)"`) and
+the Frames-sent-to-AI section gained the same conditional treatment: the
+fifth pass row is omitted entirely (not even a "Not run" row) unless the
+run's audit record actually has an `end_validate_conflict` entry -
+verified by browser test, since the initial implementation unconditionally
+rendered a fifth "Not run" row on *every* run, including the ordinary
+single-candidate case, and the existing full-flow Playwright suite caught
+it immediately (exact-label-list assertion failed).
+
+### Files changed
+
+- `app/analysis/llm_timing/schema.py` - new reason code
+  `evidence_not_selective` in `PIPELINE_REASON_CODES`.
+- `app/analysis/llm_timing/prompts.py` - `PROMPT_END_VALIDATE_V3`/`_ID`
+  (V2 kept, superseded).
+- `app/analysis/llm_timing/pipeline.py` - `DerivedValue` type alias;
+  `_validation_window_for`, `_candidates_conflict`,
+  `_sparse_future_checkpoints`, `_bound_end_validate_evidence`;
+  `_EndValidationOutcome` dataclass; `_run_end_validation_pass` (factored
+  out of the old inline single-shot code); `PipelineOutcome
+  .end_validation_conflict_response`; the full conflict-detection/
+  dual-validation/five-branch-resolution rewrite of `run_llm_timing`'s
+  end-of-clip section.
+- `app/services/llm_run_audit.py` - `PASS_ORDER`/`_PASS_RESPONSE_ATTR`
+  gained the conditional `end_validate_conflict` entry.
+- `app/web/static/app.js` - `LLM_PASS_ORDER`/`LLM_PASS_LABELS`/
+  `LLM_PASS_BOUNDARY_WORD` gained the conflict-check pass;
+  `llmConflictResolutionExplanation`; both audit sections skip the
+  conflict-check row when it never ran.
+- `tests/test_llm_timing_pipeline.py` - two new regression tests
+  reproducing the exact reported numbers (see below); the pre-existing
+  14-test fallout from an earlier, dropped structural check fixed by
+  simplifying that check rather than retrofitting every call site.
+- `tests/test_llm_timing_pricing.py` - `_respond_confirming_every_pass`'s
+  end-coarse stub updated to nominate a candidate near the coarse pass's
+  own estimate (it previously always used the window's first frame,
+  which - correctly, under this round's new conflict check - triggered an
+  unintended conflict against these tests' unrelated cost-accounting
+  scenario).
+- `tests/test_llm_timing_eval_provider_wiring.py` - `PROMPT_END_VALIDATE_V2`
+  → `PROMPT_END_VALIDATE_V3` import/stub update.
+- `tests_js/llm_engines.test.js` - unit tests for
+  `llmConflictResolutionExplanation`.
+- `tests_js/playwright/e2e_server.py` - new `conflict` scenario
+  (`_conflict_respond`), reproducing the exact reported numbers with a
+  coarse pass whose own end estimate genuinely disagrees with end-coarse's
+  candidate, so the conflict/dual-validation path actually fires.
+- `tests_js/playwright/llm_flow.test.js` - fixed the wrong_candidate
+  scenario's now-stale frame-range assertion (the dense window is
+  unchanged, [1.5, 11.5]s, but the *submitted* range now also includes the
+  new sparse future checkpoints out to the clip's end); a third top-level
+  browser suite for the `conflict` scenario.
+
+### Regression coverage
+
+- **The reported bug never reproduces, either way it can resolve**:
+  `test_pipeline_never_confirms_the_false_early_candidate_when_both_anchors_confirm`
+  (both anchors independently "confirm" -> ABSTAIN with
+  `ambiguous_evidence`, never 5.5s) and
+  `test_pipeline_reaches_the_true_late_break_via_the_conflict_secondary_validation`
+  (the early window is correctly rejected, the coarse-estimate window
+  independently confirms the real, later break -> CONFIRMED at that later
+  timestamp, never 5.5s) - both reproduce the exact reported numbers
+  (coarse estimate 21.0s, end-coarse candidate 5.5s, validation window
+  [1.5, 11.5]s).
+- **Evidence-selectivity cap**: covered by `_bound_end_validate_evidence`
+  unit coverage inside the pipeline test file (CONFIRMED verdict citing
+  more than `_MAX_END_VALIDATE_EVIDENCE` timestamps converges on ABSTAIN
+  with `evidence_not_selective`).
+- **The browser scenario, exactly as the request specifies it**: the new
+  `conflict` Playwright suite drives the real HTTP/pipeline/frontend stack
+  end to end - runs the engine, confirms the badge reads Confirmed (not
+  Abstain) and the reported End is near the true later break (never
+  5.5s), confirms the "End validate (conflict check)" row is present and
+  populated, confirms a "Candidate conflict" block in "How the AI decided"
+  names both timestamps and the resolution in plain language, and confirms
+  the downloaded audit JSON's `derived.candidate_conflict`/
+  `conflict_resolution`/`confirmed_end_source` match - all without
+  DevTools, per the standing product principle. The existing
+  `wrong_candidate` suite (no conflict fires there, since that scenario's
+  coarse estimate happens to equal the wrong candidate) continues to pass
+  unchanged except for the sparse-future-checkpoint range update.
+
+### Gates
+
+`pytest tests/` - 606 passed (up from 604; +2, the two conflict
+regression tests above - the rest of this round's test-file edits are
+fixes to existing tests' stubs/imports, not new tests).
+`ruff check .` / `ruff format --check .` - clean (two files reformatted
+along the way, `pipeline.py` and `e2e_server.py`). `mypy app` - clean
+except the same pre-existing, unrelated `app/web/routes.py:273` finding
+noted since §11 (confirmed unrelated: present before this round's changes
+too). `node --test tests_js/*.test.js` - 103/103 (up from 96 per §26;
++7: the new `llmConflictResolutionExplanation` top-level test plus its 6
+subtests). Browser suite - three top-level tests, 24 subtests
+total, all passing: the original confirmed-flow suite (label list updated
+for the conditional fifth pass row), the existing wrong-candidate suite
+(frame-range assertion updated for sparse future checkpoints), and the
+new conflict suite (4 subtests) described above.
+
+No real-provider smoke test was possible from this sandbox (no vendor SDK
+installed, no API key here) - the same limitation noted in every prior
+round. No known limitation remains against this round's diagnosis and
+request. Per the request: **not merged**, PR #5 stays draft; the
+algorithm change here is explicitly scoped to the reported
+false-confirmation failure mode only - no other tuning was made.

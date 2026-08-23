@@ -26,6 +26,7 @@ const {
   llmEvidenceLabel,
   llmPassPlainLanguage,
   llmEndCoarseToValidateExplanation,
+  llmConflictResolutionExplanation,
 } = require("../app/web/static/app.js");
 
 test("llmEngineSubtitle", async (t) => {
@@ -381,5 +382,63 @@ test("llmEndCoarseToValidateExplanation", async (t) => {
   await t.test("returns an empty string for a missing/empty derived object", () => {
     assert.equal(llmEndCoarseToValidateExplanation(undefined), "");
     assert.equal(llmEndCoarseToValidateExplanation({}), "");
+  });
+});
+
+test("llmConflictResolutionExplanation", async (t) => {
+  await t.test("returns an empty string when no conflict was detected", () => {
+    assert.equal(llmConflictResolutionExplanation({ candidate_conflict: false }), "");
+    assert.equal(llmConflictResolutionExplanation({}), "");
+    assert.equal(llmConflictResolutionExplanation(undefined), "");
+  });
+
+  await t.test("names both timestamps and the ambiguous-abstain outcome", () => {
+    const text = llmConflictResolutionExplanation({
+      candidate_conflict: true,
+      end_coarse_candidate_s: 5.5,
+      coarse_end_estimate_s: 21.0,
+      conflict_resolution: "both_confirmed_conflict_abstain",
+    });
+    assert.match(text, /5\.5s/);
+    assert.match(text, /21\.0s/);
+    assert.match(text, /ambiguous/);
+    assert.match(text, /abstained/);
+  });
+
+  await t.test("explains the end-coarse-candidate-confirmed outcome", () => {
+    const text = llmConflictResolutionExplanation({
+      candidate_conflict: true,
+      end_coarse_candidate_s: 5.5,
+      coarse_end_estimate_s: 21.0,
+      conflict_resolution: "end_coarse_candidate_confirmed",
+    });
+    assert.match(text, /end-coarse candidate held up/);
+  });
+
+  await t.test("explains the coarse-estimate-confirmed outcome", () => {
+    const text = llmConflictResolutionExplanation({
+      candidate_conflict: true,
+      end_coarse_candidate_s: 5.5,
+      coarse_end_estimate_s: 21.0,
+      conflict_resolution: "coarse_estimate_confirmed",
+    });
+    assert.match(text, /coarse pass's own end estimate held up/);
+  });
+
+  await t.test("explains the neither-confirmed outcome", () => {
+    const text = llmConflictResolutionExplanation({
+      candidate_conflict: true,
+      conflict_resolution: "neither_confirmed",
+    });
+    assert.match(text, /Neither/);
+    assert.match(text, /abstained/);
+  });
+
+  await t.test("still explains the conflict when timestamps are missing", () => {
+    const text = llmConflictResolutionExplanation({
+      candidate_conflict: true,
+      conflict_resolution: "neither_confirmed",
+    });
+    assert.match(text, /checked independently/);
   });
 });

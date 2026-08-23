@@ -37,7 +37,7 @@ from app.analysis.llm_timing.openai_provider import (
 )
 from app.analysis.llm_timing.prompts import (
     PROMPT_END_COARSE_V2,
-    PROMPT_END_VALIDATE_V2,
+    PROMPT_END_VALIDATE_V3,
     PROMPT_START_REFINE_V1,
     PROMPT_V1,
 )
@@ -107,15 +107,23 @@ def _truth_aware_response(true_start_s: float, true_end_s: float) -> Callable[[l
                 start_s, end_s, evidence = true_end_s, true_end_s, (true_end_s,)
             else:
                 return json.dumps({"status": "abstain", "reason_codes": ["no_break_found"]})
-        elif prompt_text == PROMPT_END_VALIDATE_V2:
+        elif prompt_text == PROMPT_END_VALIDATE_V3:
             # Perfect trend-validation stub: always confirms whichever
             # candidate the pipeline flagged (these synthetic truths have a
             # single genuine, sustained break with no recovery to reject).
+            # Evidence includes a baseline (at/before the candidate) and a
+            # later checkpoint (after it), matching the pipeline's own
+            # selective-checkpoint requirement (pipeline.py's
+            # _validate_end_validate_checkpoints) - a single-timestamp
+            # answer would now be structurally rejected as insufficient.
             candidate_text = " ".join(p.get("text", "") for p in parts[1:])
             candidate_matches = _CANDIDATE_LABEL_RE.findall(candidate_text)
             assert candidate_matches, "end-validate request missing a CANDIDATE frame label"
             candidate_ts = float(candidate_matches[0])
-            start_s, end_s, evidence = candidate_ts, candidate_ts, (candidate_ts,)
+            baseline_ts = min(frame_timestamps_s) if frame_timestamps_s else candidate_ts
+            later_ts = max(frame_timestamps_s) if frame_timestamps_s else candidate_ts
+            start_s, end_s = candidate_ts, candidate_ts
+            evidence = tuple(sorted({baseline_ts, candidate_ts, later_ts}))
         else:  # pragma: no cover - would mean a new pass was added and this helper wasn't updated
             raise AssertionError(f"unrecognized prompt text: {prompt_text[:80]!r}")
         return json.dumps(

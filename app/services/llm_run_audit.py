@@ -49,15 +49,28 @@ logger = get_logger(__name__)
 
 AUDIT_SCHEMA_VERSION = 1
 
-# Mirrors PipelineOutcome's own per-pass field names - the four passes the
-# coarse-to-fine strategy can reach, in the order they run.
-PASS_ORDER: tuple[str, ...] = ("coarse", "fine", "end_coarse", "end_validate")
+# Mirrors PipelineOutcome's own per-pass field names - the four passes every
+# run reaches, in the order they run, plus the fifth "end_validate_conflict"
+# pass that only exists when a real run's end-coarse candidate and the
+# coarse pass's own end estimate conflicted badly enough to need a second,
+# independently-anchored trend validation (see pipeline.py's
+# _run_end_validation_pass/_candidates_conflict and
+# diagnostics/llm_spike/DESIGN.md) - absent from ``passes`` like any other
+# pass that never ran, per _pass_audit's own contract.
+PASS_ORDER: tuple[str, ...] = (
+    "coarse",
+    "fine",
+    "end_coarse",
+    "end_validate",
+    "end_validate_conflict",
+)
 
 _PASS_RESPONSE_ATTR: dict[str, str] = {
     "coarse": "coarse_response",
     "fine": "fine_response",
     "end_coarse": "end_coarse_response",
     "end_validate": "end_validation_response",
+    "end_validate_conflict": "end_validation_conflict_response",
 }
 
 # Safe as a filename component: exactly what uuid.uuid4().hex produces (the

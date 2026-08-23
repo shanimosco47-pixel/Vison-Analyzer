@@ -1040,12 +1040,18 @@ const LLM_POLL_INTERVAL_MS = 1200;
 // for each pass - mirrors the pipeline's own pass names (see
 // PipelineOutcome.pass_frames / Event stage names) so this can never drift
 // from what the backend actually calls each pass.
-const LLM_PASS_ORDER = ["coarse", "fine", "end_coarse", "end_validate"];
+// "end_validate_conflict" only ever appears when a run's end-coarse
+// candidate conflicted with the coarse pass's own independent end estimate
+// (see pipeline._candidates_conflict) - like every other pass, its absence
+// from a given run's audit record just means it did not run, and
+// llmPassPlainLanguage already renders that as "This pass did not run."
+const LLM_PASS_ORDER = ["coarse", "fine", "end_coarse", "end_validate", "end_validate_conflict"];
 const LLM_PASS_LABELS = {
   coarse: "Start coarse",
   fine: "Start refine",
   end_coarse: "End coarse",
   end_validate: "End validate",
+  end_validate_conflict: "End validate (conflict check)",
 };
 
 const llmState = {
@@ -1568,6 +1574,12 @@ function buildLLMFramesSentSection(audit) {
   const dl = document.createElement("dl");
   dl.className = "details-grid";
   LLM_PASS_ORDER.forEach((passName) => {
+    // "end_validate_conflict" only exists on a run whose end-coarse
+    // candidate conflicted with the coarse pass's own end estimate - unlike
+    // the four passes every run reaches, it stays out of this section
+    // entirely (not even a "Not run" row) on the overwhelmingly common run
+    // that never triggers it.
+    if (passName === "end_validate_conflict" && !passes[passName]) return;
     const timestamps = passes[passName] && passes[passName].submitted_timestamps_s;
     // .details-grid is a CSS grid over its *direct* children (see
     // appendDetail above) - each dt/dd pair must be wrapped in its own
@@ -1660,6 +1672,7 @@ const LLM_PASS_BOUNDARY_WORD = {
   fine: "start",
   end_coarse: "candidate break",
   end_validate: "confirmed break",
+  end_validate_conflict: "coarse-estimate break",
 };
 
 /** Pure: a plain-language paragraph describing what one pass reported -
@@ -1719,6 +1732,47 @@ function llmEndCoarseToValidateExplanation(derived) {
   );
 }
 
+// Plain-language explanation for each way a candidate-conflict can resolve
+// (see pipeline.py's five-branch resolution logic, derived.conflict_resolution) -
+// keyed exactly to the string the backend records, so this can never drift
+// from what the pipeline actually decided.
+const LLM_CONFLICT_RESOLUTION_TEXT = {
+  both_confirmed_conflict_abstain:
+    "Both were independently confirmed as sustained trends, which is genuinely " +
+    "ambiguous - the AI abstained rather than confidently picking one over the other.",
+  end_coarse_candidate_confirmed:
+    "Only the end-coarse candidate held up as a sustained trend, so it was used " +
+    "for the final result.",
+  coarse_estimate_confirmed:
+    "Only the coarse pass's own end estimate held up as a sustained trend, so it " +
+    "was used for the final result instead of the end-coarse candidate.",
+  neither_confirmed:
+    "Neither the end-coarse candidate nor the coarse pass's own end estimate held " +
+    "up as a sustained trend, so the AI abstained.",
+};
+
+/** Pure: a plain-language paragraph explaining a cross-pass candidate
+ * conflict and how it was resolved - the supervisor-required "candidate-
+ * conflict/selection result" half of "How the AI decided". Returns "" when
+ * no conflict was detected for this run (the common case), so the section
+ * stays uncluttered. `derived` is an audit record's `derived` map. */
+function llmConflictResolutionExplanation(derived) {
+  if (!derived || !derived.candidate_conflict) return "";
+  const candidateS = derived.end_coarse_candidate_s;
+  const estimateS = derived.coarse_end_estimate_s;
+  const lead =
+    typeof candidateS === "number" && typeof estimateS === "number"
+      ? `The end-coarse candidate (t = ${candidateS.toFixed(1)}s) conflicted with the coarse ` +
+        `pass's own independent end estimate (t = ${estimateS.toFixed(1)}s) - neither's own ` +
+        `validation window contained the other, so both were checked independently. `
+      : "The end-coarse candidate conflicted with the coarse pass's own independent end " +
+        "estimate, so both were checked independently. ";
+  const outcome =
+    LLM_CONFLICT_RESOLUTION_TEXT[derived.conflict_resolution] ||
+    "The conflict was resolved without a clear-cut outcome recorded.";
+  return lead + outcome;
+}
+
 /** The "How the AI decided" section: one pass at a time, in plain
  * language, in the order the pipeline ran them - including a pass that
  * never ran ("Not run") and one whose own answer was later rejected, so
@@ -1741,6 +1795,9 @@ function buildHowAIDecidedSection(audit) {
 
   LLM_PASS_ORDER.forEach((passName) => {
     const entry = audit.passes && audit.passes[passName];
+    // Same "stay out entirely, not even Not run" rule as the Frames-sent-
+    // to-AI section - see buildLLMFramesSentSection.
+    if (passName === "end_validate_conflict" && !entry) return;
     const block = document.createElement("div");
     block.className = "llm-how-decided-pass";
     const heading = document.createElement("h5");
@@ -1762,6 +1819,19 @@ function buildHowAIDecidedSection(audit) {
 
     details.appendChild(block);
   });
+
+  const conflictExplanation = llmConflictResolutionExplanation(audit.derived);
+  if (conflictExplanation) {
+    const conflictBlock = document.createElement("div");
+    conflictBlock.className = "llm-how-decided-pass";
+    const heading = document.createElement("h5");
+    heading.textContent = "Candidate conflict";
+    conflictBlock.appendChild(heading);
+    const para = document.createElement("p");
+    para.textContent = conflictExplanation;
+    conflictBlock.appendChild(para);
+    details.appendChild(conflictBlock);
+  }
 
   return details;
 }
@@ -1940,5 +2010,6 @@ if (typeof module !== "undefined" && module.exports) {
     llmEvidenceLabel,
     llmPassPlainLanguage,
     llmEndCoarseToValidateExplanation,
+    llmConflictResolutionExplanation,
   };
 }

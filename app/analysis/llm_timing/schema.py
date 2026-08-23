@@ -57,6 +57,15 @@ PIPELINE_REASON_CODES = frozenset(
         # request-size budget; abstain rather than silently drop evidence
         # below that floor or send an oversized request the provider would
         # reject anyway (Codex review, round 2, finding 2)
+        # The below is an end-validate-specific evidence-shape check (a real
+        # audited run found a CONFIRMED end-validate verdict citing
+        # essentially every submitted frame as "evidence" - a generic trend
+        # assertion that satisfies grounding without showing which specific
+        # checkpoints actually prove a sustained trend, see
+        # diagnostics/llm_spike/DESIGN.md):
+        "evidence_not_selective",  # more evidence timestamps cited than the
+        # selective-checkpoint cap allows - citing "all of it" is not
+        # grounding, it is the absence of grounding
     }
 )
 
