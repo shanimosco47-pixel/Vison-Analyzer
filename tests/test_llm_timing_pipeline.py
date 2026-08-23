@@ -1479,6 +1479,84 @@ def test_pipeline_abstain_outcome_has_no_event_and_therefore_no_evidence(zahn_vi
     assert outcome.event is None
 
 
+def test_pipeline_confirmed_result_populates_derived_decisions(zahn_video):
+    """``PipelineOutcome.derived`` mirrors the same locked-start/candidate/
+    window/evidence facts a CONFIRMED result's ``Event.details`` already
+    carries - it is the audit-record source of truth, not a duplicate that
+    could drift from it."""
+    candidate_s = 12.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=4.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
+        if request.pass_name == "end_validate":
+            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+            return canned_json_response(start_s=ts, end_s=ts, confidence=0.9)
+        assert request.pass_name == "end_coarse"
+        return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+    assert outcome.event is not None
+    assert outcome.derived["locked_start_s"] == pytest.approx(4.0)
+    assert outcome.derived["end_coarse_candidate_s"] == pytest.approx(candidate_s)
+    assert (
+        outcome.derived["end_validation_window_s"]
+        == outcome.event.details["end_validation_window_s"]
+    )
+    assert outcome.derived["start_evidence_s"] == outcome.event.details["start_evidence_s"]
+    assert outcome.derived["end_evidence_s"] == outcome.event.details["end_evidence_s"]
+
+
+def test_pipeline_derived_decisions_survive_a_rejected_end_candidate(zahn_video):
+    """The chain "sparse frames -> candidate -> validation window -> final
+    result" must be reconstructible even when the run does NOT confirm -
+    e.g. a plausible-looking end-coarse candidate whose own dense
+    validation window rejects it. This is the exact shape a real operator
+    reported (end-coarse nominates ~5.5s; the validation window this
+    produces, [1.5, 11.5]s under the default margins, is set before the
+    validation call even runs - and is preserved here even though the
+    call itself abstains)."""
+    candidate_s = 5.5
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=1.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
+        if request.pass_name == "end_coarse":
+            return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
+        assert request.pass_name == "end_validate"
+        return RawProviderResponse(
+            model_id="stub-model",
+            raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
+            latency_s=0.01,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert outcome.derived["locked_start_s"] == pytest.approx(1.0)
+    assert outcome.derived["end_coarse_candidate_s"] == pytest.approx(candidate_s)
+    lo, hi = outcome.derived["end_validation_window_s"]
+    assert lo == pytest.approx(1.5)
+    assert hi == pytest.approx(11.5)
+    assert lo < candidate_s < hi
+    # The sparse and dense frame sets behind this chain are both still on
+    # the outcome, so a reader can see exactly what the pipeline actually
+    # looked at, even though the final answer was "no confident result".
+    assert outcome.pass_frames["end_coarse"]
+    assert outcome.pass_frames["end_validate"]
+    assert outcome.pass_verdicts["end_validate"].status is TimingStatus.ABSTAIN
+
+
 class TestNearestGroundedEvidenceTs:
     def test_picks_the_evidence_timestamp_closest_to_the_boundary(self):
         result = _nearest_grounded_evidence_ts(

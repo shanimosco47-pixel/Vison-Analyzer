@@ -24,6 +24,8 @@ const {
   llmPassFrameSummary,
   llmFormatFrameTimestamps,
   llmEvidenceLabel,
+  llmPassPlainLanguage,
+  llmEndCoarseToValidateExplanation,
 } = require("../app/web/static/app.js");
 
 test("llmEngineSubtitle", async (t) => {
@@ -239,5 +241,145 @@ test("llmEvidenceLabel", async (t) => {
   await t.test("undefined and non-finite values also read the no-evidence message", () => {
     assert.equal(llmEvidenceLabel(undefined), "No grounded evidence image available");
     assert.equal(llmEvidenceLabel(NaN), "No grounded evidence image available");
+  });
+});
+
+test("llmPassPlainLanguage", async (t) => {
+  await t.test("a pass that never ran reads plainly, without fabricating anything", () => {
+    assert.equal(llmPassPlainLanguage("fine", undefined), "This pass did not run.");
+    assert.equal(llmPassPlainLanguage("fine", null), "This pass did not run.");
+  });
+
+  await t.test("a confirmed coarse pass reports both a start and an end estimate", () => {
+    const text = llmPassPlainLanguage("coarse", {
+      submitted_count: 12,
+      submitted_range_s: [0.0, 26.0],
+      status: "confirmed",
+      start_s: 4.0,
+      end_s: 21.5,
+      confidence: 0.9,
+      reason_codes: [],
+      raw_notes: "",
+    });
+    assert.match(text, /12 frames/);
+    assert.match(text, /0\.0s to 26\.0s/);
+    assert.match(text, /start at t = 4\.0s/);
+    assert.match(text, /end at t = 21\.5s/);
+    assert.match(text, /confidence 0\.90/);
+  });
+
+  await t.test("a confirmed fine pass reports a single start boundary", () => {
+    const text = llmPassPlainLanguage("fine", {
+      submitted_count: 19,
+      submitted_range_s: [2.5, 5.5],
+      status: "confirmed",
+      start_s: 4.0,
+      end_s: 4.0,
+      confidence: 0.9,
+      reason_codes: [],
+      raw_notes: "",
+    });
+    assert.match(text, /a start at t = 4\.0s/);
+    assert.doesNotMatch(text, /end at/);
+  });
+
+  await t.test("a confirmed end-coarse pass reports a candidate break", () => {
+    const text = llmPassPlainLanguage("end_coarse", {
+      submitted_count: 53,
+      submitted_range_s: [4.0, 26.0],
+      status: "confirmed",
+      start_s: 5.5,
+      end_s: 5.5,
+      confidence: 0.9,
+      reason_codes: [],
+      raw_notes: "",
+    });
+    assert.match(text, /a candidate break at t = 5\.5s/);
+  });
+
+  await t.test("a confirmed end-validate pass reports a confirmed break", () => {
+    const text = llmPassPlainLanguage("end_validate", {
+      submitted_count: 19,
+      submitted_range_s: [1.5, 11.5],
+      status: "confirmed",
+      start_s: 5.8,
+      end_s: 5.8,
+      confidence: 0.85,
+      reason_codes: [],
+      raw_notes: "",
+    });
+    assert.match(text, /a confirmed break at t = 5\.8s/);
+  });
+
+  await t.test("an abstained pass names its reason codes instead of a timestamp", () => {
+    const text = llmPassPlainLanguage("end_validate", {
+      submitted_count: 19,
+      submitted_range_s: [1.5, 11.5],
+      status: "abstain",
+      start_s: null,
+      end_s: null,
+      confidence: 0.0,
+      reason_codes: ["no_break_found"],
+      raw_notes: "",
+    });
+    assert.match(text, /did not produce a confident answer/i);
+    assert.match(text, /no_break_found/);
+  });
+
+  await t.test("raw_notes, when present, is appended verbatim", () => {
+    const text = llmPassPlainLanguage("end_validate", {
+      submitted_count: 1,
+      submitted_range_s: [1.0, 1.0],
+      status: "abstain",
+      start_s: null,
+      end_s: null,
+      confidence: 0.0,
+      reason_codes: ["no_break_found"],
+      raw_notes: "no sustained drop observed",
+    });
+    assert.match(text, /no sustained drop observed/);
+  });
+
+  await t.test("a pass with exactly one submitted frame uses the singular", () => {
+    const text = llmPassPlainLanguage("fine", {
+      submitted_count: 1,
+      submitted_range_s: [4.0, 4.0],
+      status: "confirmed",
+      start_s: 4.0,
+      end_s: 4.0,
+      confidence: 0.9,
+      reason_codes: [],
+      raw_notes: "",
+    });
+    assert.match(text, /1 frame spanning/);
+    assert.doesNotMatch(text, /1 frames/);
+  });
+});
+
+test("llmEndCoarseToValidateExplanation", async (t) => {
+  await t.test("connects the candidate to the window built around it", () => {
+    const text = llmEndCoarseToValidateExplanation({
+      end_coarse_candidate_s: 5.5,
+      end_validation_window_s: [1.5, 11.5],
+    });
+    assert.match(text, /5\.5s/);
+    assert.match(text, /1\.5s/);
+    assert.match(text, /11\.5s/);
+  });
+
+  await t.test("returns an empty string when the candidate is missing", () => {
+    assert.equal(
+      llmEndCoarseToValidateExplanation({ end_validation_window_s: [1.5, 11.5] }),
+      ""
+    );
+  });
+
+  await t.test("returns an empty string when the window is missing", () => {
+    assert.equal(llmEndCoarseToValidateExplanation({ end_coarse_candidate_s: 5.5 }), "");
+  });
+
+  await t.test("returns an empty string for a missing/empty derived object", () => {
+    assert.equal(llmEndCoarseToValidateExplanation(undefined), "");
+    assert.equal(llmEndCoarseToValidateExplanation({}), "");
   });
 });

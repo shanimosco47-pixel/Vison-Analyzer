@@ -1993,3 +1993,251 @@ No known limitation remains for requirements #1, #2, or #4. Requirement
 #3's UI half is the static explanation text plus the actual per-run
 range shown inside the Frames-sent-to-AI section - no numeric default
 changed. Per the request: **not merged**, PR #5 stays draft.
+
+## 26. Automatic, durable AI decision audit trail
+
+A second supervisor change request against §25's own work, prompted by a
+real operator complaint after a hands-on run: an end-coarse pass
+nominated an early candidate, the dense validation window built around it
+was consequently too narrow to see the clip's real continuation, and
+there was no way to understand *why* without DevTools or manual JSON
+extraction. Explicit closing test: "for every AI timing result, I must be
+able to answer, from the website itself, what exactly did the AI see, and
+which two submitted frames support the reported start and end" - this
+round extends that to *every* outcome, not only a CONFIRMED one, and
+makes the answer durable across a page refresh and a server restart, not
+just visible while a browser tab happens to still be polling. No change
+to the classical detector, the LLM prompts, or any pipeline/timing
+default - explicitly out of scope, same as §25.
+
+### Two new derived-decision fields, threaded through every outcome
+
+`PipelineOutcome` gained `derived: dict[str, ...]`
+(`pipeline.py`) - `locked_start_s`, `start_evidence_s`,
+`end_coarse_candidate_s`, `end_validation_window_s`, `end_evidence_s` -
+populated the moment each is actually decided inside `run_llm_timing`,
+*not* only inside the final CONFIRMED block (which already had this data
+in `Event.details`, untouched). The validation window in particular is
+recorded the instant `validation_lo`/`validation_hi` are computed, before
+the validation call is even sent - so a run that abstains because that
+window was too narrow, or because the byte budget refused it outright,
+still shows exactly what window the pipeline chose and why. Threaded
+through all nine `PipelineOutcome`/`_abstain_outcome` return sites, the
+same incremental pattern §25's `pass_frames` already established - and in
+threading it, one *pre-existing* gap from that round was closed along the
+way: the "fine window implausibly wide" abstain path
+(`ambiguous_evidence`) had never been passing `pass_verdicts`/`pass_frames`
+through at all, silently dropping the coarse pass's own already-computed
+detail from that one outcome; it now does, matching every other abstain
+path (`tests/test_llm_timing_pipeline.py::test_pipeline_derived_decisions_survive_a_rejected_end_candidate`
+reproduces the operator's exact numbers - candidate 5.5s, window
+[1.5, 11.5]s - and proves both `derived` and `pass_frames`/`pass_verdicts`
+are populated even though the run overall abstains).
+
+### The durable audit record
+
+New `app/services/llm_run_audit.py`:
+
+- `build_audit_record(...)` - a pure function assembling one JSON-safe
+  dict from a run's identity, an optional `PipelineOutcome` (`None` for a
+  run that never reached the pipeline at all, e.g. a credential failure -
+  the record is still built, with empty `passes`/`derived` and whatever
+  `error` says, per "persist safe partial information for ABSTAIN,
+  failure and cancellation too"), and nothing else - it is never given a
+  `VideoRecord`'s real filesystem path, an `EngineConfig.credential_ref`,
+  or a `TimedFrame`'s image bytes, so none of those can appear in its
+  output by construction, not by a redaction pass trying to catch them
+  afterward. Every free-text field (`raw_notes`, the top-level `error`) is
+  still routed through `sanitize_untrusted_text` again at build time as
+  defense in depth, even though both sources already sanitize their own
+  text.
+- `LLMRunAuditStore` - one JSON file per run under
+  `data_dir/llm_run_audits/<run_id>.json`, written atomically
+  (write-to-temp, then rename - same pattern `llm_engine_store.py` already
+  uses). `get(run_id)` validates `run_id` against a strict
+  `[A-Za-z0-9_-]{1,128}` pattern before it ever becomes a path component -
+  "safe run IDs only" is an explicit requirement, and this is the one
+  place a run_id arrives from a URL path parameter.
+  `latest_for_engine(engine_id)` is a plain directory scan (not a
+  maintained index file, which could itself drift out of sync with what's
+  actually on disk) - fine at this application's scale.
+  `purge_before(cutoff_epoch_s)` deletes everything older than the
+  cutoff, and is called from `LLMRunService.purge_expired()` with the
+  *same* `RUN_RETENTION_S` cutoff already applied to the in-memory job
+  map - bounded cleanup tied to the existing retention policy, per the
+  requirement, not a new one.
+
+`LLMRunService` now takes an `AppConfig` (previously just the engine
+store) and builds/saves an audit record on every terminal outcome -
+complete, failed, *and* cancelled, including a run cancelled before it
+ever started (which previously skipped the worker's `try/finally`
+entirely and would have produced no audit at all; fixed by an explicit
+save on that early-return path too). One real ordering bug was caught
+and fixed while wiring this up, by the new integration tests themselves
+racing against it: the first version set `job.status` to its terminal
+value *before* the `finally` block that saved the audit, so a poller
+could see `status: "complete"` and immediately request the audit before
+it existed on disk. Fixed by introducing a `terminal_status` local that
+every branch sets instead of `job.status` directly, saving the audit
+against that value inside `finally`, and only then publishing it onto
+`job.status` - so by the time any caller can observe a terminal status,
+the durable audit is already there.
+
+### HTTP surface
+
+Three additions to `llm_engine_routes.py`:
+
+- `GET /api/llm-runs/<run_id>/audit` - the full record, `Content-Disposition:
+  attachment` set (a plain `fetch()` ignores that header; only a
+  browser-navigated/`<a download>` click respects it - so this one URL
+  serves both the page's own rendering *and* the "Download audit report
+  (JSON)" button, never two endpoints that could drift apart).
+- `GET /api/llm-engines/<engine_id>/latest-audit` - how the page finds
+  "what this engine last did" after a refresh without already knowing a
+  `run_id`.
+- The existing evidence-image endpoint (§25) now falls back to the
+  durable audit's own `derived` timestamps when the in-memory job is gone
+  (restart, or past the 6-hour retention) - previously it 404'd the
+  instant the job left memory even though the image was still derivable
+  from disk; evidence images now stay viewable exactly as long as the
+  audit JSON does.
+
+### UI: "How the AI decided" and the download button
+
+`app.js` gained `buildHowAIDecidedSection(audit)` - one block per pass, in
+run order, in plain language (`llmPassPlainLanguage`), each pass's own
+`raw_notes` appended verbatim, plus (only under "End coarse") a connector
+sentence naming the exact candidate-to-window derivation
+(`llmEndCoarseToValidateExplanation`) - the specific link the requirement
+calls out by name. A pass that never ran reads "This pass did not run.",
+never silently omitted, so an ABSTAIN's chain is exactly as inspectable
+as a CONFIRMED one. `buildAuditDownloadLink(runId)` is a plain
+`<a download>` pointed at the audit endpoint above.
+
+This meant switching the existing Frames-sent-to-AI and evidence-image
+sections (§25) from reading `job.outcome`/`job.start_evidence_s` to
+reading the durable `audit.passes`/`audit.derived` instead - not a
+cosmetic change: it is what makes the *entire* result card, not just the
+new section, render identically whether it just finished live or is
+being restored on page load from `GET /api/llm-engines/<id>/latest-audit`
+(`loadLatestAuditForEngine`, called for every configured engine right
+after `loadLLMEngines()` on every page load). A live run's card still
+gets this data one fetch sooner than before (`fetchLLMAuditAndRender`,
+called once a poll sees a terminal status) rather than reading it
+straight off the poll response - the extra round trip is invisible in
+practice given the ordering fix above, and buys a single source of truth
+for both cases instead of two rendering paths that could disagree.
+
+### Redaction, verified not asserted
+
+Beyond `build_audit_record`'s structural guarantee (§ above), tests in
+`tests/test_llm_run_audit.py` and `tests/test_web_llm_engines.py` prove,
+over the actual HTTP response body, that a secret-shaped string injected
+into a model's own `raw_notes` is redacted (`[redacted]`), that the
+configured engine's env-var name and the word "credential" never appear,
+and that the real uploaded video's filesystem path never appears - not by
+inspecting the code path, but by grepping the actual serialized JSON a
+client would receive.
+
+### Files changed
+
+- `app/analysis/llm_timing/pipeline.py` - `PipelineOutcome.derived` +
+  threading; one pre-existing threading gap fixed (see above).
+- `app/services/llm_run_audit.py` - new: `build_audit_record`,
+  `LLMRunAuditStore`.
+- `app/services/llm_run_service.py` - takes `AppConfig`; builds/persists
+  the audit on every terminal outcome (including cancel-before-start);
+  the `terminal_status` ordering fix; `get_audit`/
+  `get_latest_audit_for_engine`; audit cleanup wired into
+  `purge_expired()`.
+- `app/web/routes.py` - passes `config` into `LLMRunService`.
+- `app/web/llm_engine_routes.py` - `GET /api/llm-runs/<id>/audit`,
+  `GET /api/llm-engines/<id>/latest-audit`; the evidence endpoint's
+  durable-audit fallback.
+- `app/web/static/app.js` - `buildHowAIDecidedSection`,
+  `buildAuditDownloadLink`, `llmPassPlainLanguage`,
+  `llmEndCoarseToValidateExplanation`; Frames-sent-to-AI/evidence sections
+  switched to read from the durable audit; `loadLatestAuditForEngine`/
+  `fetchLLMAuditAndRender`.
+- `app/web/static/styles.css` - `.llm-how-decided*`, `.llm-audit-actions`.
+- `tests/test_llm_timing_pipeline.py`,
+  `tests/test_llm_run_audit.py` (new),
+  `tests/test_web_llm_engines.py`,
+  `tests/test_llm_run_service.py` - new coverage per requirement #7
+  below, plus the `app_config` fixture both LLMRunService test files now
+  share (needed once its constructor takes an `AppConfig`).
+- `tests_js/llm_engines.test.js` - unit tests for the two new pure
+  helpers.
+- `tests_js/playwright/e2e_server.py` - gained a `scenario` argument
+  (`confirmed` default, `wrong_candidate` new) so the same harness can
+  reproduce the operator's exact wrong-result shape deterministically.
+- `tests_js/playwright/llm_flow.test.js` - a second top-level browser
+  test for the wrong-candidate scenario; the first suite's "no console
+  errors" check now excludes the one expected, harmless 404 from
+  `loadLatestAuditForEngine` probing an engine that has never run
+  (matched by URL via Playwright's `msg.location()`, not by the browser's
+  generic message text, so an unrelated real console error still fails
+  the check).
+
+### Regression coverage (requirement #7, one item each)
+
+- **Automatic persistence**: `test_a_completed_run_is_automatically_persisted_and_retrievable`.
+- **Reload after a new app/service instance**: `test_audit_is_readable_from_a_brand_new_service_instance`
+  and `test_audit_store_survives_a_fresh_instance_same_directory` - a
+  second `LLMRunService`/`LLMRunAuditStore` pointed at the same
+  `data_dir` reads what the first wrote; the in-memory job map does not
+  carry over (proven 404ing), the durable audit does.
+- **Exact post-thinning timestamps**: `test_build_audit_record_exact_post_thinning_timestamps_match_pass_frames`.
+- **Per-pass raw_notes/reason/evidence**: `test_build_audit_record_for_a_confirmed_outcome_has_every_pass`.
+- **Candidate -> window derivation**: `test_build_audit_record_for_a_rejected_candidate_still_shows_the_chain`
+  (backend) and the whole second Playwright suite (browser, see below).
+- **Safe partial audits**: `test_build_audit_record_for_a_run_that_never_reached_the_pipeline`,
+  `test_a_missing_credential_failure_still_persists_a_safe_partial_audit`,
+  `test_a_run_cancelled_before_it_starts_still_persists_a_safe_partial_audit`.
+- **Secret/path/image-byte redaction**: `test_build_audit_record_redacts_secret_shaped_text_in_raw_notes_and_error`,
+  `test_build_audit_record_never_carries_image_bytes_credentials_or_paths`,
+  `test_audit_record_over_the_wire_never_carries_credentials_or_the_video_path`.
+- **UI rendering**: JS unit tests for both new pure helpers; the browser
+  suite's "How the AI decided explains the candidate -> window -> abstain
+  chain" step reads the rendered DOM text, not just checks the section
+  exists.
+- **JSON download**: the browser suite's "Download audit report (JSON)"
+  step actually clicks the link, captures the real download via
+  Playwright's `download` event, and parses the saved file to confirm it
+  matches the on-page chain.
+- **Bounded cleanup**: `test_audit_store_purge_before_deletes_old_records_and_keeps_new_ones`,
+  `test_purge_expired_also_removes_the_durable_audit`.
+- **The wrong-candidate shape itself, in the browser**: the second
+  Playwright suite reproduces the operator's exact numbers end to end
+  (candidate 5.5s, window [1.5, 11.5]s, clip continuing to 26s) via a new
+  `wrong_candidate` scenario in `e2e_server.py`, and asserts the rendered
+  "End coarse" and "End validate" paragraphs name the candidate, the
+  window bounds, and the abstain reason - not merely that a section with
+  that heading is present.
+
+### Gates
+
+`pytest` - 604 passed (up from 578; +26: 2 new in
+`test_llm_timing_pipeline.py` for `derived` and the wrong-candidate
+chain, 18 in the new `test_llm_run_audit.py`, 6 new in
+`test_web_llm_engines.py`'s `TestLLMRunAudit`, the rest mechanical
+fixture-sharing changes, not new behavior). `ruff check .` /
+`ruff format --check .` - clean (one file reformatted along the way).
+`mypy app` - clean except the same pre-existing, unrelated
+`app/web/routes.py:273` finding noted since §11 (still present with this
+round's changes stashed out). `node --test tests_js/*.test.js` - 96/96
+(up from 82; +14 for the two new pure helpers). Browser suite - two
+top-level tests, 19 subtests total, all passing: the original confirmed-
+flow suite (now also proving the durable-audit-driven rendering matches
+the old job-driven one) plus the new wrong-candidate suite. Screenshots
+at 1280px and 375px were captured and visually inspected for both
+scenarios - the "How the AI decided" section stays legible and correctly
+collapsed/expandable at both widths; a dedicated screenshot of the
+expanded wrong-candidate explanation was also inspected directly (not
+committed - regenerable by re-running the suite).
+
+No real-provider smoke test was possible from this sandbox (no vendor
+SDK installed, no API key here) - the same limitation noted in every
+prior round. No known limitation remains for any of the seven numbered
+requirements in the request. Per the request: **not merged**, PR #5
+stays draft.

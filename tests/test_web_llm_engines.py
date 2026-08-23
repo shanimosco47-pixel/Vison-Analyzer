@@ -536,3 +536,106 @@ class TestLLMModelOptions:
         # the allowlist tests in test_llm_engine_store.py; here we just
         # confirm the wire shape.
         assert all(isinstance(models, list) and models for models in body.values())
+
+
+class TestLLMRunAudit:
+    """The durable audit trail's HTTP surface: fetching one run's record,
+    finding an engine's latest one, the download's Content-Disposition
+    header, and that the evidence-image endpoint keeps working from the
+    durable record after the in-memory job is gone (simulating a server
+    restart without actually restarting the process)."""
+
+    def _run_a_confirmed_engine(self, app, client, zahn_video, monkeypatch):
+        video = upload(client, zahn_video.path).get_json()
+        engine = client.post(
+            "/api/llm-engines",
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "display_name": "Audit Test Engine",
+                "env_var": "OPENAI_API_KEY",
+            },
+        ).get_json()
+        monkeypatch.setattr(
+            app.extensions["llm_engine_store"],
+            "build_provider",
+            lambda e: _confirmed_stub_provider(),
+        )
+        started = client.post(
+            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+        ).get_json()
+        _wait_for_run(client, started["run_id"])
+        return engine, started["run_id"]
+
+    def test_audit_endpoint_returns_the_full_record(self, app, client, zahn_video, monkeypatch):
+        engine, run_id = self._run_a_confirmed_engine(app, client, zahn_video, monkeypatch)
+
+        response = client.get(f"/api/llm-runs/{run_id}/audit")
+
+        assert response.status_code == 200
+        assert "attachment" in response.headers.get("Content-Disposition", "")
+        assert run_id in response.headers["Content-Disposition"]
+        body = response.get_json()
+        assert body["run_id"] == run_id
+        assert body["engine_id"] == engine["engine_id"]
+        assert set(body["passes"]) == {"coarse", "fine", "end_coarse", "end_validate"}
+        assert body["final_verdict"]["status"] == "confirmed"
+        assert body["derived"]["locked_start_s"] is not None
+
+    def test_audit_endpoint_is_404_for_an_unknown_run(self, client):
+        response = client.get("/api/llm-runs/no-such-run/audit")
+        assert response.status_code == 404
+
+    def test_latest_audit_for_engine_endpoint(self, app, client, zahn_video, monkeypatch):
+        engine, run_id = self._run_a_confirmed_engine(app, client, zahn_video, monkeypatch)
+
+        response = client.get(f"/api/llm-engines/{engine['engine_id']}/latest-audit")
+
+        assert response.status_code == 200
+        assert response.get_json()["run_id"] == run_id
+
+    def test_latest_audit_for_engine_endpoint_404s_before_any_run(self, client):
+        engine = client.post(
+            "/api/llm-engines",
+            json={
+                "provider_name": "openai",
+                "model_id": "gpt-4.1-mini",
+                "env_var": "OPENAI_API_KEY",
+            },
+        ).get_json()
+        response = client.get(f"/api/llm-engines/{engine['engine_id']}/latest-audit")
+        assert response.status_code == 404
+
+    def test_evidence_endpoint_falls_back_to_the_durable_audit_after_the_job_is_forgotten(
+        self, app, client, zahn_video, monkeypatch
+    ):
+        """Simulates the in-memory job map being gone (server restart, or
+        past the 6-hour retention window) without actually restarting the
+        process: the evidence image must still be servable purely from
+        the durable audit record on disk."""
+        engine, run_id = self._run_a_confirmed_engine(app, client, zahn_video, monkeypatch)
+
+        # Confirm both boundaries work while the job is still in memory,
+        # then forget it and confirm they still work from disk alone.
+        assert client.get(f"/api/llm-runs/{run_id}/evidence/start").status_code == 200
+        app.extensions["llm_run_service"]._jobs.pop(run_id, None)
+
+        for boundary in ("start", "end"):
+            response = client.get(f"/api/llm-runs/{run_id}/evidence/{boundary}")
+            assert response.status_code == 200
+            assert response.mimetype == "image/jpeg"
+            assert len(response.data) > 0
+
+    def test_audit_record_over_the_wire_never_carries_credentials_or_the_video_path(
+        self, app, client, zahn_video, monkeypatch
+    ):
+        _engine, run_id = self._run_a_confirmed_engine(app, client, zahn_video, monkeypatch)
+
+        response = client.get(f"/api/llm-runs/{run_id}/audit")
+        raw_body = response.get_data(as_text=True)
+
+        assert str(zahn_video.path) not in raw_body
+        assert "credential" not in raw_body.lower()
+        assert "secret:" not in raw_body
+        assert "OPENAI_API_KEY" not in raw_body
+        assert "api_key" not in raw_body.lower()

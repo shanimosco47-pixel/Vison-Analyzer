@@ -28,13 +28,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..analysis.llm_timing.engine_config import EngineConfig
-from ..analysis.llm_timing.pipeline import PipelineConfig, run_llm_timing
+from ..analysis.llm_timing.pipeline import PipelineConfig, PipelineOutcome, run_llm_timing
 from ..analysis.llm_timing.prompts import PROMPT_V1, PROMPT_V1_ID
 from ..analysis.llm_timing.redaction import sanitize_untrusted_text
 from ..analysis.llm_timing.schema import TimingStatus
+from ..config import AppConfig
 from ..errors import AnalyzerError, NotFoundError
 from ..logging_setup import get_logger
 from .llm_engine_store import LLMEngineStore
+from .llm_run_audit import LLMRunAuditStore, build_audit_record
 from .storage import VideoRecord
 
 logger = get_logger(__name__)
@@ -139,10 +141,12 @@ class LLMRunService:
     def __init__(
         self,
         engine_store: LLMEngineStore,
+        config: AppConfig,
         *,
         sweep_interval_s: float = RETENTION_SWEEP_INTERVAL_S,
     ) -> None:
         self._engine_store = engine_store
+        self._audit_store = LLMRunAuditStore(config.data_dir)
         self._jobs: dict[str, LLMRunJob] = {}
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(
@@ -186,6 +190,24 @@ class LLMRunService:
             raise NotFoundError("That run is no longer available. Please run it again.")
         return job
 
+    def get_audit(self, run_id: str) -> dict[str, Any]:
+        """The durable audit record for ``run_id`` - unlike :meth:`get`,
+        readable after a page refresh or a server restart, since it comes
+        from disk (``LLMRunAuditStore``), not the in-memory job map."""
+        record = self._audit_store.get(run_id)
+        if record is None:
+            raise NotFoundError("No audit record is available for that run.")
+        return record
+
+    def get_latest_audit_for_engine(self, engine_id: str) -> dict[str, Any]:
+        """The most recently finished run's audit record for ``engine_id``
+        - how a reader finds "the last thing this engine did" after a
+        refresh/restart without already knowing a ``run_id``."""
+        record = self._audit_store.latest_for_engine(engine_id)
+        if record is None:
+            raise NotFoundError("No run has finished yet for that engine.")
+        return record
+
     def cancel(self, run_id: str) -> LLMRunJob:
         """Request cancellation. Honest about what this can and can't stop:
         cancellation is checked cooperatively, only *between* pipeline
@@ -222,6 +244,14 @@ class LLMRunService:
             ]
             for run_id in expired:
                 self._jobs.pop(run_id, None)
+        # Bounded cleanup for the durable audit store, tied to the same
+        # retention cutoff as the in-memory job map above - supervisor
+        # requirement: storage must not grow forever. A run's on-disk audit
+        # can outlive its in-memory LLMRunJob (that is the whole point of
+        # persisting it - see LLMRunAuditStore's own docstring), so this is
+        # a second, independent sweep against the same cutoff, not a
+        # by-product of the loop above.
+        self._audit_store.purge_before(cutoff)
         return len(expired)
 
     # -- retention --------------------------------------------------------- #
@@ -244,6 +274,11 @@ class LLMRunService:
 
     def _run_job(self, job: LLMRunJob, record: VideoRecord, engine: EngineConfig) -> None:
         if job.cancelled:
+            # cancel() already finalized this job (status/finished_at) while
+            # it was still queued - persist that safe partial audit here,
+            # since this early return skips the try/finally below that
+            # would otherwise do it.
+            self._save_audit(job, None, status=job.status)
             return
         job.status = "running"
         job.started_at = time.time()
@@ -256,6 +291,15 @@ class LLMRunService:
             job.stage = stage
             job.message = _STAGE_MESSAGES.get(stage, stage)
 
+        # job.status is deliberately NOT set to its terminal value inline
+        # below (unlike stage/message/error, which are only ever polled
+        # alongside status and are harmless to update early) - it is set
+        # once, at the very end, only after the durable audit has actually
+        # been written. Otherwise a poller could see status="complete" and
+        # immediately fetch this run's audit before _save_audit has run,
+        # a real race a first version of this method had.
+        outcome: PipelineOutcome | None = None
+        terminal_status: str | None = None
         try:
             if job.cancelled:
                 raise RunCancelled()
@@ -276,7 +320,7 @@ class LLMRunService:
             )
             job.outcome_dict = outcome.to_dict()
             job.event_dict = outcome.event.to_dict() if outcome.event is not None else None
-            job.status = "complete"
+            terminal_status = "complete"
             job.stage = "complete"
             job.message = _completion_message(outcome.verdict)
             logger.info(
@@ -286,18 +330,18 @@ class LLMRunService:
                 outcome.verdict.status.value,
             )
         except RunCancelled:
-            job.status = "cancelled"
+            terminal_status = "cancelled"
             job.stage = "cancelled"
             job.message = "Run cancelled"
             logger.info("LLM run %s cancelled by the user", job.run_id)
         except AnalyzerError as exc:
-            job.status = "failed"
+            terminal_status = "failed"
             job.error = exc.user_message
             job.stage = "failed"
             job.message = exc.user_message
             logger.error("LLM run %s failed: %s (%s)", job.run_id, exc.user_message, exc.detail)
         except Exception as exc:  # noqa: BLE001 - last line of defence for the worker
-            job.status = "failed"
+            terminal_status = "failed"
             job.error = (
                 "The run stopped because of an unexpected internal error. "
                 "The technical details are in the server log."
@@ -313,6 +357,40 @@ class LLMRunService:
         finally:
             job.finished_at = time.time()
             record.touch()
+            if terminal_status is not None:
+                self._save_audit(job, outcome, status=terminal_status)
+                job.status = terminal_status
+
+    def _save_audit(self, job: LLMRunJob, outcome: PipelineOutcome | None, *, status: str) -> None:
+        """Persist this run's durable audit record. Wrapped in its own
+        try/except: a disk error here (full disk, permissions) must never
+        mask the run's real outcome or crash the worker - the in-memory
+        job (and its response to the browser) is unaffected either way,
+        the durable copy is simply missing for this one run.
+
+        Takes ``status`` explicitly rather than reading ``job.status``: the
+        caller in ``_run_job`` calls this *before* publishing the terminal
+        status onto ``job`` (see that method's own comment), and the
+        already-finalized ``job.status`` is what the early-cancelled path
+        below passes instead."""
+        try:
+            audit = build_audit_record(
+                run_id=job.run_id,
+                video_id=job.video_id,
+                engine_id=job.engine_id,
+                engine_display_name=job.engine_display_name,
+                provider_name=job.provider_name,
+                model_id=job.model_id,
+                status=status,
+                created_at=job.created_at,
+                started_at=job.started_at,
+                finished_at=job.finished_at,
+                error=job.error,
+                outcome=outcome,
+            )
+            self._audit_store.save(audit)
+        except Exception:  # noqa: BLE001 - persistence must never crash the worker
+            logger.exception("Failed to persist the audit record for LLM run %s", job.run_id)
 
 
 def _completion_message(verdict) -> str:

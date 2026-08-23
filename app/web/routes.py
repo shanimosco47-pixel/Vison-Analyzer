@@ -240,7 +240,7 @@ def create_app(config: AppConfig | None = None) -> Flask:
 
     secret_store = SecretStore()
     engine_store = LLMEngineStore(config, secret_store)
-    llm_run_service = LLMRunService(engine_store)
+    llm_run_service = LLMRunService(engine_store, config)
 
     app.extensions["app_config"] = config
     app.extensions["video_store"] = store

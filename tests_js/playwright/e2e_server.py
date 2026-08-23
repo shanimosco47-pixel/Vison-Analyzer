@@ -17,7 +17,13 @@ Also writes a small synthetic video into the same throwaway directory so
 the browser test can upload a real, valid file without committing a binary
 fixture to the repository.
 
-Usage: ``python e2e_server.py``. Prints exactly one line to stdout once
+Usage: ``python e2e_server.py [scenario]``, where ``scenario`` is
+``confirmed`` (default) or ``wrong_candidate`` - the latter reproduces the
+exact wrong-result shape a real operator reported (an end-coarse pass
+nominating a too-early candidate, whose own dense validation window is
+consequently too narrow to see the clip's actual continuation), so the
+browser suite can prove the "How the AI decided" section explains that
+chain, not just the happy path. Prints exactly one line to stdout once
 ready:
 
     LISTENING <port> <video_path>
@@ -70,7 +76,7 @@ def _make_video(path: Path) -> None:
     writer.release()
 
 
-def _stub_respond(request: ProviderRequest) -> RawProviderResponse:
+def _confirmed_respond(request: ProviderRequest) -> RawProviderResponse:
     """Deterministic CONFIRMED result for every pass - mirrors
     ``tests/test_llm_run_service.py``'s ``_confirmed_stub_provider``, a
     recipe already proven to reach a CONFIRMED verdict through the real
@@ -87,7 +93,47 @@ def _stub_respond(request: ProviderRequest) -> RawProviderResponse:
     return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
 
 
+def _wrong_candidate_respond(request: ProviderRequest) -> RawProviderResponse:
+    """The exact wrong-result shape a real operator reported: end-coarse
+    nominates a too-early candidate (5.5s); the dense validation window
+    the pipeline builds around it is consequently only [1.5, 11.5]s even
+    though the clip (26s here) continues well past that - and the
+    validation pass, seeing no sustained break in that narrow window,
+    abstains. Same numbers as
+    tests/test_llm_timing_pipeline.py::test_pipeline_derived_decisions_survive_a_rejected_end_candidate,
+    so the browser-level assertions and the pipeline-level ones describe
+    the same scenario."""
+    candidate_s = 5.5
+    if request.pass_name == "coarse":
+        return canned_json_response(start_s=1.0, end_s=candidate_s, confidence=0.9)
+    if request.pass_name == "fine":
+        return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
+    if request.pass_name == "end_coarse":
+        return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
+    assert request.pass_name == "end_validate"
+    return RawProviderResponse(
+        model_id="stub-model",
+        raw_text=(
+            '{"status": "abstain", "reason_codes": ["no_break_found"], '
+            '"raw_notes": "no sustained drop observed in this window - the clip may '
+            'continue past what was checked here"}'
+        ),
+        latency_s=0.01,
+    )
+
+
+_SCENARIOS = {
+    "confirmed": _confirmed_respond,
+    "wrong_candidate": _wrong_candidate_respond,
+}
+
+
 def main() -> None:
+    scenario_name = sys.argv[1] if len(sys.argv) > 1 else "confirmed"
+    if scenario_name not in _SCENARIOS:
+        raise SystemExit(f"Unknown scenario {scenario_name!r} - choose one of {list(_SCENARIOS)}")
+    respond = _SCENARIOS[scenario_name]
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="llm-e2e-"))
     video_path = tmp_dir / "sample.mp4"
     _make_video(video_path)
@@ -99,7 +145,7 @@ def main() -> None:
     # process's life, including the one create_app() built for itself -
     # so every engine configured through the UI runs against the stub,
     # regardless of which provider/model the browser test picks.
-    LLMEngineStore.build_provider = lambda self, engine: StubTimingProvider(_stub_respond)
+    LLMEngineStore.build_provider = lambda self, engine: StubTimingProvider(respond)
 
     server = make_server("127.0.0.1", 0, app)
     port = server.server_port

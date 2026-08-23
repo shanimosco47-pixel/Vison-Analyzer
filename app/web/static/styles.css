@@ -291,3 +291,12 @@ pre { background: #f7f8fa; border: 1px solid var(--line); border-radius: 6px; pa
   position: absolute; left: 0.4rem; bottom: 0.4rem; background: rgba(0, 0, 0, 0.65); color: #fff;
   font-size: 0.78rem; padding: 0.1rem 0.4rem; border-radius: 4px; font-variant-numeric: tabular-nums;
 }
+
+.llm-how-decided { margin-top: 0.85rem; border: 1px solid var(--line); border-radius: 6px; padding: 0.6rem 0.85rem; }
+.llm-how-decided summary { cursor: pointer; font-weight: 600; }
+.llm-how-decided-pass { margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--line); }
+.llm-how-decided-pass:first-of-type { margin-top: 0.6rem; padding-top: 0; border-top: none; }
+.llm-how-decided-pass h5 { margin: 0 0 0.3rem; font-size: 0.9rem; }
+.llm-how-decided-pass p { margin: 0.25rem 0 0; font-size: 0.88rem; line-height: 1.4; }
+
+.llm-audit-actions { margin-top: 0.75rem; }

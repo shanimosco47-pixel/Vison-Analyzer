@@ -71,9 +71,9 @@ const SCREENSHOT_DIR = path.join(os.tmpdir(), "llm-e2e-screenshots");
 const STARTUP_TIMEOUT_MS = 45000;
 const RUN_TIMEOUT_MS = 30000;
 
-function startServer() {
+function startServer(scenario = "confirmed") {
   return new Promise((resolve, reject) => {
-    const proc = spawn("python", [SERVER_SCRIPT], { cwd: REPO_ROOT });
+    const proc = spawn("python", [SERVER_SCRIPT, scenario], { cwd: REPO_ROOT });
     let stdoutBuf = "";
     let stderrBuf = "";
     let settled = false;
@@ -137,9 +137,17 @@ test("Experimental LLM analysis - full browser flow against a stub provider", as
 
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
   page.on("console", (msg) => {
-    if (msg.type() === "error") consoleErrors.push(msg.text());
+    if (msg.type() === "error") {
+      // location().url is the failed resource's own URL for a browser-
+      // generated "Failed to load resource" line (confirmed empirically -
+      // Chromium reports the resource, not the calling script, for this
+      // message type), which is what lets the final assertion tell an
+      // expected 404 probe apart from a real console error by URL rather
+      // than by matching brittle, generic message text.
+      consoleErrors.push({ text: msg.text(), url: msg.location().url });
+    }
   });
-  page.on("pageerror", (err) => consoleErrors.push(String(err)));
+  page.on("pageerror", (err) => consoleErrors.push({ text: String(err), url: "" }));
   page.on("response", (response) => {
     if (response.status() >= 400) {
       badResponses.push(`${response.status()} ${response.url()}`);
@@ -324,7 +332,144 @@ test("Experimental LLM analysis - full browser flow against a stub provider", as
   });
 
   await t.test("no console errors or broken network requests occurred", () => {
-    assert.deepEqual(consoleErrors, [], `console errors: ${consoleErrors.join(" | ")}`);
-    assert.deepEqual(badResponses, [], `failed requests: ${badResponses.join(" | ")}`);
+    // The one expected exception: loadLatestAuditForEngine() deliberately
+    // probes GET /api/llm-engines/<id>/latest-audit for every configured
+    // engine on load, and a 404 (never run yet) is a normal, handled
+    // outcome - not a bug - so it (and the console line Chromium logs for
+    // any 4xx/5xx response, regardless of whether the page handled it)
+    // is excluded here by URL, the same way a real operator would ignore
+    // it rather than by matching the browser's generic, unrelated-looking
+    // message text.
+    const isExpectedLatestAuditProbe = (url) => /\/llm-engines\/[^/]+\/latest-audit$/.test(url);
+    const unexpectedBadResponses = badResponses.filter((entry) => {
+      const [status, url] = entry.split(" ", 2);
+      return !(status === "404" && isExpectedLatestAuditProbe(url));
+    });
+    const unexpectedConsoleErrors = consoleErrors.filter(
+      (entry) => !isExpectedLatestAuditProbe(entry.url)
+    );
+    assert.deepEqual(
+      unexpectedConsoleErrors,
+      [],
+      `console errors: ${unexpectedConsoleErrors.map((e) => e.text).join(" | ")}`
+    );
+    assert.deepEqual(
+      unexpectedBadResponses,
+      [],
+      `failed requests: ${unexpectedBadResponses.join(" | ")}`
+    );
+  });
+});
+
+test("Experimental LLM analysis - the wrong-candidate audit trail explains itself", async (t) => {
+  // The exact shape a real operator reported: end-coarse nominates a
+  // too-early candidate (5.5s), so the dense validation window built
+  // around it ([1.5, 11.5]s) never sees the clip's actual continuation
+  // past 17s, and the run abstains. This proves the "How the AI decided"
+  // section - not just the pipeline/audit-builder layer already covered
+  // by test_pipeline_derived_decisions_survive_a_rejected_end_candidate
+  // and test_build_audit_record_for_a_rejected_candidate_still_shows_the_chain
+  // - actually explains that chain on the page itself, without DevTools.
+  const { proc: serverProc, port, videoPath } = await startServer("wrong_candidate");
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  const browser = await chromium.launch({ headless: true });
+  t.after(async () => {
+    await browser.close().catch(() => {});
+    serverProc.kill();
+  });
+
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+
+  await t.test("run the engine and reach an honest ABSTAIN, not a fabricated result", async () => {
+    await page.goto(baseUrl, { waitUntil: "load" });
+    await page.setInputFiles("#file-input", videoPath);
+    await page.waitForSelector("#video-details:not(.hidden)", { timeout: 15000 });
+
+    await page.click("#llm-add-engine");
+    await page.waitForSelector("#llm-engine-form:not(.hidden)");
+    await page.fill("#llm-engine-display-name", "Wrong Candidate Engine");
+    await page.selectOption("#llm-engine-provider", "openai");
+    await page.waitForFunction(
+      () => document.querySelector("#llm-engine-model-id").options.length > 0
+    );
+    await page.check('input[name="llm-credential-mode"][value="env_var"]');
+    await page.fill("#llm-engine-env-var", "STUB_ENV_VAR_NOT_ACTUALLY_USED");
+    await page.click("#llm-engine-save");
+    await page.waitForSelector("#llm-engine-form", { state: "hidden" });
+
+    await page.click(".llm-run-btn");
+    await page.waitForSelector(".llm-result:not(.hidden)", { timeout: RUN_TIMEOUT_MS });
+    await page.waitForSelector(".llm-how-decided", { timeout: 10000 });
+
+    const badgeTexts = await page.$$eval(".llm-result .badge", (els) =>
+      els.map((el) => el.textContent)
+    );
+    assert.ok(
+      badgeTexts.some((t) => /abstain/i.test(t)),
+      `expected an Abstained badge, got: ${badgeTexts.join(", ")}`
+    );
+    // Never a fabricated evidence image for a run that didn't confirm.
+    assert.equal(await page.$$(".llm-evidence-image").then((els) => els.length), 0);
+  });
+
+  await t.test("Frames sent to AI still shows the end-coarse and end-validate ranges", async () => {
+    await page.click(".llm-frames-sent > summary");
+    const rows = await page.$eval(".llm-frames-sent .details-grid", (dl) => {
+      const dts = Array.from(dl.querySelectorAll("dt")).map((el) => el.textContent);
+      const dds = Array.from(dl.querySelectorAll("dd")).map(
+        (el) => el.childNodes[0] && el.childNodes[0].textContent
+      );
+      return Object.fromEntries(dts.map((label, i) => [label, dds[i]]));
+    });
+    assert.notEqual(rows["End coarse"], "Not run");
+    assert.notEqual(rows["End validate"], "Not run");
+    assert.match(rows["End validate"], /1\.5s to 11\.5s/);
+  });
+
+  await t.test("How the AI decided explains the candidate -> window -> abstain chain", async () => {
+    await page.click(".llm-how-decided > summary");
+    const paragraphs = await page.$$eval(".llm-how-decided-pass", (blocks) =>
+      blocks.map((block) => ({
+        heading: block.querySelector("h5").textContent,
+        text: Array.from(block.querySelectorAll("p"))
+          .map((p) => p.textContent)
+          .join(" "),
+      }))
+    );
+
+    const endCoarse = paragraphs.find((p) => p.heading === "End coarse");
+    assert.ok(endCoarse, "no End coarse block found");
+    assert.match(endCoarse.text, /candidate break at t = 5\.5s/);
+    assert.match(endCoarse.text, /1\.5s/);
+    assert.match(endCoarse.text, /11\.5s/);
+
+    const endValidate = paragraphs.find((p) => p.heading === "End validate");
+    assert.ok(endValidate, "no End validate block found");
+    assert.match(endValidate.text, /did not produce a confident answer/i);
+    assert.match(endValidate.text, /no_break_found/);
+    assert.match(endValidate.text, /no sustained drop observed/);
+  });
+
+  await t.test("Download audit report (JSON) produces the same chain as a file", async () => {
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      page.click(".llm-audit-actions a"),
+    ]);
+    assert.match(download.suggestedFilename(), /^llm-run-.+-audit\.json$/);
+    const downloadPath = await download.path();
+    const audit = JSON.parse(fs.readFileSync(downloadPath, "utf8"));
+    assert.equal(audit["final_verdict"]["status"], "abstain");
+    assert.equal(audit["derived"]["end_coarse_candidate_s"], 5.5);
+    assert.deepEqual(audit["derived"]["end_validation_window_s"], [1.5, 11.5]);
+  });
+
+  await t.test("a page refresh restores the same explanation from the durable audit", async () => {
+    await page.reload({ waitUntil: "load" });
+    await page.waitForSelector(".llm-how-decided", { timeout: 10000 });
+    const badgeTexts = await page.$$eval(".llm-result .badge", (els) =>
+      els.map((el) => el.textContent)
+    );
+    assert.ok(badgeTexts.some((t) => /abstain/i.test(t)));
   });
 });

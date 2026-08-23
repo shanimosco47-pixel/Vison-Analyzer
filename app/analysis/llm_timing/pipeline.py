@@ -254,6 +254,24 @@ class PipelineOutcome:
     silently misrepresent a thinned/sparse request as a continuous range
     (see diagnostics/llm_spike/DESIGN.md). Only timestamps - never image
     bytes."""
+    derived: dict[str, float | list[float] | None] = field(default_factory=dict)
+    """The pipeline's own intermediate decisions, recorded as they are made
+    - *not* only when the run ends CONFIRMED. Keys, populated incrementally
+    (absent until the step that produces them runs): ``locked_start_s``/
+    ``locked_start_uncertainty_s`` (the fine pass's confirmed start),
+    ``start_evidence_s`` (the grounded evidence frame behind it),
+    ``end_coarse_candidate_s`` (the sparse end-coarse pass's nominated
+    break), ``end_validation_window_s`` (the ``[lo, hi]`` dense window built
+    around that candidate - recorded the moment it is *decided*, even if
+    the request that window implies never fits the byte budget or the
+    validation pass rejects it), and ``end_evidence_s`` (the grounded
+    evidence frame behind the validated end). Supervisor-directed audit
+    requirement: a wrong or abstained result must still let a reader
+    reconstruct the chain "sparse frames -> candidate -> validation window
+    -> final result" from this one outcome, not only a CONFIRMED one -
+    ``Event.details`` (CONFIRMED-only, pre-existing) duplicates a few of
+    these keys for its own established consumers; this field is the one
+    that is populated regardless of how the run ends."""
 
     @property
     def total_retries(self) -> int:
@@ -359,6 +377,7 @@ class PipelineOutcome:
             "pricing_table_version": PRICING_TABLE_VERSION,
             "pass_verdicts": {name: v.to_dict() for name, v in self.pass_verdicts.items()},
             "pass_frames": {name: list(times) for name, times in self.pass_frames.items()},
+            "derived": dict(self.derived),
         }
 
 
@@ -800,6 +819,7 @@ def _abstain_outcome(
     *,
     pass_verdicts: dict[str, TimingVerdict] | None = None,
     pass_frames: dict[str, tuple[float, ...]] | None = None,
+    derived: dict[str, float | list[float] | None] | None = None,
 ) -> PipelineOutcome:
     return PipelineOutcome(
         verdict=verdict,
@@ -808,6 +828,7 @@ def _abstain_outcome(
         fine_response=None,
         pass_verdicts=dict(pass_verdicts) if pass_verdicts else {},
         pass_frames=dict(pass_frames) if pass_frames else {},
+        derived=dict(derived) if derived else {},
     )
 
 
@@ -864,6 +885,7 @@ def run_llm_timing(
     cfg.validate()
     pass_verdicts: dict[str, TimingVerdict] = {}
     pass_frames: dict[str, tuple[float, ...]] = {}
+    derived: dict[str, float | list[float] | None] = {}
 
     with VideoReader(video_path, video_info).open() as reader:
         duration_s = reader.info.duration_s
@@ -936,6 +958,7 @@ def run_llm_timing(
                 coarse_response,
                 pass_verdicts=pass_verdicts,
                 pass_frames=pass_frames,
+                derived=derived,
             )
 
         assert coarse_verdict.start_s is not None and coarse_verdict.end_s is not None
@@ -968,7 +991,13 @@ def run_llm_timing(
                     f"start_s={coarse_verdict.start_s}"
                 ),
             )
-            return _abstain_outcome(abstain, coarse_response)
+            return _abstain_outcome(
+                abstain,
+                coarse_response,
+                pass_verdicts=pass_verdicts,
+                pass_frames=pass_frames,
+                derived=derived,
+            )
 
         fps = reader.info.fps
         fine_step_s = 1.0 / fps
@@ -1001,6 +1030,7 @@ def run_llm_timing(
                 fine_response=_unsent_response(abstain.raw_notes),
                 pass_verdicts=dict(pass_verdicts),
                 pass_frames=dict(pass_frames),
+                derived=dict(derived),
             )
 
         fine_request = ProviderRequest(
@@ -1043,6 +1073,7 @@ def run_llm_timing(
                 fine_response=fine_response,
                 pass_verdicts=dict(pass_verdicts),
                 pass_frames=dict(pass_frames),
+                derived=dict(derived),
             )
 
         # The end is nominated by ONE whole-clip (post-start), sparsely
@@ -1079,6 +1110,11 @@ def run_llm_timing(
         locked_start_s: float = fine_verdict.start_s
         locked_start_uncertainty_s = fine_verdict.start_uncertainty_s
         start_side_evidence = fine_verdict.evidence_frame_timestamps_s
+        derived["locked_start_s"] = locked_start_s
+        derived["locked_start_uncertainty_s"] = locked_start_uncertainty_s
+        derived["start_evidence_s"] = _nearest_grounded_evidence_ts(
+            start_side_evidence, pass_frames.get("fine", ()), locked_start_s
+        )
 
         scan_from_s = min(max(start_hi, locked_start_s), duration_s)
 
@@ -1113,6 +1149,7 @@ def run_llm_timing(
                 fine_response=fine_response,
                 pass_verdicts=dict(pass_verdicts),
                 pass_frames=dict(pass_frames),
+                derived=dict(derived),
             )
 
         end_coarse_request = ProviderRequest(
@@ -1152,6 +1189,7 @@ def run_llm_timing(
                 end_coarse_response=end_coarse_response,
                 pass_verdicts=dict(pass_verdicts),
                 pass_frames=dict(pass_frames),
+                derived=dict(derived),
             )
 
         # A sparse coarse candidate is never trusted on its own - it must
@@ -1162,6 +1200,7 @@ def run_llm_timing(
         # diagnostics/llm_spike/DESIGN.md).
         assert end_coarse_verdict.end_s is not None
         candidate_ts = end_coarse_verdict.end_s
+        derived["end_coarse_candidate_s"] = candidate_ts
 
         # The dense validation window is a WIDE, coherent region around the
         # sparse candidate, not a narrow point-anchored one: three
@@ -1179,6 +1218,7 @@ def run_llm_timing(
         # diagnostics/llm_spike/DESIGN.md).
         validation_lo = max(locked_start_s, candidate_ts - cfg.end_validation_pre_s)
         validation_hi = min(duration_s, candidate_ts + cfg.end_validation_post_s)
+        derived["end_validation_window_s"] = [validation_lo, validation_hi]
         validation_frames = _build_validation_frames(
             reader,
             candidate_ts=candidate_ts,
@@ -1208,6 +1248,7 @@ def run_llm_timing(
                 end_coarse_response=end_coarse_response,
                 pass_verdicts=dict(pass_verdicts),
                 pass_frames=dict(pass_frames),
+                derived=dict(derived),
             )
 
         validation_request = ProviderRequest(
@@ -1263,6 +1304,15 @@ def run_llm_timing(
                     f"evidence follows it (window ends at t={validation_hi:.2f}s)",
                 )
         pass_verdicts["end_validate"] = validation_verdict
+        # Computed regardless of whether validation confirmed - even a
+        # rejected/abstained candidate should show which cited evidence (if
+        # any) was closest to it, per the same "never fabricate, but always
+        # show what's known" rule _nearest_grounded_evidence_ts follows.
+        derived["end_evidence_s"] = _nearest_grounded_evidence_ts(
+            validation_verdict.evidence_frame_timestamps_s,
+            pass_frames.get("end_validate", ()),
+            validation_verdict.end_s if validation_verdict.end_s is not None else candidate_ts,
+        )
         if validation_verdict.status is not TimingStatus.CONFIRMED:
             # Rejected (trend didn't hold) or couldn't be validated at all
             # (insufficient future context, ambiguous, malformed, or
@@ -1278,6 +1328,7 @@ def run_llm_timing(
                 end_validation_response=validation_response,
                 pass_verdicts=dict(pass_verdicts),
                 pass_frames=dict(pass_frames),
+                derived=dict(derived),
             )
 
         # Report the dense validation pass's own (possibly refined) onset,
@@ -1375,4 +1426,5 @@ def run_llm_timing(
             end_validation_response=validation_response,
             pass_verdicts=dict(pass_verdicts),
             pass_frames=dict(pass_frames),
+            derived=dict(derived),
         )

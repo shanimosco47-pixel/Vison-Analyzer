@@ -157,21 +157,66 @@ def llm_run_evidence_frame(run_id: str, boundary: str) -> Response:
     was an explicit supervisor requirement (see
     diagnostics/llm_spike/DESIGN.md). 404s - never a fabricated image -
     when the run has no grounded evidence for this boundary at all
-    (abstained, failed, or the deciding pass cited none)."""
+    (abstained, failed, or the deciding pass cited none).
+
+    Falls back to the durable audit record (``llm_run_audit.py``) when the
+    in-memory job is gone (server restart, or past its 6-hour retention) -
+    so a past result's evidence images stay viewable exactly as long as
+    its audit JSON does, not only while the job happens to still be in
+    memory."""
     if boundary not in ("start", "end"):
         raise AnalyzerError("Unknown evidence boundary - expected 'start' or 'end'.")
 
-    job = _llm_run_service().get(run_id)
-    timestamp_s = job.start_evidence_s if boundary == "start" else job.end_evidence_s
+    timestamp_s, video_id = _evidence_timestamp_and_video(run_id, boundary)
     if timestamp_s is None:
         raise NotFoundError("No grounded evidence image is available for this run.")
 
-    record = _video_store().get(job.video_id)
+    record = _video_store().get(video_id)
     with VideoReader(record.path, record.info) as reader:
         frame = reader.frame_at(timestamp_s)
     response = Response(encode_jpeg(frame), mimetype="image/jpeg")
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def _evidence_timestamp_and_video(run_id: str, boundary: str) -> tuple[float | None, str]:
+    key = "start_evidence_s" if boundary == "start" else "end_evidence_s"
+    try:
+        job = _llm_run_service().get(run_id)
+    except NotFoundError:
+        audit = _llm_run_service().get_audit(run_id)  # raises NotFoundError itself if missing
+        derived = audit.get("derived") or {}
+        return derived.get(key), audit["video_id"]
+    timestamp_s = job.start_evidence_s if boundary == "start" else job.end_evidence_s
+    return timestamp_s, job.video_id
+
+
+@llm_engines.get("/llm-runs/<run_id>/audit")
+def llm_run_audit(run_id: str) -> Response:
+    """The full durable audit record for one run - client-safe by
+    construction (see ``llm_run_audit.py``'s own module docstring: never a
+    credential, a filesystem path, or an image byte). Serves as both the
+    data source for the result card's "How the AI decided" section
+    (fetched directly) and the "Download audit report (JSON)" button
+    (the same URL, given a ``download`` attribute in the page) - the
+    ``Content-Disposition`` header below only affects the latter; a plain
+    ``fetch()`` ignores it. Readable after a page refresh or a server
+    restart, since it comes from disk, not the in-memory job map."""
+    audit = _llm_run_service().get_audit(run_id)
+    response = jsonify(audit)
+    response.headers["Content-Disposition"] = f'attachment; filename="llm-run-{run_id}-audit.json"'
+    return response
+
+
+@llm_engines.get("/llm-engines/<engine_id>/latest-audit")
+def llm_engine_latest_audit(engine_id: str) -> Response:
+    """The most recently finished run's audit record for ``engine_id`` -
+    how the page finds "what this engine last did" after a refresh or
+    restart, without already knowing a ``run_id``. 404s if this engine has
+    never finished a run (never confused with an engine that ran but
+    produced nothing - that case still has an audit record, just one
+    whose ``final_verdict`` is ABSTAIN)."""
+    return jsonify(_llm_run_service().get_latest_audit_for_engine(engine_id))
 
 
 def _optional_str(value: Any) -> str | None:

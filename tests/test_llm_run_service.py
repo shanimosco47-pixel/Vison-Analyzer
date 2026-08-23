@@ -44,15 +44,19 @@ class _FakeKeyringBackend:
 
 
 @pytest.fixture
-def engine_store(tmp_path: Path) -> LLMEngineStore:
-    config = replace(AppConfig(), data_dir=tmp_path / "data")
-    backend = _FakeKeyringBackend()
-    return LLMEngineStore(config, SecretStore(backend_factory=lambda: backend))
+def app_config(tmp_path: Path) -> AppConfig:
+    return replace(AppConfig(), data_dir=tmp_path / "data")
 
 
 @pytest.fixture
-def run_service(engine_store: LLMEngineStore):
-    service = LLMRunService(engine_store, sweep_interval_s=0.05)
+def engine_store(app_config: AppConfig) -> LLMEngineStore:
+    backend = _FakeKeyringBackend()
+    return LLMEngineStore(app_config, SecretStore(backend_factory=lambda: backend))
+
+
+@pytest.fixture
+def run_service(app_config: AppConfig, engine_store: LLMEngineStore):
+    service = LLMRunService(engine_store, app_config, sweep_interval_s=0.05)
     try:
         yield service
     finally:
