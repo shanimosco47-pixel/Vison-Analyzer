@@ -84,6 +84,17 @@ class TimedFrame:
     timestamp in ``trend_checkpoint_timestamps_s``, and
     ``pipeline._validate_trend_checkpoints`` is what actually enforces the
     spacing contract, independent of which frames carry this label.
+
+    ``is_contact_sheet`` marks a frame whose ``image_bytes`` is not a
+    single video frame but a deterministically-composed grid of several
+    frames (a "contact sheet" - see ``contact_sheet.py`` and
+    ``pipeline._run_end_validation_pass``'s candidate-centred cascade),
+    each panel self-labelled with its own timestamp baked into the image
+    itself. ``timestamp_s`` on a contact-sheet frame is only a
+    representative anchor (the candidate the sheet is centred on, or the
+    look-back point it ends at) - the actual per-panel timestamps a
+    provider may cite live in ``ProviderRequest.grounding_timestamps_s``,
+    not in any single ``TimedFrame``.
     """
 
     timestamp_s: float
@@ -91,6 +102,7 @@ class TimedFrame:
     media_type: str = "image/jpeg"
     is_candidate: bool = False
     is_trend_checkpoint: bool = False
+    is_contact_sheet: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,6 +121,17 @@ class ProviderRequest:
     prompt_text: str
     frames: tuple[TimedFrame, ...]
     pass_name: str  # "coarse" | "fine"
+    grounding_timestamps_s: tuple[float, ...] | None = None
+    """Explicit override of "which timestamps a provider may legitimately
+    cite back" for this request, used only when that set differs from
+    ``[frame.timestamp_s for frame in frames]`` - currently only the
+    contact-sheet cascade (a single composite ``TimedFrame`` standing in
+    for several logical panel timestamps - see
+    ``TimedFrame.is_contact_sheet``). ``None`` (the default, and every
+    non-cascade request) means "derive it from ``frames`` as before" -
+    both ``openai_provider``'s Structured-Outputs enum constraint and
+    ``pipeline.py``'s own grounding-region construction fall back to that
+    when this is unset, so every existing call site is unaffected."""
 
 
 @dataclass(frozen=True)
@@ -171,6 +194,7 @@ def canned_json_response(
     reason_codes: tuple[str, ...] = (),
     evidence_frame_timestamps_s: tuple[float, ...] | None = None,
     trend_checkpoint_timestamps_s: tuple[float, ...] = (),
+    possible_collapse_s: float | None = None,
     latency_s: float = 0.01,
 ) -> RawProviderResponse:
     """Build a well-formed CONFIRMED raw response - the common test case.
@@ -201,6 +225,7 @@ def canned_json_response(
         "reason_codes": list(reason_codes),
         "evidence_frame_timestamps_s": list(evidence_frame_timestamps_s),
         "trend_checkpoint_timestamps_s": list(trend_checkpoint_timestamps_s),
+        "possible_collapse_s": possible_collapse_s,
     }
     return RawProviderResponse(model_id=model_id, raw_text=json.dumps(payload), latency_s=latency_s)
 
@@ -234,6 +259,82 @@ def spaced_trend_checkpoints(
     return tuple(picked)
 
 
+def cascade_confirmed_response(
+    request: ProviderRequest,
+    *,
+    model_id: str = "stub-model",
+    confidence: float = 0.9,
+    onset_index: int | None = None,
+) -> RawProviderResponse:
+    """Test helper: a compliant CONFIRMED response for a contact-sheet
+    cascade request (see ``pipeline._run_end_validation_pass`` and
+    ``contact_sheet.py``) - the composite-image analogue of
+    :func:`canned_json_response`/:func:`spaced_trend_checkpoints` for the
+    older dense-frame shape.
+
+    Picks ``request.grounding_timestamps_s`` (the panel timestamps the
+    contact sheet actually shows - never ``request.frames``, which for a
+    cascade request holds only the one composite image) rather than
+    inventing timestamps, so a stub scripted this way can never
+    accidentally cite something ungrounded. Defaults to the middle panel
+    as the onset (matching the coarse sheet's own candidate-centring) and
+    every later panel as a trend checkpoint; pass ``onset_index`` to pick a
+    different panel (e.g. an earlier one on the refine sheet).
+    """
+    panels = sorted(request.grounding_timestamps_s or ())
+    if not panels:
+        raise ValueError(
+            "cascade_confirmed_response needs request.grounding_timestamps_s - "
+            "this stub was called with a non-cascade request"
+        )
+    index = onset_index if onset_index is not None else len(panels) // 2
+    onset = panels[index]
+    checkpoints = tuple(ts for ts in panels if ts > onset)
+    return canned_json_response(
+        model_id=model_id,
+        start_s=onset,
+        end_s=onset,
+        confidence=confidence,
+        evidence_frame_timestamps_s=(onset, *checkpoints[:2]),
+        trend_checkpoint_timestamps_s=checkpoints,
+    )
+
+
+def cascade_abstain_response(
+    request: ProviderRequest,
+    *,
+    model_id: str = "stub-model",
+    reason_codes: tuple[str, ...] = ("ambiguous_trend",),
+    possible_collapse_index: int | None = None,
+    latency_s: float = 0.01,
+) -> RawProviderResponse:
+    """Test helper: a compliant ABSTAIN response for a contact-sheet cascade
+    request - optionally citing one of the sheet's own panels as
+    ``possible_collapse_s`` (the coarse-sheet escape hatch that seeds the
+    denser refine look-back - see ``TimingVerdict.possible_collapse_s``).
+    ``possible_collapse_index=None`` (the default) means "no possible
+    collapse to point at", i.e. a plain, terminal abstain.
+    """
+    panels = sorted(request.grounding_timestamps_s or ())
+    possible_collapse_s = (
+        panels[possible_collapse_index] if possible_collapse_index is not None else None
+    )
+    payload = {
+        "status": "abstain",
+        "start_s": None,
+        "end_s": None,
+        "start_uncertainty_s": None,
+        "end_uncertainty_s": None,
+        "confidence": 0.0,
+        "reason_codes": list(reason_codes),
+        "evidence_frame_timestamps_s": [],
+        "trend_checkpoint_timestamps_s": [],
+        "possible_collapse_s": possible_collapse_s,
+        "raw_notes": "",
+    }
+    return RawProviderResponse(model_id=model_id, raw_text=json.dumps(payload), latency_s=latency_s)
+
+
 def _abstain(
     *, reason_code: str, model_id: str, prompt_version: str, raw_notes: str = ""
 ) -> TimingVerdict:
@@ -261,6 +362,8 @@ def _parse_confirmed(
     trend_checkpoints = tuple(
         float(t) for t in (payload.get("trend_checkpoint_timestamps_s") or ())
     )
+    possible_collapse_raw = payload.get("possible_collapse_s")
+    possible_collapse = float(possible_collapse_raw) if possible_collapse_raw is not None else None
     return TimingVerdict(
         status=TimingStatus.CONFIRMED,
         start_s=float(payload["start_s"]),
@@ -271,6 +374,7 @@ def _parse_confirmed(
         reason_codes=reason_codes,
         evidence_frame_timestamps_s=evidence,
         trend_checkpoint_timestamps_s=trend_checkpoints,
+        possible_collapse_s=possible_collapse,
         model_id=response.model_id,
         prompt_version=prompt_version,
         raw_notes=sanitize_untrusted_text(str(payload.get("raw_notes", ""))),
@@ -285,12 +389,15 @@ def _parse_abstain(
 ) -> TimingVerdict:
     """Build the model-requested ABSTAIN verdict, or raise (see :func:`_parse_confirmed`)."""
     codes = reason_codes or ("no_continuous_stream_found",)
+    possible_collapse_raw = payload.get("possible_collapse_s")
+    possible_collapse = float(possible_collapse_raw) if possible_collapse_raw is not None else None
     return TimingVerdict.abstain(
         reason_codes=codes,
         model_id=response.model_id,
         prompt_version=prompt_version,
         confidence=float(payload.get("confidence", 0.0) or 0.0),
         raw_notes=sanitize_untrusted_text(str(payload.get("raw_notes", ""))),
+        possible_collapse_s=possible_collapse,
     )
 
 

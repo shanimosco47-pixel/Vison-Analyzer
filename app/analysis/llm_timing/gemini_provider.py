@@ -206,7 +206,9 @@ def _build_parts(request: ProviderRequest) -> list[dict]:
     """
     parts: list[dict] = [{"text": request.prompt_text}]
     for frame in request.frames:
-        if frame.is_candidate:
+        if frame.is_contact_sheet:
+            label = "CONTACT SHEET (composite grid - see each panel's own timestamp header)"
+        elif frame.is_candidate:
             label = "CANDIDATE frame"
         elif frame.is_trend_checkpoint:
             label = "TREND CHECKPOINT candidate frame"

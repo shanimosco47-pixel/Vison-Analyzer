@@ -1327,6 +1327,252 @@ null, and explain why in reason_codes. Do not invent a confident-sounding
 timestamp when the evidence does not support one.
 """
 
+# --------------------------------------------------------------------------- #
+# Candidate-centred contact-sheet cascade (supervisor-authorized, real
+# gpt-5-mini experiment: two independent 3/3 passes of a three-video dev
+# criterion, errors within +/-0.75s - see diagnostics/llm_spike/DESIGN.md).
+# Replaces the dense-individual-frames end-validate request with ONE
+# composite grid image: several small panels, each self-labelled with its
+# own timestamp baked into its header, tiled chronologically. A coarse
+# (9-panel, 0.5s spacing, 4s span) sheet centred on the end-coarse pass's
+# own candidate does the primary check; if it cannot confirm but points at
+# a possible collapse, a denser (7-panel, 0.25s spacing, 1.5s look-back)
+# refine sheet gets one more look. See pipeline._run_end_validation_pass.
+# --------------------------------------------------------------------------- #
+
+PROMPT_END_CASCADE_COARSE_V1_ID = "zahn-efflux-end-cascade-coarse-v1"
+
+PROMPT_END_CASCADE_COARSE_V1 = """\
+You are analyzing ONE composite image: a chronological, row-major 3x3 grid
+of 9 panels from a Zahn cup viscosity test video, evenly spaced 0.5 seconds
+apart (4 seconds total), centred on a candidate an earlier pass flagged as
+roughly where a break might be. This is NOT nine separate frames - it is a
+single contact sheet. Read the panels in reading order (left to right, top
+to bottom): that order is their chronological order.
+
+Each panel has its own exact timestamp printed in a black header at the top
+of that panel - use those printed timestamps, and only those, whenever you
+report a timestamp. Each panel also has:
+- a small red ring marking the tracked cup outlet - the liquid stream
+  starts there and hangs down from it;
+- a blue scale down the left edge, with numbered tick marks - use it only
+  to compare the connected stream's reach between panels (which panel's
+  reach-number is bigger or smaller), never as a real-world unit.
+
+MEASUREMENT RULE (use exactly this rule, do not invent your own):
+- In each panel, find the lowest point of liquid that is CONTINUOUSLY
+  attached to the outlet (follow the stream down from the red ring without
+  a gap) and read off its reach against the blue scale. Ignore anything
+  already detached and falling separately below that point - that is not
+  part of the connected stream's reach.
+- Reject a rigid vertical structure in the background - a conveyor hanger,
+  a fixture, any rigid object - that drifts sideways through the outlet
+  corridor across panels. That is background motion, not the liquid: if a
+  panel's apparent "recovery" (reach getting longer again) is actually such
+  a rigid object crossing behind or near the stream, do not count it as the
+  stream lengthening.
+- Scanning the panels in chronological order, find the EARLIEST panel where
+  the connected reach begins a genuinely SUSTAINED shortening: later panels
+  must keep confirming it (each showing further shortening than the panel
+  before, not merely "still shorter than the first panel") - a single
+  panel that looks shorter, on its own, proves nothing.
+- A drop that recovers back toward the earlier, established reach and
+  stays there is a visual/camera/contrast artifact or exactly the rigid-
+  background case above, not the real break - reject that panel and keep
+  scanning later panels for the next shorter-looking one.
+- Your answer, if confirmed, is the EARLIEST panel that is both genuinely
+  shorter than the established baseline AND backed by at least two later
+  panels each showing further shortening - never a later, "more obvious"
+  panel, and never a panel confirmed by only one later panel.
+
+WHEN TO ABSTAIN AND POINT AT A POSSIBLE COLLAPSE: this sheet is coarse -
+0.5s apart is enough to notice a possible break, but sometimes not enough
+to fully confirm a sustained trend from these 9 panels alone (the true
+onset might sit between two of them, or the last panel or two might still
+be shortening with not enough panels left in this sheet to prove it keeps
+going). When that happens:
+- Set "status" to "abstain".
+- If you saw a panel that looks like it might be the collapse - even if you
+  cannot fully confirm it from this sheet alone - set "possible_collapse_s"
+  to that panel's own printed timestamp, so a denser follow-up sheet can
+  look more closely around it. Use reason_codes including
+  "cascade_needs_refinement".
+- If nothing in this sheet looks like a break at all (the reach is stable
+  in every panel, or the evidence is simply too ambiguous to point at
+  anything), leave "possible_collapse_s" null and use reason_codes
+  including "no_break_found" or "ambiguous_evidence" as appropriate.
+- Only report "confirmed" when this sheet's own 9 panels already fully
+  support it per the MEASUREMENT RULE above - do not confirm a marginal or
+  borderline case just to avoid a follow-up sheet.
+
+TIMESTAMP RULE (read this carefully): every timestamp you report - start_s,
+end_s, every entry in evidence_frame_timestamps_s and
+trend_checkpoint_timestamps_s, and possible_collapse_s - must be COPIED
+EXACTLY, character-for-character, from one of the panel headers in this
+image. Never compute, estimate, round, or interpolate a timestamp between
+two panels.
+
+HAZARDS SPECIFIC TO THIS FOOTAGE:
+- The cup, stream and background are often close to the same pale/dusty
+  colour (industrial environment) - contrast can be very low. A drop in
+  raw pixel brightness alone is not evidence of shortening: look for the
+  connected stream's own geometric reach against the blue scale, not an
+  absolute brightness threshold.
+- The footage is handheld - there is camera shake. Do not confuse
+  whole-frame motion (camera movement) with real motion of the stream
+  itself, and do not confuse a rigid background object's own motion with
+  liquid recovery (see MEASUREMENT RULE above).
+
+OUTPUT: reply with a single JSON object and nothing else (no prose before
+or after it), matching exactly this shape. This reports a single moment
+(the confirmed onset, if any), not an interval - set start_s and end_s to
+the SAME timestamp, and start_uncertainty_s/end_uncertainty_s to the same
+value. evidence_frame_timestamps_s is a SMALL, SELECTIVE list.
+trend_checkpoint_timestamps_s is DISTINCT: at least two LATER panels, each
+showing further shortening than the last - empty unless confirmed.
+
+{
+  "status": "confirmed" | "abstain",
+  "start_s": <float seconds, copied exactly from a panel header above -
+              identical to end_s; or null if abstaining>,
+  "end_s": <float seconds, copied exactly from a panel header above -
+            identical to start_s; or null if abstaining>,
+  "start_uncertainty_s": <float, your own +/- bound on the timestamp>,
+  "end_uncertainty_s": <float, the same +/- bound as start_uncertainty_s>,
+  "confidence": <float 0..1>,
+  "reason_codes": [<short machine-readable strings, e.g.
+                     "cascade_needs_refinement", "no_break_found",
+                     "ambiguous_evidence", "rigid_background_object",
+                     "weak_contrast", "camera_motion">],
+  "evidence_frame_timestamps_s": [<a small, selective set of specific panel
+                                     timestamps supporting your answer>],
+  "trend_checkpoint_timestamps_s": [<at least two LATER panel timestamps,
+                                       each showing further shortening than
+                                       the last - empty unless confirmed>],
+  "possible_collapse_s": <float, copied exactly from a panel header above -
+                            the panel that might be the collapse, when you
+                            cannot fully confirm it from this sheet alone;
+                            or null>,
+  "raw_notes": "<short free-text explanation, for a human audit log only>"
+}
+
+Do not invent a confident-sounding onset when this sheet's own 9 panels do
+not fully support one.
+"""
+
+PROMPT_END_CASCADE_REFINE_V1_ID = "zahn-efflux-end-cascade-refine-v1"
+
+PROMPT_END_CASCADE_REFINE_V1 = """\
+You are analyzing ONE composite image: a chronological, row-major grid of
+panels from a Zahn cup viscosity test video (4 panels in the first row,
+then 3 more - the 8th cell is blank, ignore it), evenly spaced 0.25 seconds
+apart (1.5 seconds total), ending at a point a coarser pass flagged as a
+possible or obvious collapse. This is a DENSER, closer look at that same
+moment - not nine separate frames, a single contact sheet. Read the panels
+in reading order (left to right, top to bottom): that order is their
+chronological order, and the LAST panel is the possible/obvious collapse
+the coarser pass already saw.
+
+Each panel has its own exact timestamp printed in a black header at the top
+of that panel - use those printed timestamps, and only those, whenever you
+report a timestamp. Each panel also has:
+- a small red ring marking the tracked cup outlet - the liquid stream
+  starts there and hangs down from it;
+- a blue scale down the left edge, with numbered tick marks - use it only
+  to compare the connected stream's reach between panels, never as a
+  real-world unit.
+
+YOUR JOB: report the FIRST onset frame within THIS denser window, not the
+later, more obvious collapse you were centred on. The coarser pass already
+knows something happens by the last panel - what it could not tell is
+exactly when the shortening actually began. Look at the panels in
+chronological order and find the EARLIEST one, anywhere in this window,
+where the connected reach already begins departing from the earlier,
+stable reach - even if that departure is subtle in the earliest panels and
+only becomes obvious by the last one.
+
+MEASUREMENT RULE (use exactly this rule, do not invent your own):
+- In each panel, find the lowest point of liquid CONTINUOUSLY attached to
+  the outlet (follow the stream down from the red ring without a gap) and
+  read its reach against the blue scale. Ignore anything already detached
+  and falling separately below that point.
+- Reject a rigid vertical structure in the background - a conveyor hanger,
+  a fixture, any rigid object - that drifts sideways through the outlet
+  corridor across panels; that is background motion, not the liquid. Do
+  not count such an object's own motion as the stream recovering.
+- Your answer is the EARLIEST panel whose reach is already genuinely
+  shorter than the established stable reach AND whose later panels, within
+  this same window, keep confirming it (progressively shorter, or at least
+  not recovering back to the earlier stable reach and staying there) - not
+  a single momentary dip, and not the later, obvious collapse itself if an
+  earlier panel already shows the real onset.
+- If every panel in this window looks the same as the established stable
+  reach until the very last one or two, and there is genuinely no earlier
+  onset visible, your answer may be one of the later panels - report
+  whichever panel this window's own evidence actually supports as the
+  earliest confirmed onset, even if that turns out to be the same panel
+  the coarser pass already pointed at.
+- If this denser window still cannot confirm a sustained trend at all (for
+  example, the apparent collapse turns out to be a rigid background object,
+  or the evidence remains genuinely ambiguous even at this density), report
+  "abstain" with reason_codes including "ambiguous_evidence",
+  "trend_not_sustained", or "rigid_background_object" as appropriate. Do
+  not point at a further "possible_collapse_s" from this refine sheet -
+  this is the last look this cascade takes.
+
+TIMESTAMP RULE (read this carefully): every timestamp you report - start_s,
+end_s, and every entry in evidence_frame_timestamps_s and
+trend_checkpoint_timestamps_s - must be COPIED EXACTLY, character-for-
+character, from one of the panel headers in this image (ignore the blank
+8th cell - it has no header). Never compute, estimate, round, or
+interpolate a timestamp between two panels.
+
+HAZARDS SPECIFIC TO THIS FOOTAGE:
+- The cup, stream and background are often close to the same pale/dusty
+  colour (industrial environment) - contrast can be very low. A drop in
+  raw pixel brightness alone is not evidence of shortening: look for the
+  connected stream's own geometric reach against the blue scale.
+- The footage is handheld - there is camera shake. Do not confuse
+  whole-frame motion (camera movement) with real motion of the stream
+  itself, and do not confuse a rigid background object's own motion with
+  liquid recovery (see MEASUREMENT RULE above).
+
+OUTPUT: reply with a single JSON object and nothing else (no prose before
+or after it), matching exactly this shape. This reports a single moment
+(the confirmed onset, if any), not an interval - set start_s and end_s to
+the SAME timestamp, and start_uncertainty_s/end_uncertainty_s to the same
+value. evidence_frame_timestamps_s is a SMALL, SELECTIVE list.
+trend_checkpoint_timestamps_s is DISTINCT: at least two LATER panels, each
+showing further shortening than the last - empty unless confirmed.
+"possible_collapse_s" is always null from this pass - this refine sheet is
+the cascade's last look, not a further hand-off.
+
+{
+  "status": "confirmed" | "abstain",
+  "start_s": <float seconds, copied exactly from a panel header above -
+              identical to end_s; or null if abstaining>,
+  "end_s": <float seconds, copied exactly from a panel header above -
+            identical to start_s; or null if abstaining>,
+  "start_uncertainty_s": <float, your own +/- bound on the timestamp>,
+  "end_uncertainty_s": <float, the same +/- bound as start_uncertainty_s>,
+  "confidence": <float 0..1>,
+  "reason_codes": [<short machine-readable strings, e.g.
+                     "ambiguous_evidence", "trend_not_sustained",
+                     "rigid_background_object", "weak_contrast",
+                     "camera_motion">],
+  "evidence_frame_timestamps_s": [<a small, selective set of specific panel
+                                     timestamps supporting your answer>],
+  "trend_checkpoint_timestamps_s": [<at least two LATER panel timestamps,
+                                       each showing further shortening than
+                                       the last - empty unless confirmed>],
+  "possible_collapse_s": null,
+  "raw_notes": "<short free-text explanation, for a human audit log only>"
+}
+
+Do not invent a confident-sounding onset when this window's own panels do
+not fully support one.
+"""
+
 PROMPTS: dict[str, str] = {
     PROMPT_V1_ID: PROMPT_V1,
     PROMPT_END_SCAN_V1_ID: PROMPT_END_SCAN_V1,
@@ -1338,6 +1584,8 @@ PROMPTS: dict[str, str] = {
     PROMPT_END_VALIDATE_V4_ID: PROMPT_END_VALIDATE_V4,
     PROMPT_END_COARSE_V1_ID: PROMPT_END_COARSE_V1,
     PROMPT_END_COARSE_V2_ID: PROMPT_END_COARSE_V2,
+    PROMPT_END_CASCADE_COARSE_V1_ID: PROMPT_END_CASCADE_COARSE_V1,
+    PROMPT_END_CASCADE_REFINE_V1_ID: PROMPT_END_CASCADE_REFINE_V1,
 }
 
 

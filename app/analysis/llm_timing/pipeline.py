@@ -28,12 +28,15 @@ from ...errors import ConfigurationError
 from ...video.metadata import VideoInfo
 from ...video.reader import VideoReader, encode_jpeg
 from ..base_detector import Event, EventStatus
+from . import contact_sheet
 from .pricing import PRICING_TABLE_VERSION, ModelPricing, estimate_cost_usd
 from .prompts import (
+    PROMPT_END_CASCADE_COARSE_V1,
+    PROMPT_END_CASCADE_COARSE_V1_ID,
+    PROMPT_END_CASCADE_REFINE_V1,
+    PROMPT_END_CASCADE_REFINE_V1_ID,
     PROMPT_END_COARSE_V2,
     PROMPT_END_COARSE_V2_ID,
-    PROMPT_END_VALIDATE_V4,
-    PROMPT_END_VALIDATE_V4_ID,
     PROMPT_START_REFINE_V1,
     PROMPT_START_REFINE_V1_ID,
 )
@@ -262,21 +265,37 @@ class PipelineOutcome:
     Kept separate from ``fine_response`` so every pass's cost/latency/
     retries is individually inspectable, not collapsed into one number."""
     end_validation_response: RawProviderResponse | None = None
-    """The single dense-plus-sparse trend-validation call that confirms or
-    rejects ``end_coarse_response``'s candidate - see
-    ``_run_end_validation_pass``. ``None`` for a run that never reached
-    this phase. A rejected or unvalidatable candidate now converges
-    directly on ABSTAIN (never confidently wrong) rather than searching
-    for another candidate - see ``run_llm_timing``."""
+    """The DECISIVE contact-sheet cascade call for ``end_coarse_response``'s
+    candidate - the 7-panel refine sheet's own response when one ran,
+    otherwise the 9-panel coarse sheet's (see ``_run_end_validation_pass``).
+    ``None`` for a run that never reached this phase. A rejected or
+    unvalidatable candidate now converges directly on ABSTAIN (never
+    confidently wrong) rather than searching for another candidate - see
+    ``run_llm_timing``."""
+    end_validation_coarse_cascade_response: RawProviderResponse | None = None
+    """The coarse (9-panel) contact sheet's own response, kept separately
+    inspectable ONLY when a refine sheet also ran and superseded it (i.e.
+    ``end_validation_response`` above is the refine call's response, not
+    this one) - so both calls' cost/latency/tokens stay individually
+    auditable rather than the coarse call's own spend silently vanishing
+    once a refine sheet supersedes its verdict. ``None`` whenever no
+    refine sheet ran (the coarse sheet's response is already
+    ``end_validation_response`` in that case)."""
     end_validation_conflict_response: RawProviderResponse | None = None
-    """A second, differently-anchored trend-validation call around the
-    *coarse* pass's own independent end estimate - sent only when
+    """A second, differently-anchored cascade around the *coarse* pass's
+    own independent end estimate - sent only when
     ``derived["candidate_conflict"]`` is true (the coarse and end-coarse
-    passes disagreed badly enough that neither's own validation window
-    would contain the other's candidate). ``None`` whenever no conflict
-    was detected, which is the common case - this is a bounded, at-most-
-    one-extra-call check, never an open-ended search (supervisor-directed,
-    see diagnostics/llm_spike/DESIGN.md)."""
+    passes disagreed badly enough that neither's own cascade window would
+    contain the other's candidate). ``None`` whenever no conflict was
+    detected, which is the common case - this is a bounded, at-most-
+    one-extra-candidate check, never an open-ended search (supervisor-
+    directed, see diagnostics/llm_spike/DESIGN.md)."""
+    end_validation_conflict_coarse_cascade_response: RawProviderResponse | None = None
+    """The conflict-path counterpart of
+    ``end_validation_coarse_cascade_response`` - the coarse sheet built
+    around the *coarse* pass's own independent end estimate, kept
+    separately inspectable only when that anchor's own refine sheet also
+    ran and superseded it."""
     pass_verdicts: dict[str, TimingVerdict] = field(default_factory=dict)
     """Every pass's own post-grounding verdict, keyed by pass name
     ("coarse", "fine", "end_coarse", "end_validate") - populated
@@ -321,48 +340,39 @@ class PipelineOutcome:
     these keys for its own established consumers; this field is the one
     that is populated regardless of how the run ends."""
 
+    def _all_responses(self) -> list[RawProviderResponse]:
+        """Every provider call this outcome actually made, including a
+        coarse cascade sheet superseded by its own refine sheet - so
+        cost/latency/token accounting never silently drops a call that was
+        genuinely sent (see ``end_validation_coarse_cascade_response``'s
+        own docstring)."""
+        return [
+            response
+            for response in (
+                self.coarse_response,
+                self.fine_response,
+                self.end_coarse_response,
+                self.end_validation_response,
+                self.end_validation_coarse_cascade_response,
+                self.end_validation_conflict_response,
+                self.end_validation_conflict_coarse_cascade_response,
+            )
+            if response is not None
+        ]
+
     @property
     def total_retries(self) -> int:
-        return (
-            self.coarse_response.retries
-            + (self.fine_response.retries if self.fine_response else 0)
-            + (self.end_coarse_response.retries if self.end_coarse_response else 0)
-            + (self.end_validation_response.retries if self.end_validation_response else 0)
-            + (
-                self.end_validation_conflict_response.retries
-                if self.end_validation_conflict_response
-                else 0
-            )
-        )
+        return sum(response.retries for response in self._all_responses())
 
     @property
     def total_latency_s(self) -> float:
-        return (
-            self.coarse_response.latency_s
-            + (self.fine_response.latency_s if self.fine_response else 0.0)
-            + (self.end_coarse_response.latency_s if self.end_coarse_response else 0.0)
-            + (self.end_validation_response.latency_s if self.end_validation_response else 0.0)
-            + (
-                self.end_validation_conflict_response.latency_s
-                if self.end_validation_conflict_response
-                else 0.0
-            )
-        )
+        return sum(response.latency_s for response in self._all_responses())
 
     @property
     def total_tokens(self) -> int | None:
         """``None`` (unknown) unless every pass that ran reported usage."""
-        parts = [
-            self.coarse_response,
-            self.fine_response,
-            self.end_coarse_response,
-            self.end_validation_response,
-            self.end_validation_conflict_response,
-        ]
         counts = []
-        for response in parts:
-            if response is None:
-                continue
+        for response in self._all_responses():
             if response.prompt_tokens is None or response.completion_tokens is None:
                 return None
             counts.append(response.prompt_tokens + response.completion_tokens)
@@ -374,17 +384,8 @@ class PipelineOutcome:
         Deliberately not "sum the known ones and ignore the rest" - a
         partial total would understate cost silently. See ``pricing.py``.
         """
-        responses = [
-            self.coarse_response,
-            self.fine_response,
-            self.end_coarse_response,
-            self.end_validation_response,
-            self.end_validation_conflict_response,
-        ]
         total = 0.0
-        for response in responses:
-            if response is None:
-                continue
+        for response in self._all_responses():
             cost = estimate_cost_usd(
                 response.model_id,
                 response.prompt_tokens,
@@ -430,6 +431,21 @@ class PipelineOutcome:
             "end_validation_retries": (
                 self.end_validation_response.retries if self.end_validation_response else None
             ),
+            "end_validation_coarse_cascade_model_id": (
+                self.end_validation_coarse_cascade_response.model_id
+                if self.end_validation_coarse_cascade_response
+                else None
+            ),
+            "end_validation_coarse_cascade_latency_s": (
+                self.end_validation_coarse_cascade_response.latency_s
+                if self.end_validation_coarse_cascade_response
+                else None
+            ),
+            "end_validation_coarse_cascade_retries": (
+                self.end_validation_coarse_cascade_response.retries
+                if self.end_validation_coarse_cascade_response
+                else None
+            ),
             "end_validation_conflict_model_id": (
                 self.end_validation_conflict_response.model_id
                 if self.end_validation_conflict_response
@@ -443,6 +459,21 @@ class PipelineOutcome:
             "end_validation_conflict_retries": (
                 self.end_validation_conflict_response.retries
                 if self.end_validation_conflict_response
+                else None
+            ),
+            "end_validation_conflict_coarse_cascade_model_id": (
+                self.end_validation_conflict_coarse_cascade_response.model_id
+                if self.end_validation_conflict_coarse_cascade_response
+                else None
+            ),
+            "end_validation_conflict_coarse_cascade_latency_s": (
+                self.end_validation_conflict_coarse_cascade_response.latency_s
+                if self.end_validation_conflict_coarse_cascade_response
+                else None
+            ),
+            "end_validation_conflict_coarse_cascade_retries": (
+                self.end_validation_conflict_coarse_cascade_response.retries
+                if self.end_validation_conflict_coarse_cascade_response
                 else None
             ),
             "total_latency_s": self.total_latency_s,
@@ -1123,15 +1154,250 @@ def _validate_trend_checkpoints(
 
 @dataclass(frozen=True)
 class _EndValidationOutcome:
-    """One candidate's full trend-validation result - the reusable unit
+    """One candidate's full contact-sheet cascade result - the reusable unit
     both the primary (end-coarse's own candidate) and, when a conflict is
     detected, the secondary (the coarse pass's own independent end
-    estimate) validation calls are built from."""
+    estimate) validation calls are built from.
+
+    ``verdict``/``response``/``submitted_timestamps_s``/``window_s`` always
+    describe the DECISIVE call - the 7-panel refine sheet's own result when
+    one ran, otherwise the 9-panel coarse sheet's. ``coarse_cascade_*``
+    fields are set only when a refine sheet actually ran, so the coarse
+    sheet's own (superseded) verdict/response/panels stay individually
+    inspectable for cost/audit purposes rather than silently discarded -
+    see ``pipeline.PipelineOutcome.end_validation_coarse_cascade_response``.
+    """
 
     verdict: TimingVerdict
     response: RawProviderResponse
     submitted_timestamps_s: tuple[float, ...]
     window_s: tuple[float, float]
+    coarse_cascade_verdict: TimingVerdict | None = None
+    coarse_cascade_response: RawProviderResponse | None = None
+    coarse_cascade_submitted_timestamps_s: tuple[float, ...] | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Candidate-centred contact-sheet cascade (supervisor-authorized, real
+# gpt-5-mini experiment - see prompts.py's own module comment and
+# diagnostics/llm_spike/DESIGN.md for the full write-up). Replaces the
+# dense-individual-frames trend-validation request above with ONE composite
+# grid image per call: a coarse 9-panel/0.5s/4s sheet centred on the
+# candidate, and - only when that sheet abstains but points at a possible
+# collapse - one denser 7-panel/0.25s/1.5s look-back refine sheet. Never
+# more than two calls per candidate, matching the "bounded, never an
+# open-ended search" discipline every other pass in this module follows.
+# --------------------------------------------------------------------------- #
+
+_CASCADE_COARSE_STEP_S = 0.5
+_CASCADE_COARSE_COUNT = 9
+_CASCADE_COARSE_COLUMNS = 3
+_CASCADE_COARSE_ROWS = 3
+_CASCADE_COARSE_HALF_SPAN_S = (_CASCADE_COARSE_COUNT - 1) * _CASCADE_COARSE_STEP_S / 2  # 2.0s
+
+_CASCADE_REFINE_STEP_S = 0.25
+_CASCADE_REFINE_COUNT = 7
+_CASCADE_REFINE_COLUMNS = 4
+_CASCADE_REFINE_ROWS = 2
+_CASCADE_REFINE_LOOKBACK_S = (_CASCADE_REFINE_COUNT - 1) * _CASCADE_REFINE_STEP_S  # 1.5s
+
+
+def _shift_window_into_bounds(
+    lo: float, hi: float, bound_lo: float, bound_hi: float
+) -> tuple[float, float]:
+    """Slide a fixed-width ``[lo, hi]`` window so it fits inside
+    ``[bound_lo, bound_hi]``, preserving its width whenever the bounds are
+    wide enough to hold it - so a candidate near the start or end of the
+    scannable region still gets a full-width, evenly-spaced panel sheet,
+    just not perfectly centred on it. Clamped (width degrades) only when
+    the bounds themselves are narrower than the window - a short clip or a
+    candidate hard up against ``locked_start_s``."""
+    if bound_hi - bound_lo <= (hi - lo) + _BOUNDS_EPSILON_S:
+        return bound_lo, bound_hi
+    if lo < bound_lo:
+        shift = bound_lo - lo
+        lo, hi = lo + shift, hi + shift
+    if hi > bound_hi:
+        shift = hi - bound_hi
+        lo, hi = lo - shift, hi - shift
+    return max(lo, bound_lo), min(hi, bound_hi)
+
+
+def _cascade_coarse_timestamps(
+    candidate_ts: float, bound_lo: float, bound_hi: float
+) -> list[float]:
+    """9 timestamps, 0.5s apart, centred on ``candidate_ts`` where the
+    bounds allow it - see :func:`_shift_window_into_bounds`."""
+    lo, hi = _shift_window_into_bounds(
+        candidate_ts - _CASCADE_COARSE_HALF_SPAN_S,
+        candidate_ts + _CASCADE_COARSE_HALF_SPAN_S,
+        bound_lo,
+        bound_hi,
+    )
+    return [
+        round(min(lo + i * _CASCADE_COARSE_STEP_S, hi), 6) for i in range(_CASCADE_COARSE_COUNT)
+    ]
+
+
+def _cascade_refine_timestamps(collapse_ts: float, bound_lo: float, bound_hi: float) -> list[float]:
+    """7 timestamps, 0.25s apart, looking back 1.5s from ``collapse_ts`` -
+    see :func:`_shift_window_into_bounds`."""
+    lo, hi = _shift_window_into_bounds(
+        collapse_ts - _CASCADE_REFINE_LOOKBACK_S, collapse_ts, bound_lo, bound_hi
+    )
+    return [
+        round(min(lo + i * _CASCADE_REFINE_STEP_S, hi), 6) for i in range(_CASCADE_REFINE_COUNT)
+    ]
+
+
+def _build_cascade_request(
+    reader: VideoReader,
+    panel_timestamps_s: list[float],
+    *,
+    crop_origin: tuple[int, int],
+    columns: int,
+    rows: int,
+    prompt_version: str,
+    prompt_text: str,
+    jpeg_quality: int,
+) -> ProviderRequest:
+    """Render every panel, compose them into one contact sheet, and wrap it
+    as a single-frame :class:`ProviderRequest` whose
+    ``grounding_timestamps_s`` carries the *logical* per-panel timestamps -
+    see ``TimedFrame.is_contact_sheet``/``ProviderRequest.grounding_timestamps_s``
+    for why a single composite image still needs several grounded
+    timestamps."""
+    panels = [
+        contact_sheet.render_panel(reader.frame_at(ts), timestamp_s=ts, crop_origin=crop_origin)
+        for ts in panel_timestamps_s
+    ]
+    grid = contact_sheet.compose_grid(panels, columns=columns, rows=rows)
+    image_bytes = encode_jpeg(grid, quality=jpeg_quality)
+    anchor_ts = panel_timestamps_s[len(panel_timestamps_s) // 2]
+    frame = TimedFrame(timestamp_s=anchor_ts, image_bytes=image_bytes, is_contact_sheet=True)
+    return ProviderRequest(
+        prompt_version=prompt_version,
+        prompt_text=prompt_text,
+        frames=(frame,),
+        pass_name="end_validate",
+        grounding_timestamps_s=tuple(panel_timestamps_s),
+    )
+
+
+def _validate_possible_collapse(
+    verdict: TimingVerdict, *, region: _GroundingRegion
+) -> TimingVerdict:
+    """An ungrounded ``possible_collapse_s`` (not one of this pass's own
+    submitted panels) is a fabrication like any other ungrounded citation -
+    converges on ABSTAIN, same discipline as ``_validate_grounding``. A
+    no-op when nothing was cited; applies to CONFIRMED and ABSTAIN alike,
+    since ``possible_collapse_s`` is meaningful on either (unlike
+    ``evidence_frame_timestamps_s``, which only a CONFIRMED verdict uses)."""
+    if verdict.possible_collapse_s is None:
+        return verdict
+    ts = verdict.possible_collapse_s
+    if not any(abs(ts - sent) <= region.time_tolerance_s for sent in region.submitted_timestamps_s):
+        return _grounding_abstain(
+            verdict,
+            "ungrounded_evidence",
+            f"possible_collapse_s={ts} does not correspond to any panel actually "
+            f"submitted in this contact sheet",
+        )
+    return verdict
+
+
+def _validate_cascade_trend_checkpoints(
+    verdict: TimingVerdict, *, region: _GroundingRegion, min_count: int
+) -> TimingVerdict:
+    """The contact-sheet cascade's own trend-confirmation gate: a CONFIRMED
+    verdict must cite at least ``min_count`` grounded panel timestamps,
+    strictly after the reported onset, as ``trend_checkpoint_timestamps_s``
+    - "later panels are mandatory confirmation" (supervisor's own wording).
+
+    Deliberately does not reuse ``_validate_trend_checkpoints``'s numeric
+    onset-gap/checkpoint-spacing floors (0.75s, calibrated for the old
+    dense-native-fps-frame method's own jitter risk): a contact sheet's
+    panels are already fixed, deliberately-spaced anchors (0.5s coarse /
+    0.25s refine apart) - there is no native-fps density for the model to
+    mistake as a trend, so the floor that problem needed does not apply
+    here. Converges on ABSTAIN like every other grounding failure; a no-op
+    for an already-ABSTAIN verdict."""
+    if verdict.status is not TimingStatus.CONFIRMED:
+        return verdict
+    assert verdict.end_s is not None
+    checkpoints = verdict.trend_checkpoint_timestamps_s
+
+    def _matches_region(ts: float) -> bool:
+        return any(
+            abs(ts - sent) <= region.time_tolerance_s for sent in region.submitted_timestamps_s
+        )
+
+    ungrounded = [ts for ts in checkpoints if not _matches_region(ts)]
+    if ungrounded:
+        return _grounding_abstain(
+            verdict,
+            "insufficient_trend_horizon",
+            f"trend_checkpoint_timestamps_s {ungrounded} do not correspond to any panel "
+            f"actually shown in this contact sheet",
+        )
+    after_onset = [ts for ts in checkpoints if ts > verdict.end_s + _BOUNDS_EPSILON_S]
+    if len(after_onset) < min_count:
+        return _grounding_abstain(
+            verdict,
+            "insufficient_trend_horizon",
+            f"cited only {len(after_onset)} trend checkpoint(s) strictly after the "
+            f"reported onset t={verdict.end_s:.3f}s - at least {min_count} later panels "
+            f"are required to confirm the trend persists",
+        )
+    return verdict
+
+
+def _run_cascade_sheet(
+    reader: VideoReader,
+    panel_timestamps_s: list[float],
+    *,
+    crop_origin: tuple[int, int],
+    columns: int,
+    rows: int,
+    prompt_version: str,
+    prompt_text: str,
+    cfg: PipelineConfig,
+    provider: TimingProvider,
+    on_stage: Callable[[str], None] | None,
+) -> tuple[TimingVerdict, RawProviderResponse, tuple[float, ...]]:
+    """Send one contact sheet (coarse or refine) and return its grounded
+    verdict - the shared body both cascade stages use."""
+    request = _build_cascade_request(
+        reader,
+        panel_timestamps_s,
+        crop_origin=crop_origin,
+        columns=columns,
+        rows=rows,
+        prompt_version=prompt_version,
+        prompt_text=prompt_text,
+        jpeg_quality=cfg.jpeg_quality,
+    )
+    if on_stage is not None:
+        on_stage("end_validate")
+    response = provider.analyze(request)
+    verdict = parse_raw_response(
+        response, prompt_version=prompt_version, min_confidence=cfg.min_confidence
+    )
+    submitted = tuple(panel_timestamps_s)
+    region = _GroundingRegion(
+        bounds=(submitted[0], submitted[-1]),
+        submitted_timestamps_s=submitted,
+        time_tolerance_s=2.0 * (submitted[1] - submitted[0] if len(submitted) > 1 else 0.5),
+    )
+    verdict = _validate_grounding(
+        verdict, start_region=region, end_region=region, max_uncertainty_s=cfg.max_uncertainty_s
+    )
+    verdict = _bound_end_validate_evidence(verdict)
+    verdict = _validate_cascade_trend_checkpoints(
+        verdict, region=region, min_count=cfg.end_validation_min_trend_checkpoints
+    )
+    verdict = _validate_possible_collapse(verdict, region=region)
+    return verdict, response, submitted
 
 
 def _run_end_validation_pass(
@@ -1144,106 +1410,91 @@ def _run_end_validation_pass(
     cfg: PipelineConfig,
     provider: TimingProvider,
     on_stage: Callable[[str], None] | None,
-) -> _EndValidationOutcome | None:
-    """Dense-plus-sparse trend validation for one candidate end timestamp.
-    Returns ``None`` only when even the sparsest allowed dense selection
-    cannot fit the request byte budget - same contract as every other
-    budget failure in this module; the caller reports that as an
-    oversized-abstain."""
-    validation_lo, validation_hi = _validation_window_for(
-        candidate_ts, locked_start_s, duration_s, cfg
-    )
-    dense_frames = _build_validation_frames(
+) -> _EndValidationOutcome:
+    """Candidate-centred contact-sheet cascade for one candidate end
+    timestamp: a coarse 9-panel sheet first, and - only when it abstains
+    but points at a possible collapse - one denser 7-panel refine sheet.
+    Reuses the application's own existing broad/coarse pass's candidate as
+    the sheet's centre; never invents a truth-centred window (supervisor
+    authorization). ``fine_step_s`` is unused by the cascade itself (kept
+    in the signature for call-site compatibility with the dense-frame
+    method this replaced) but is not needed here - panel spacing is fixed
+    by the cascade's own contract, not the clip's native frame rate.
+
+    Unlike the dense-frame method this replaced, a contact sheet is a
+    small, fixed-size composite image (9 or 7 tiles at a fixed resolution)
+    - never subject to the per-request byte-budget thinning that could
+    make the old method's own frame batch not fit, so there is no
+    ``None``/oversized-abstain outcome to report here.
+    """
+    del fine_step_s  # unused by the cascade - see docstring
+    bound_lo = max(0.0, locked_start_s)
+    sample_frame = reader.frame_at(candidate_ts)
+    crop_origin = contact_sheet.default_crop_origin(sample_frame.shape[1], sample_frame.shape[0])
+
+    coarse_timestamps = _cascade_coarse_timestamps(candidate_ts, bound_lo, duration_s)
+    coarse_verdict, coarse_response, coarse_submitted = _run_cascade_sheet(
         reader,
-        candidate_ts=candidate_ts,
-        validation_lo=validation_lo,
-        validation_hi=validation_hi,
-        fine_step_s=fine_step_s,
-        max_dimension_px=cfg.max_frame_dimension_px,
-        jpeg_quality=cfg.jpeg_quality,
-        prompt_text=PROMPT_END_VALIDATE_V4,
-        max_request_bytes=cfg.max_request_bytes,
-        target_tolerance_s=cfg.target_tolerance_s,
+        coarse_timestamps,
+        crop_origin=crop_origin,
+        columns=_CASCADE_COARSE_COLUMNS,
+        rows=_CASCADE_COARSE_ROWS,
+        prompt_version=PROMPT_END_CASCADE_COARSE_V1_ID,
+        prompt_text=PROMPT_END_CASCADE_COARSE_V1,
+        cfg=cfg,
+        provider=provider,
+        on_stage=on_stage,
     )
-    if dense_frames is None:
-        return None
+    coarse_window_s = (coarse_submitted[0], coarse_submitted[-1])
 
-    future_timestamps = _sparse_future_checkpoints(
-        validation_hi, duration_s, max_count=_MAX_SPARSE_FUTURE_CHECKPOINTS
+    coarse_needs_refine = (
+        coarse_verdict.status is not TimingStatus.CONFIRMED
+        and coarse_verdict.possible_collapse_s is not None
     )
-    future_frames = (
-        _extract_frames(
-            reader,
-            future_timestamps,
-            max_dimension_px=cfg.max_frame_dimension_px,
-            jpeg_quality=cfg.jpeg_quality,
+    if not coarse_needs_refine:
+        # Either confirmed outright, or abstained with nothing to point a
+        # refine sheet at - the coarse verdict's own reason codes (the
+        # model's, e.g. "no_break_found", or a grounding failure's, e.g.
+        # "ungrounded_evidence") are already the accurate, specific
+        # terminal reason; nothing to relabel.
+        return _EndValidationOutcome(
+            verdict=coarse_verdict,
+            response=coarse_response,
+            submitted_timestamps_s=coarse_submitted,
+            window_s=coarse_window_s,
         )
-        if future_timestamps
-        else []
-    )
-    all_frames = _merge_frames_sorted(dense_frames, future_frames)
 
-    checkpoint_labels = set(
-        _suggested_trend_checkpoints(
-            candidate_ts,
-            [frame.timestamp_s for frame in all_frames],
-            spacing_s=_TREND_CHECKPOINT_LABEL_SPACING_S,
-            max_count=_MAX_TREND_CHECKPOINT_LABELS,
-        )
+    assert coarse_verdict.possible_collapse_s is not None
+    refine_timestamps = _cascade_refine_timestamps(
+        coarse_verdict.possible_collapse_s, bound_lo, duration_s
     )
-    all_frames = [
-        replace(frame, is_trend_checkpoint=True)
-        if frame.timestamp_s in checkpoint_labels and not frame.is_candidate
-        else frame
-        for frame in all_frames
-    ]
-
-    request = ProviderRequest(
-        prompt_version=PROMPT_END_VALIDATE_V4_ID,
-        prompt_text=PROMPT_END_VALIDATE_V4,
-        frames=tuple(all_frames),
-        pass_name="end_validate",
+    refine_verdict, refine_response, refine_submitted = _run_cascade_sheet(
+        reader,
+        refine_timestamps,
+        crop_origin=crop_origin,
+        columns=_CASCADE_REFINE_COLUMNS,
+        rows=_CASCADE_REFINE_ROWS,
+        prompt_version=PROMPT_END_CASCADE_REFINE_V1_ID,
+        prompt_text=PROMPT_END_CASCADE_REFINE_V1,
+        cfg=cfg,
+        provider=provider,
+        on_stage=on_stage,
     )
-    if on_stage is not None:
-        on_stage("end_validate")
-    response = provider.analyze(request)
-    verdict = parse_raw_response(
-        response, prompt_version=PROMPT_END_VALIDATE_V4_ID, min_confidence=cfg.min_confidence
-    )
-    submitted = tuple(frame.timestamp_s for frame in all_frames)
-    region_hi = max(validation_hi, future_timestamps[-1]) if future_timestamps else validation_hi
-    region = _GroundingRegion(
-        bounds=(validation_lo, region_hi),
-        submitted_timestamps_s=submitted,
-        time_tolerance_s=_effective_tolerance_s(list(submitted), fine_step_s),
-    )
-    verdict = _validate_grounding(
-        verdict, start_region=region, end_region=region, max_uncertainty_s=cfg.max_uncertainty_s
-    )
-    verdict = _bound_end_validate_evidence(verdict)
-    verdict = _validate_trend_checkpoints(verdict, region=region, cfg=cfg)
-    if verdict.status is TimingStatus.CONFIRMED:
-        # The dense future-context floor is unchanged and still checked
-        # against validation_hi (the dense window's own edge), not the
-        # sparse checkpoints further out - those inform the model's own
-        # judgement (see PROMPT_END_VALIDATE_V4's SPARSE FUTURE
-        # CHECKPOINTS section) but are too sparse to themselves satisfy a
-        # dense-evidence requirement.
-        assert verdict.end_s is not None
-        if verdict.end_s + cfg.end_validation_min_future_s > (validation_hi + _BOUNDS_EPSILON_S):
-            verdict = _grounding_abstain(
-                verdict,
-                "insufficient_future_context",
-                f"refined onset at t={verdict.end_s:.3f}s needs "
-                f"{cfg.end_validation_min_future_s:.2f}s of future context within "
-                f"this window, but only {validation_hi - verdict.end_s:.2f}s of "
-                f"submitted evidence follows it (window ends at t={validation_hi:.2f}s)",
-            )
+    if refine_verdict.status is not TimingStatus.CONFIRMED:
+        # The refine sheet was reached (the coarse sheet did point at a
+        # possible collapse) and still could not confirm - tag the
+        # cascade's own terminal reason alongside whatever specific reason
+        # the refine stage itself already gave, rather than replacing it.
+        merged_reasons = dict.fromkeys((*refine_verdict.reason_codes, "cascade_unconfirmed"))
+        refine_verdict = replace(refine_verdict, reason_codes=tuple(merged_reasons))
     return _EndValidationOutcome(
-        verdict=verdict,
-        response=response,
-        submitted_timestamps_s=submitted,
-        window_s=(validation_lo, validation_hi),
+        verdict=refine_verdict,
+        response=refine_response,
+        submitted_timestamps_s=refine_submitted,
+        window_s=(refine_submitted[0], refine_submitted[-1]),
+        coarse_cascade_verdict=coarse_verdict,
+        coarse_cascade_response=coarse_response,
+        coarse_cascade_submitted_timestamps_s=coarse_submitted,
     )
 
 
@@ -1616,20 +1867,13 @@ def run_llm_timing(
         )
         derived["candidate_conflict"] = conflict
 
-        # The dense validation window is a WIDE, coherent region around the
-        # candidate being checked, not a narrow point-anchored one: three
-        # consecutive real gate-1 reruns nominated candidates at 16.5s,
-        # 18.5s, and 21.5s against a true break near 20.5s - a sparse
-        # pass's own error can exceed a few seconds in either direction,
-        # and a window built only from a tight baseline/horizon around a
-        # wrong candidate structurally excludes the true break, whatever
-        # the candidate turns out to be. Clamped by locked_start_s and
-        # duration_s; PipelineConfig.validate() already guarantees
-        # end_validation_pre_s + end_validation_post_s fits the hard
-        # end_validation_max_span_s cap, so each call below is still one
-        # coherent request, never an open-ended search (supervisor-
-        # directed, see diagnostics/llm_spike/DESIGN.md) - a conflict adds
-        # at most ONE extra such call, never more.
+        # The candidate-centred contact-sheet cascade (coarse 9-panel sheet,
+        # and - only when it abstains but points at a possible collapse -
+        # one denser 7-panel refine sheet) is still one bounded check per
+        # candidate, never an open-ended search (supervisor-directed, see
+        # diagnostics/llm_spike/DESIGN.md and PROMPT_END_CASCADE_COARSE_V1/
+        # PROMPT_END_CASCADE_REFINE_V1) - a conflict adds at most ONE extra
+        # such (up to two-call) check, never more.
         primary = _run_end_validation_pass(
             reader,
             candidate_ts=candidate_ts,
@@ -1640,32 +1884,16 @@ def run_llm_timing(
             provider=provider,
             on_stage=on_stage,
         )
-        if primary is None:
-            validation_lo, validation_hi = _validation_window_for(
-                candidate_ts, locked_start_s, duration_s, cfg
-            )
-            abstain = _oversized_abstain(
-                PROMPT_END_VALIDATE_V4_ID,
-                "end_validate",
-                f"candidate at t={candidate_ts:.2f}s: validation window "
-                f"[{validation_lo:.2f}, {validation_hi:.2f}]s still exceeds the request "
-                f"byte budget even at the sparsest sampling that meets the target "
-                f"tolerance",
-            )
-            return PipelineOutcome(
-                verdict=abstain,
-                event=None,
-                coarse_response=coarse_response,
-                fine_response=fine_response,
-                end_coarse_response=end_coarse_response,
-                pass_verdicts=dict(pass_verdicts),
-                pass_frames=dict(pass_frames),
-                derived=dict(derived),
-            )
 
         pass_verdicts["end_validate"] = primary.verdict
         pass_frames["end_validate"] = primary.submitted_timestamps_s
         derived["end_validation_window_s"] = list(primary.window_s)
+        if primary.coarse_cascade_verdict is not None:
+            pass_verdicts["end_validate_coarse_cascade"] = primary.coarse_cascade_verdict
+            assert primary.coarse_cascade_submitted_timestamps_s is not None
+            pass_frames["end_validate_coarse_cascade"] = (
+                primary.coarse_cascade_submitted_timestamps_s
+            )
         # Computed regardless of whether validation confirmed - even a
         # rejected/abstained candidate should show which cited evidence (if
         # any) was closest to it, per the same "never fabricate, but always
@@ -1692,18 +1920,25 @@ def run_llm_timing(
                 provider=provider,
                 on_stage=on_stage,
             )
-            if secondary is not None:
-                pass_verdicts["end_validate_conflict"] = secondary.verdict
-                pass_frames["end_validate_conflict"] = secondary.submitted_timestamps_s
-                derived["end_validation_conflict_window_s"] = list(secondary.window_s)
-                derived["end_conflict_evidence_s"] = _nearest_grounded_evidence_ts(
-                    secondary.verdict.evidence_frame_timestamps_s,
-                    secondary.submitted_timestamps_s,
-                    (
-                        secondary.verdict.end_s
-                        if secondary.verdict.end_s is not None
-                        else coarse_end_estimate_s
-                    ),
+            pass_verdicts["end_validate_conflict"] = secondary.verdict
+            pass_frames["end_validate_conflict"] = secondary.submitted_timestamps_s
+            derived["end_validation_conflict_window_s"] = list(secondary.window_s)
+            derived["end_conflict_evidence_s"] = _nearest_grounded_evidence_ts(
+                secondary.verdict.evidence_frame_timestamps_s,
+                secondary.submitted_timestamps_s,
+                (
+                    secondary.verdict.end_s
+                    if secondary.verdict.end_s is not None
+                    else coarse_end_estimate_s
+                ),
+            )
+            if secondary.coarse_cascade_verdict is not None:
+                pass_verdicts["end_validate_conflict_coarse_cascade"] = (
+                    secondary.coarse_cascade_verdict
+                )
+                assert secondary.coarse_cascade_submitted_timestamps_s is not None
+                pass_frames["end_validate_conflict_coarse_cascade"] = (
+                    secondary.coarse_cascade_submitted_timestamps_s
                 )
 
         primary_confirmed = primary.verdict.status is TimingStatus.CONFIRMED
@@ -1739,7 +1974,7 @@ def run_llm_timing(
                 abstain_verdict = TimingVerdict.abstain(
                     reason_codes=("ambiguous_evidence",),
                     model_id=primary.verdict.model_id,
-                    prompt_version=PROMPT_END_VALIDATE_V4_ID,
+                    prompt_version=primary.verdict.prompt_version,
                     raw_notes=(
                         f"both the end-coarse candidate (confirmed at "
                         f"t={primary.verdict.end_s:.3f}s) and the coarse pass's own "
@@ -1763,16 +1998,20 @@ def run_llm_timing(
                 fine_response=fine_response,
                 end_coarse_response=end_coarse_response,
                 end_validation_response=primary.response,
+                end_validation_coarse_cascade_response=primary.coarse_cascade_response,
                 end_validation_conflict_response=(secondary.response if secondary else None),
+                end_validation_conflict_coarse_cascade_response=(
+                    secondary.coarse_cascade_response if secondary else None
+                ),
                 pass_verdicts=dict(pass_verdicts),
                 pass_frames=dict(pass_frames),
                 derived=dict(derived),
             )
 
-        # Report the chosen validation pass's own (possibly refined) onset,
-        # not necessarily the end-coarse candidate that nominated the
-        # primary window: PROMPT_END_VALIDATE_V4 is deliberately allowed to
-        # localize the true onset anywhere within its own grounded window,
+        # Report the chosen cascade's own (possibly refined) onset, not
+        # necessarily the end-coarse candidate that nominated the primary
+        # sheet: the cascade is deliberately allowed to localize the true
+        # onset anywhere within its own grounded panels,
         # and - when a conflict was resolved in the coarse estimate's
         # favor - the reported onset instead comes from that independently-
         # anchored window. The future-context guarantee for this exact
@@ -1821,12 +2060,12 @@ def run_llm_timing(
             ),
             trend_checkpoint_timestamps_s=chosen.verdict.trend_checkpoint_timestamps_s,
             model_id=chosen.verdict.model_id,
-            prompt_version=PROMPT_END_VALIDATE_V4_ID,
+            prompt_version=chosen.verdict.prompt_version,
             raw_notes=(
                 f"start confirmed via {PROMPT_START_REFINE_V1_ID}; candidate break "
                 f"nominated via {PROMPT_END_COARSE_V2_ID} at t={candidate_ts:.3f}s"
                 f"{conflict_note}; refined and confirmed as a sustained trend via "
-                f"{PROMPT_END_VALIDATE_V4_ID} at t={chosen.verdict.end_s:.3f}s"
+                f"{chosen.verdict.prompt_version} at t={chosen.verdict.end_s:.3f}s"
                 f"{source_note}"
             ),
         )
@@ -1865,7 +2104,7 @@ def run_llm_timing(
                 "model_id": final_verdict.model_id,
                 "start_prompt_version": PROMPT_START_REFINE_V1_ID,
                 "end_coarse_prompt_version": PROMPT_END_COARSE_V2_ID,
-                "end_validate_prompt_version": PROMPT_END_VALIDATE_V4_ID,
+                "end_validate_prompt_version": chosen.verdict.prompt_version,
                 "coarse_start_s": coarse_verdict.start_s,
                 "coarse_end_s": coarse_verdict.end_s,
                 "end_coarse_candidate_s": candidate_ts,
@@ -1885,7 +2124,11 @@ def run_llm_timing(
             fine_response=fine_response,
             end_coarse_response=end_coarse_response,
             end_validation_response=primary.response,
+            end_validation_coarse_cascade_response=primary.coarse_cascade_response,
             end_validation_conflict_response=(secondary.response if secondary else None),
+            end_validation_conflict_coarse_cascade_response=(
+                secondary.coarse_cascade_response if secondary else None
+            ),
             pass_verdicts=dict(pass_verdicts),
             pass_frames=dict(pass_frames),
             derived=dict(derived),

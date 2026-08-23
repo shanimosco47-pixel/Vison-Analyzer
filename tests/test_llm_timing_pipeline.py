@@ -14,6 +14,8 @@ the two hand-verified real clips, neither of which exist in this repo.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.analysis.base_detector import EventStatus
@@ -28,8 +30,9 @@ from app.analysis.llm_timing.provider import (
     RawProviderResponse,
     StubTimingProvider,
     canned_json_response,
+    cascade_abstain_response,
+    cascade_confirmed_response,
     parse_raw_response,
-    spaced_trend_checkpoints,
 )
 from app.analysis.llm_timing.schema import TimingStatus, TimingVerdict
 from app.errors import ConfigurationError
@@ -38,35 +41,28 @@ PROMPT_VERSION = "test-prompt-v1"
 
 
 def _candidate_timestamp(request: ProviderRequest) -> float:
-    """The timestamp of the frame the pipeline marked as the trend-
-    validation candidate (see ``TimedFrame.is_candidate``) - every
-    "end_validate" request has exactly one."""
-    for frame in request.frames:
-        if frame.is_candidate:
-            return frame.timestamp_s
-    raise AssertionError("end_validate request missing a candidate-marked frame")
+    """The candidate the pipeline centred this contact-sheet cascade
+    request on - the middle panel of ``grounding_timestamps_s`` (see
+    ``pipeline._build_cascade_request``: the coarse sheet's own 9 panels
+    are always centred on the candidate wherever the scannable bounds
+    allow it)."""
+    panels = sorted(request.grounding_timestamps_s or ())
+    if not panels:
+        raise AssertionError("end_validate cascade request missing grounding_timestamps_s")
+    return panels[len(panels) // 2]
 
 
 def _confirm_validation(
     request: ProviderRequest, *, confidence: float = 0.9
 ) -> RawProviderResponse:
-    """A perfect trend-validation stub response: always validates whichever
-    candidate the pipeline flagged, citing a compliant pair of trend
-    checkpoints drawn from the request's own submitted frames (see
-    ``provider.spaced_trend_checkpoints``) so the response actually reaches
-    CONFIRMED under ``pipeline._validate_trend_checkpoints``. Good enough
-    for tests whose synthetic fixture has a single genuine, sustained break
-    with no recovery - the dedicated trend-validation regressions below
-    script something more specific."""
-    ts = _candidate_timestamp(request)
-    checkpoints = spaced_trend_checkpoints(request.frames, ts)
-    return canned_json_response(
-        start_s=ts,
-        end_s=ts,
-        confidence=confidence,
-        evidence_frame_timestamps_s=(ts,) + checkpoints,
-        trend_checkpoint_timestamps_s=checkpoints,
-    )
+    """A perfect cascade stub response: always confirms the coarse sheet's
+    own centred candidate, citing every later panel as a trend checkpoint
+    (see ``provider.cascade_confirmed_response``) so the response actually
+    reaches CONFIRMED under ``pipeline._validate_cascade_trend_checkpoints``.
+    Good enough for tests whose synthetic fixture has a single genuine,
+    sustained break with no recovery - the dedicated trend-validation
+    regressions below script something more specific."""
+    return cascade_confirmed_response(request, confidence=confidence)
 
 
 # --------------------------------------------------------------------------- #
@@ -783,14 +779,13 @@ def test_pipeline_abstains_when_the_only_candidate_fails_trend_validation(zahn_v
 def test_pipeline_clamps_the_validation_window_to_locked_start_s_for_an_early_candidate(
     zahn_video,
 ):
-    """A candidate close enough to the confirmed start that
-    ``candidate_ts - end_validation_pre_s`` would fall before it must have
-    its validation window clamped at ``locked_start_s``, never reaching
-    back before the confirmed start of the stream itself."""
-    # locked_start_s is 4.0 (default fine_margin_s=1.5 puts start_hi at
-    # 5.5) - scan_from_s is 5.5, so the earliest reachable candidate is
-    # just past that; end_validation_pre_s=4.0 would reach back to 1.5s,
-    # before the confirmed start, without the clamp.
+    """A candidate close enough to the confirmed start that the coarse
+    contact sheet's own ``candidate_ts - 2.0s`` would fall before it must
+    have its panels clamped (shifted, never reaching back before
+    ``locked_start_s``) - see ``pipeline._shift_window_into_bounds``."""
+    # locked_start_s is 4.0; end-coarse candidate 6.0 would ideally centre
+    # the coarse sheet at [4.0, 8.0] - already flush against locked_start_s,
+    # so the low edge cannot shift any further back.
     early_candidate_s = 6.0
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
@@ -820,21 +815,19 @@ def test_pipeline_clamps_the_validation_window_to_locked_start_s_for_an_early_ca
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
     validate_call = next(c for c in provider.calls if c.pass_name == "end_validate")
-    validate_times = [f.timestamp_s for f in validate_call.frames]
-    assert min(validate_times) == pytest.approx(4.0, abs=0.1)  # clamped, not 6.0 - 4.0 = 2.0
+    validate_times = validate_call.grounding_timestamps_s
+    assert min(validate_times) == pytest.approx(4.0, abs=0.01)  # clamped, not 6.0 - 2.0 = 4.0
 
 
 def test_pipeline_clamps_the_validation_window_to_the_clip_end_and_still_confirms(zahn_video):
-    """A candidate close to the end of the clip gets a validation window
-    clamped at ``duration_s`` (never past the clip), but the request is
-    still sent - unlike the earlier pre-flight design, clip-end clamping
-    alone is no longer a reason to abstain before even asking. If the
-    refined onset reported still has enough of *this clamped window's own*
-    future evidence after it, the run confirms normally."""
-    # duration_s is 26.0; end_validation_post_s defaults to 6.0, so an
-    # unclamped window would reach to 29.0s - past the clip - and must be
-    # clamped to 26.0 instead.
-    near_end_candidate_s = 23.0
+    """A candidate close to the end of the clip gets its coarse sheet's
+    panels clamped (shifted, never past ``duration_s``), but the request
+    is still sent and can still confirm normally from that shifted
+    window."""
+    # duration_s is 26.0; a candidate at 25.0s would ideally centre the
+    # coarse sheet at [23.0, 27.0] - past the clip - so it must shift back
+    # to [22.0, 26.0] instead.
+    near_end_candidate_s = 25.0
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
@@ -862,29 +855,22 @@ def test_pipeline_clamps_the_validation_window_to_the_clip_end_and_still_confirm
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
-    assert outcome.event.end_s == pytest.approx(near_end_candidate_s)
     validate_call = next(c for c in provider.calls if c.pass_name == "end_validate")
-    validate_times = [f.timestamp_s for f in validate_call.frames]
-    assert max(validate_times) == pytest.approx(zahn_video.duration_s, abs=0.1)  # clamped to 26.0
+    validate_times = validate_call.grounding_timestamps_s
+    assert max(validate_times) == pytest.approx(zahn_video.duration_s, abs=0.01)  # clamped to 26.0
+    assert min(validate_times) == pytest.approx(22.0, abs=0.01)  # shifted back, still a 4.0s span
 
 
-def test_pipeline_sends_validation_then_abstains_when_clip_end_clamping_leaves_no_future_room(
+def test_pipeline_abstains_when_the_last_panel_has_no_room_for_a_trend_checkpoint(
     zahn_video,
 ):
-    """The mandatory future-evidence rule is now checked against the
-    validation window's own actual (possibly clip-clamped) upper bound,
-    after the response comes back - not as a pre-flight refusal to even
-    ask, per the old design. A candidate near enough to the clip's own end
-    that even the clamped window leaves no room for the refined onset's
-    required future evidence must still abstain, but only after the
-    validation request was actually sent."""
-    # duration_s is 26.0 - a candidate at 24.3s clamps the window to
-    # [20.3, 26.0]s (1.7s of nominal future room from the reported onset):
-    # enough for two trend checkpoints spaced >=0.75s apart (so the new
-    # insufficient_trend_horizon check does not fire first), but still
-    # under the 2.0s end_validation_min_future_s floor if the model
-    # reports the candidate itself as the onset.
-    near_end_candidate_s = 24.3
+    """A candidate near enough to the clip's own end that the coarse
+    sheet's panels shift to end exactly at ``duration_s`` leaves no later
+    panel at all if the model reports the very last panel as the onset -
+    the cascade's own trend-checkpoint gate (never fewer than two later,
+    grounded panels) catches this structurally, without needing a separate
+    future-context floor."""
+    near_end_candidate_s = 25.0  # coarse sheet shifts to [22.0, 26.0]
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
@@ -894,7 +880,15 @@ def test_pipeline_sends_validation_then_abstains_when_clip_end_clamping_leaves_n
                 start_s=4.0, end_s=4.0, confidence=0.9, evidence_frame_timestamps_s=(4.0,)
             )
         if request.pass_name == "end_validate":
-            return _confirm_validation(request)
+            panels = sorted(request.grounding_timestamps_s or ())
+            last = panels[-1]
+            return canned_json_response(
+                start_s=last,
+                end_s=last,
+                confidence=0.9,
+                evidence_frame_timestamps_s=(last,),
+                trend_checkpoint_timestamps_s=(),
+            )
         assert request.pass_name == "end_coarse"
         return canned_json_response(
             start_s=near_end_candidate_s,
@@ -912,9 +906,7 @@ def test_pipeline_sends_validation_then_abstains_when_clip_end_clamping_leaves_n
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
-    assert "insufficient_future_context" in outcome.verdict.reason_codes
-    # Unlike the old pre-flight design, the validation request WAS sent -
-    # only the response's own reported onset was rejected.
+    assert "insufficient_trend_horizon" in outcome.verdict.reason_codes
     assert [c.pass_name for c in provider.calls] == [
         "coarse",
         "fine",
@@ -980,17 +972,13 @@ def test_pipeline_reaches_the_true_break_in_one_call_when_end_coarse_avoids_the_
 def test_pipeline_accepts_a_validation_refined_onset_earlier_than_the_sparse_candidate(
     zahn_video,
 ):
-    """Reproduces the shape of a real whole-clip rerun (commit 86c083d):
-    the sparse end-coarse pass nominated 21.5s, a second too late; the
-    dense validation window - which already reaches back to
-    ``candidate - end_validation_pre_s`` by design - contained the true
-    onset at 20.5s. PROMPT_END_VALIDATE_V2 is explicitly allowed to report
-    that earlier, better-supported timestamp instead of only confirming
-    or rejecting the sparse candidate verbatim, and the pipeline must
-    report the validation pass's own (refined) answer, not the coarse
-    candidate that only nominated the window to search."""
+    """The coarse contact sheet is explicitly allowed to report an earlier,
+    better-supported onset than the end-coarse candidate that centred it -
+    a panel earlier in the same 9-panel sheet, not just the candidate
+    verbatim - and the pipeline must report the cascade's own (refined)
+    answer, not the coarse candidate that only nominated the sheet."""
     sparse_candidate_s = 21.5
-    refined_onset_s = 20.5  # comfortably within [17.5, 26.0] at the default 4.0s pre-margin
+    refined_onset_s = 20.5  # one panel (1.0s) earlier - well within the same 9-panel sheet
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
@@ -998,14 +986,9 @@ def test_pipeline_accepts_a_validation_refined_onset_earlier_than_the_sparse_can
         if request.pass_name == "fine":
             return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         if request.pass_name == "end_validate":
-            checkpoints = spaced_trend_checkpoints(request.frames, refined_onset_s)
-            return canned_json_response(
-                start_s=refined_onset_s,
-                end_s=refined_onset_s,
-                confidence=0.9,
-                evidence_frame_timestamps_s=(refined_onset_s,) + checkpoints,
-                trend_checkpoint_timestamps_s=checkpoints,
-            )
+            panels = sorted(request.grounding_timestamps_s or ())
+            onset_index = panels.index(min(panels, key=lambda t: abs(t - refined_onset_s)))
+            return cascade_confirmed_response(request, onset_index=onset_index)
         assert request.pass_name == "end_coarse"
         return canned_json_response(
             start_s=sparse_candidate_s,
@@ -1030,22 +1013,17 @@ def test_pipeline_accepts_a_validation_refined_onset_earlier_than_the_sparse_can
     assert outcome.event.details["end_coarse_candidate_s"] == pytest.approx(sparse_candidate_s)
 
 
-def test_pipeline_reaches_a_break_the_old_narrow_validation_window_could_not_reach(zahn_video):
-    """Reproduces the exact shape of a real whole-clip rerun (commit
-    b42bb9a): the sparse end-coarse pass nominated 16.5s - now ~4s
-    *before* the true break (~20.5s), rather than after it. Under the old
-    point-anchored window (``candidate_ts - 1.0s`` to
-    ``candidate_ts + 2.0s``, i.e. ``[15.5, 18.5]``), the true break was
-    structurally unreachable - not merely missed, but nowhere in the
-    request at all - so even a clean CONFIRMED there would have been
-    wrong by roughly 4 seconds. The wider default window
-    (``end_validation_pre_s``/``end_validation_post_s`` = 4.0s/6.0s) now
-    reaches ``[12.5, 22.5]``, which does contain 20.5s, and the dense
-    validation pass - which scans its whole batch chronologically per
-    PROMPT_END_VALIDATE_V2 - can refine forward from the sparse (wrong,
-    too-early) candidate to the true, later, evidence-supported onset."""
-    sparse_candidate_s = 16.5  # a real end-coarse nomination that was ~4s early
-    true_break_s = 20.5
+def test_pipeline_reaches_a_break_within_the_coarse_sheets_own_reach(zahn_video):
+    """The coarse sheet still refines forward within its own 9-panel reach
+    (+/-2.0s around the candidate): a sparse end-coarse nomination that is
+    close but not exact still lets the cascade report the true, later
+    onset it can see in the same sheet - it does not have to be the exact
+    candidate. (The cascade's own reach is deliberately narrower than the
+    old dense window's wide pre/post margins - the end-coarse pass itself
+    is responsible for a reasonably-close candidate; see
+    diagnostics/llm_spike/DESIGN.md for the accepted tradeoff.)"""
+    sparse_candidate_s = 19.0  # a real end-coarse nomination that was ~1.0s early
+    true_break_s = 20.0  # within [17.0, 21.0], with room for 2 later checkpoints
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
@@ -1057,15 +1035,10 @@ def test_pipeline_reaches_a_break_the_old_narrow_validation_window_could_not_rea
         if request.pass_name == "end_validate":
             # A compliant model rejects the early transient near the
             # sparse candidate and reports the true, later, sustained
-            # onset it can see later in this same wide batch.
-            checkpoints = spaced_trend_checkpoints(request.frames, true_break_s)
-            return canned_json_response(
-                start_s=true_break_s,
-                end_s=true_break_s,
-                confidence=0.9,
-                evidence_frame_timestamps_s=(true_break_s,) + checkpoints,
-                trend_checkpoint_timestamps_s=checkpoints,
-            )
+            # onset it can see later in this same sheet.
+            panels = sorted(request.grounding_timestamps_s or ())
+            onset_index = panels.index(min(panels, key=lambda t: abs(t - true_break_s)))
+            return cascade_confirmed_response(request, onset_index=onset_index)
         assert request.pass_name == "end_coarse"
         return canned_json_response(
             start_s=sparse_candidate_s,
@@ -1085,11 +1058,8 @@ def test_pipeline_reaches_a_break_the_old_narrow_validation_window_could_not_rea
     assert outcome.event is not None
     assert outcome.event.end_s == pytest.approx(true_break_s)
     assert outcome.event.details["end_coarse_candidate_s"] == pytest.approx(sparse_candidate_s)
-    # The window actually sent reaches well past where the old 2.0s
-    # horizon would have stopped (18.5s) - it must cover the true break.
     validate_call = next(c for c in provider.calls if c.pass_name == "end_validate")
-    validate_times = [f.timestamp_s for f in validate_call.frames]
-    assert max(validate_times) >= true_break_s
+    assert max(validate_call.grounding_timestamps_s) >= true_break_s
 
 
 def test_pipeline_abstains_when_a_refined_onset_falls_outside_the_validation_window(zahn_video):
@@ -1132,71 +1102,13 @@ def test_pipeline_abstains_when_a_refined_onset_falls_outside_the_validation_win
     assert "out_of_bounds" in outcome.verdict.reason_codes
 
 
-def test_pipeline_abstains_when_the_refined_onset_has_no_room_for_its_own_future_horizon(
-    zahn_video,
-):
-    """The mandatory future-context rule is re-checked against whatever
-    timestamp validation actually reports, not just the original sparse
-    candidate: refining forward, toward the validation window's own edge,
-    leaves less than the mandatory ``end_validation_min_future_s`` of
-    submitted evidence after it - the pipeline must catch this
-    structurally rather than trust the model's own compliance."""
-    candidate_s = 10.0
-    # Window is [6.0, 16.0] (locked_start_s=4.0 clamps the low side;
-    # candidate_s + end_validation_post_s=6.0 sets the high side). A
-    # refined onset at 14.3s has 1.7s of submitted evidence after it within
-    # this window - enough for two trend checkpoints spaced >=0.75s apart
-    # (so insufficient_trend_horizon does not fire first), but still short
-    # of the 2.0s end_validation_min_future_s floor.
-    forward_point_s = 14.3
-
-    def respond(request: ProviderRequest) -> RawProviderResponse:
-        if request.pass_name == "coarse":
-            return canned_json_response(start_s=4.0, end_s=candidate_s, confidence=0.9)
-        if request.pass_name == "fine":
-            return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
-        if request.pass_name == "end_validate":
-            checkpoints = spaced_trend_checkpoints(request.frames, forward_point_s)
-            return canned_json_response(
-                start_s=forward_point_s,
-                end_s=forward_point_s,
-                confidence=0.9,
-                evidence_frame_timestamps_s=(forward_point_s,) + checkpoints,
-                trend_checkpoint_timestamps_s=checkpoints,
-            )
-        assert request.pass_name == "end_coarse"
-        return canned_json_response(
-            start_s=candidate_s,
-            end_s=candidate_s,
-            confidence=0.9,
-            evidence_frame_timestamps_s=(candidate_s,),
-        )
-
-    provider = StubTimingProvider(respond)
-    outcome = run_llm_timing(
-        zahn_video.path,
-        provider,
-        prompt_version=PROMPT_VERSION,
-        prompt_text="irrelevant for a stub",
-    )
-    assert outcome.verdict.status is TimingStatus.ABSTAIN
-    assert outcome.event is None
-    assert "insufficient_future_context" in outcome.verdict.reason_codes
-    # Unlike the pre-flight check for the sparse candidate, this abstain
-    # only happens after the validation call actually ran and answered.
-    assert [c.pass_name for c in provider.calls] == [
-        "coarse",
-        "fine",
-        "end_coarse",
-        "end_validate",
-    ]
-
-
-def test_pipeline_accepts_a_candidate_with_sustained_per_second_shortening(zahn_video):
+def test_pipeline_accepts_a_candidate_with_sustained_shortening_across_later_panels(zahn_video):
     """The straightforward positive case: a candidate break whose
-    post-candidate frames show a clear, sustained shortening trend -
-    evidence cited at the candidate itself plus later per-checkpoint
-    frames - is accepted, no rejection needed."""
+    later-panel evidence shows a clear, sustained shortening trend is
+    accepted, no rejection needed. (The contact-sheet cascade's fixed-size
+    panels are never subject to the old dense method's per-request byte
+    budget, so there is no "too large to fit" abstain path to test here -
+    a composite grid image is always small and bounded by construction.)"""
     candidate_s = 12.0
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
@@ -1205,25 +1117,7 @@ def test_pipeline_accepts_a_candidate_with_sustained_per_second_shortening(zahn_
         if request.pass_name == "fine":
             return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         if request.pass_name == "end_validate":
-            candidate_ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-            later_frames = sorted(
-                f.timestamp_s for f in request.frames if f.timestamp_s > candidate_ts
-            )
-            # Cite the candidate plus two later checkpoints - a stand-in for
-            # "checked roughly per second through the validation horizon".
-            trend_checkpoints = spaced_trend_checkpoints(request.frames, candidate_ts)
-            checkpoints = (
-                (candidate_ts, later_frames[len(later_frames) // 2], later_frames[-1])
-                if later_frames
-                else (candidate_ts,)
-            )
-            return canned_json_response(
-                start_s=candidate_ts,
-                end_s=candidate_ts,
-                confidence=0.95,
-                evidence_frame_timestamps_s=checkpoints,
-                trend_checkpoint_timestamps_s=trend_checkpoints,
-            )
+            return cascade_confirmed_response(request, confidence=0.95)
         assert request.pass_name == "end_coarse"
         return canned_json_response(
             start_s=candidate_s,
@@ -1243,55 +1137,6 @@ def test_pipeline_accepts_a_candidate_with_sustained_per_second_shortening(zahn_
     assert outcome.event is not None
     assert outcome.event.end_s == pytest.approx(candidate_s)
     assert outcome.end_validation_response is not None  # validated immediately, no rejects
-
-
-def test_pipeline_abstains_with_request_too_large_when_the_wide_validation_window_cannot_fit(
-    zahn_video,
-):
-    """The dense validation window is now up to ``end_validation_max_span_s``
-    wide (10.0s by default) - far larger than the ~3s fine window or the
-    sparse coarse/end-coarse batches - so a byte budget that comfortably
-    fits every other pass can still be too small for the validation
-    pass's own precision floor. The validation request must never be
-    sent in that case, same "abstain, never send an undersized or
-    oversized request" contract as every other budget failure (see
-    ``_fit_frames_to_budget``)."""
-    candidate_s = 15.0  # far enough from either clip edge that the window is the full 10.0s
-
-    def respond(request: ProviderRequest) -> RawProviderResponse:
-        if request.pass_name == "coarse":
-            return canned_json_response(start_s=4.0, end_s=candidate_s, confidence=0.9)
-        if request.pass_name == "fine":
-            return canned_json_response(
-                start_s=4.0, end_s=4.0, confidence=0.9, evidence_frame_timestamps_s=(4.0,)
-            )
-        assert request.pass_name == "end_coarse"
-        return canned_json_response(
-            start_s=candidate_s,
-            end_s=candidate_s,
-            confidence=0.9,
-            evidence_frame_timestamps_s=(candidate_s,),
-        )
-
-    provider = StubTimingProvider(respond)
-    # A tight target_tolerance_s inflates every window's own precision
-    # floor (frame count needed), but the validation window (~10s) is far
-    # wider than the fine window (~3s), so its floor grows disproportion-
-    # ately more - a budget sized to comfortably fit coarse/fine/end-coarse
-    # at this tolerance still can't fit the validation pass's own floor.
-    config = PipelineConfig(max_request_bytes=800_000, target_tolerance_s=0.1)
-    outcome = run_llm_timing(
-        zahn_video.path,
-        provider,
-        prompt_version=PROMPT_VERSION,
-        prompt_text="irrelevant for a stub",
-        config=config,
-    )
-    assert outcome.verdict.status is TimingStatus.ABSTAIN
-    assert outcome.event is None
-    assert "request_too_large" in outcome.verdict.reason_codes
-    assert [c.pass_name for c in provider.calls] == ["coarse", "fine", "end_coarse"]
-    assert outcome.end_validation_response is None  # never sent
 
 
 def test_pipeline_calls_on_stage_before_each_pass_it_actually_reaches(zahn_video):
@@ -1368,14 +1213,7 @@ def test_pipeline_records_pass_frames_matching_the_actual_submitted_requests(zah
         if request.pass_name == "fine":
             return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         if request.pass_name == "end_validate":
-            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-            checkpoints = spaced_trend_checkpoints(request.frames, ts)
-            return canned_json_response(
-                start_s=ts,
-                end_s=ts,
-                confidence=0.9,
-                trend_checkpoint_timestamps_s=checkpoints,
-            )
+            return cascade_confirmed_response(request)
         assert request.pass_name == "end_coarse"
         return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
 
@@ -1387,7 +1225,16 @@ def test_pipeline_records_pass_frames_matching_the_actual_submitted_requests(zah
     assert set(outcome.pass_frames) == {"coarse", "fine", "end_coarse", "end_validate"}
     calls_by_pass = {c.pass_name: c for c in provider.calls}
     for pass_name, call in calls_by_pass.items():
-        expected = tuple(sorted(f.timestamp_s for f in call.frames))
+        # A contact-sheet cascade request ("end_validate") carries several
+        # logical panel timestamps in grounding_timestamps_s despite being
+        # ONE composite image (one TimedFrame) - every other pass still has
+        # exactly one timestamp per TimedFrame, so grounding_timestamps_s is
+        # unset there and this falls back to the frame timestamps.
+        expected = tuple(
+            sorted(call.grounding_timestamps_s)
+            if call.grounding_timestamps_s is not None
+            else sorted(f.timestamp_s for f in call.frames)
+        )
         actual = tuple(sorted(outcome.pass_frames[pass_name]))
         assert actual == expected, pass_name
 
@@ -1431,14 +1278,7 @@ def test_pipeline_thinned_pass_frames_match_the_frames_actually_sent(zahn_video)
                 start_s=4.0, end_s=4.0, confidence=0.9, evidence_frame_timestamps_s=(4.0,)
             )
         if request.pass_name == "end_validate":
-            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-            checkpoints = spaced_trend_checkpoints(request.frames, ts)
-            return canned_json_response(
-                start_s=ts,
-                end_s=ts,
-                confidence=0.9,
-                trend_checkpoint_timestamps_s=checkpoints,
-            )
+            return cascade_confirmed_response(request)
         assert request.pass_name == "end_coarse"
         return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
 
@@ -1472,14 +1312,7 @@ def test_pipeline_confirmed_result_exposes_grounded_evidence_timestamps(zahn_vid
         if request.pass_name == "fine":
             return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         if request.pass_name == "end_validate":
-            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-            checkpoints = spaced_trend_checkpoints(request.frames, ts)
-            return canned_json_response(
-                start_s=ts,
-                end_s=ts,
-                confidence=0.9,
-                trend_checkpoint_timestamps_s=checkpoints,
-            )
+            return cascade_confirmed_response(request)
         assert request.pass_name == "end_coarse"
         return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
 
@@ -1530,14 +1363,7 @@ def test_pipeline_confirmed_result_populates_derived_decisions(zahn_video):
         if request.pass_name == "fine":
             return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         if request.pass_name == "end_validate":
-            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-            checkpoints = spaced_trend_checkpoints(request.frames, ts)
-            return canned_json_response(
-                start_s=ts,
-                end_s=ts,
-                confidence=0.9,
-                trend_checkpoint_timestamps_s=checkpoints,
-            )
+            return cascade_confirmed_response(request)
         assert request.pass_name == "end_coarse"
         return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
 
@@ -1559,12 +1385,10 @@ def test_pipeline_confirmed_result_populates_derived_decisions(zahn_video):
 def test_pipeline_derived_decisions_survive_a_rejected_end_candidate(zahn_video):
     """The chain "sparse frames -> candidate -> validation window -> final
     result" must be reconstructible even when the run does NOT confirm -
-    e.g. a plausible-looking end-coarse candidate whose own dense
-    validation window rejects it. This is the exact shape a real operator
-    reported (end-coarse nominates ~5.5s; the validation window this
-    produces, [1.5, 11.5]s under the default margins, is set before the
-    validation call even runs - and is preserved here even though the
-    call itself abstains)."""
+    e.g. a plausible-looking end-coarse candidate whose own coarse contact
+    sheet rejects it. The window ([3.5, 7.5], centred on the 5.5s
+    candidate) is set before the validation call even runs - and is
+    preserved here even though the call itself abstains)."""
     candidate_s = 5.5
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
@@ -1590,8 +1414,8 @@ def test_pipeline_derived_decisions_survive_a_rejected_end_candidate(zahn_video)
     assert outcome.derived["locked_start_s"] == pytest.approx(1.0)
     assert outcome.derived["end_coarse_candidate_s"] == pytest.approx(candidate_s)
     lo, hi = outcome.derived["end_validation_window_s"]
-    assert lo == pytest.approx(1.5)
-    assert hi == pytest.approx(11.5)
+    assert lo == pytest.approx(3.5)
+    assert hi == pytest.approx(7.5)
     assert lo < candidate_s < hi
     # The sparse and dense frame sets behind this chain are both still on
     # the outcome, so a reader can see exactly what the pipeline actually
@@ -1625,7 +1449,6 @@ def test_pipeline_never_confirms_the_false_early_candidate_when_both_anchors_con
 ):
     false_candidate_s = 5.5  # end-coarse's wrong nomination, per the real audit
     coarse_estimate_s = 21.0  # the coarse pass's own, independent end estimate
-    true_break_s = 20.5  # what the coarse-estimate-anchored window actually finds
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
@@ -1643,31 +1466,15 @@ def test_pipeline_never_confirms_the_false_early_candidate_when_both_anchors_con
         assert request.pass_name == "end_validate"
         candidate_ts = _candidate_timestamp(request)
         if candidate_ts < 15.0:
-            # The exact reported bug's shape, but now with a compliant
-            # (properly-spaced) trend-checkpoint citation - this test is
-            # about the cross-pass conflict resolving to a safe ABSTAIN when
-            # BOTH anchors independently confirm, not about the temporal-
-            # spacing gate itself (see test_pipeline_never_confirms_the_
-            # false_early_candidate_from_native_fps_jitter for that).
-            checkpoints = spaced_trend_checkpoints(request.frames, candidate_ts)
-            return canned_json_response(
-                start_s=candidate_ts,
-                end_s=candidate_ts,
-                confidence=0.9,
-                evidence_frame_timestamps_s=(candidate_ts,) + checkpoints,
-                trend_checkpoint_timestamps_s=checkpoints,
-            )
+            # The exact reported bug's shape: BOTH anchors independently
+            # confirm - this test is about the cross-pass conflict
+            # resolving to a safe ABSTAIN in that case, not about the
+            # trend-checkpoint gate itself.
+            return cascade_confirmed_response(request)
+        # The coarse-estimate-anchored window ALSO independently confirms.
         # The coarse-estimate-anchored window independently confirms the
         # real, later break.
-        ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - true_break_s))
-        checkpoints = spaced_trend_checkpoints(request.frames, ts)
-        return canned_json_response(
-            start_s=ts,
-            end_s=ts,
-            confidence=0.9,
-            evidence_frame_timestamps_s=(ts,) + checkpoints,
-            trend_checkpoint_timestamps_s=checkpoints,
-        )
+        return cascade_confirmed_response(request)
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
@@ -1683,8 +1490,8 @@ def test_pipeline_never_confirms_the_false_early_candidate_when_both_anchors_con
     assert outcome.derived["end_coarse_candidate_s"] == pytest.approx(false_candidate_s)
     assert outcome.derived["coarse_end_estimate_s"] == pytest.approx(coarse_estimate_s)
     lo, hi = outcome.derived["end_validation_window_s"]
-    assert lo == pytest.approx(1.5)
-    assert hi == pytest.approx(11.5)
+    assert lo == pytest.approx(3.5)
+    assert hi == pytest.approx(7.5)
     assert outcome.derived["conflict_resolution"] == "both_confirmed_conflict_abstain"
     assert "ambiguous_evidence" in outcome.verdict.reason_codes
     # Both independently-confirmed candidates stay visible for audit, even
@@ -1724,15 +1531,9 @@ def test_pipeline_reaches_the_true_late_break_via_the_conflict_secondary_validat
                 raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
                 latency_s=0.01,
             )
-        ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - true_break_s))
-        checkpoints = spaced_trend_checkpoints(request.frames, ts)
-        return canned_json_response(
-            start_s=ts,
-            end_s=ts,
-            confidence=0.9,
-            evidence_frame_timestamps_s=(ts,) + checkpoints,
-            trend_checkpoint_timestamps_s=checkpoints,
-        )
+        panels = sorted(request.grounding_timestamps_s or ())
+        onset_index = panels.index(min(panels, key=lambda t: abs(t - true_break_s)))
+        return cascade_confirmed_response(request, onset_index=onset_index)
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
@@ -1770,50 +1571,211 @@ def test_pipeline_reaches_the_true_late_break_via_the_conflict_secondary_validat
 # --------------------------------------------------------------------------- #
 
 
-def _adjacent_jitter_checkpoints(
-    request: ProviderRequest, onset_ts: float, *, count: int = 3
-) -> tuple[float, ...]:
-    """The exact shape the real audit exposed: ``count`` *consecutive*
-    submitted frames immediately after the onset - native-fps adjacent,
-    never spaced anywhere near the 0.75s floor - reproducing "cited three
-    adjacent frames as a sustained trend" independent of this fixture's own
-    frame rate (unlike hard-coding the real run's literal ~33ms-apart
-    floats, which were sampled from a different clip at a different fps and
-    would not land on this fixture's own grid)."""
-    later = sorted(f.timestamp_s for f in request.frames if f.timestamp_s > onset_ts)
-    return tuple(later[:count])
+def _end_coarse_respond(request: ProviderRequest, candidate_s: float) -> RawProviderResponse:
+    ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - candidate_s))
+    return canned_json_response(
+        start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
+    )
 
 
-def test_pipeline_never_confirms_a_trend_from_adjacent_native_fps_jitter(zahn_video):
-    """The primary reported shape in isolation, no cross-pass conflict
-    involved: end-coarse's candidate and the coarse pass's own estimate
-    agree closely, so a single validation call runs - and even though it
-    reports "confirmed", citing three adjacent native-fps frames right
-    after the onset as trend_checkpoint_timestamps_s, the temporal-spacing
-    gate rejects it before it can ever become the reported result."""
+def test_pipeline_confirms_via_the_coarse_cascade_citing_later_panels_as_checkpoints(zahn_video):
+    """The cascade's own happy path: the 9-panel coarse contact sheet
+    confirms the candidate outright, citing later panels as trend
+    checkpoints - no refine sheet is ever built or sent."""
     candidate_s = 7.5
 
     def respond(request: ProviderRequest) -> RawProviderResponse:
         if request.pass_name == "coarse":
-            # Close enough to end-coarse's own nomination that no conflict
-            # is triggered - this test is about the spacing gate alone.
             return canned_json_response(start_s=1.0, end_s=candidate_s, confidence=0.9)
         if request.pass_name == "fine":
             return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
         if request.pass_name == "end_coarse":
-            ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - candidate_s))
-            return canned_json_response(
-                start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
+            return _end_coarse_respond(request, candidate_s)
+        assert request.pass_name == "end_validate"
+        return cascade_confirmed_response(request)
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.event.end_s == pytest.approx(candidate_s)
+    assert len(outcome.verdict.trend_checkpoint_timestamps_s) >= 2
+    assert outcome.end_validation_coarse_cascade_response is None
+    assert "end_validate_coarse_cascade" not in outcome.pass_verdicts
+
+
+def test_pipeline_refines_via_the_denser_lookback_sheet_when_coarse_abstains(zahn_video):
+    """When the coarse sheet cannot itself confirm but points at a possible
+    collapse, the pipeline builds the denser 7-panel refine sheet centred
+    on it and reports the refine sheet's own onset - and both calls stay
+    individually auditable."""
+    candidate_s = 12.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=1.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
+        if request.pass_name == "end_coarse":
+            return _end_coarse_respond(request, candidate_s)
+        assert request.pass_name == "end_validate"
+        if request.prompt_version == "zahn-efflux-end-cascade-coarse-v1":
+            panels = sorted(request.grounding_timestamps_s or ())
+            return cascade_abstain_response(
+                request,
+                reason_codes=("ambiguous_evidence",),
+                possible_collapse_index=len(panels) // 2,
             )
+        return cascade_confirmed_response(request)
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+
+    assert outcome.verdict.status is TimingStatus.CONFIRMED
+    assert outcome.event is not None
+    assert outcome.end_validation_response is not None
+    assert outcome.end_validation_response.model_id == "stub-model"
+    assert outcome.end_validation_coarse_cascade_response is not None
+    assert outcome.pass_verdicts["end_validate_coarse_cascade"].status is TimingStatus.ABSTAIN
+    assert outcome.pass_verdicts["end_validate"].status is TimingStatus.CONFIRMED
+    assert (
+        outcome.pass_verdicts["end_validate"].prompt_version == "zahn-efflux-end-cascade-refine-v1"
+    )
+
+
+def test_pipeline_abstains_when_coarse_cascade_finds_nothing_to_point_at(zahn_video):
+    """A coarse sheet that abstains with no possible_collapse_s ends the
+    cascade right there - never a refine sheet built on nothing."""
+    candidate_s = 12.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=1.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
+        if request.pass_name == "end_coarse":
+            return _end_coarse_respond(request, candidate_s)
+        assert request.pass_name == "end_validate"
+        return cascade_abstain_response(request, reason_codes=("no_break_found",))
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "no_break_found" in outcome.verdict.reason_codes
+    assert outcome.end_validation_coarse_cascade_response is None
+    validate_calls = [c for c in provider.calls if c.pass_name == "end_validate"]
+    assert len(validate_calls) == 1
+
+
+def test_pipeline_abstains_when_the_refine_sheet_also_fails_to_confirm(zahn_video):
+    """The full cascade failure path: coarse points at a possible collapse,
+    the refine sheet is built and sent, and it too cannot confirm - the
+    run abstains with "cascade_unconfirmed" tagged alongside the refine
+    sheet's own reason, and both calls stay individually auditable."""
+    candidate_s = 12.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=1.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
+        if request.pass_name == "end_coarse":
+            return _end_coarse_respond(request, candidate_s)
+        assert request.pass_name == "end_validate"
+        if request.prompt_version == "zahn-efflux-end-cascade-coarse-v1":
+            panels = sorted(request.grounding_timestamps_s or ())
+            return cascade_abstain_response(
+                request,
+                reason_codes=("ambiguous_evidence",),
+                possible_collapse_index=len(panels) // 2,
+            )
+        return cascade_abstain_response(request, reason_codes=("trend_not_sustained",))
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "trend_not_sustained" in outcome.verdict.reason_codes
+    assert "cascade_unconfirmed" in outcome.verdict.reason_codes
+    assert outcome.end_validation_coarse_cascade_response is not None
+    validate_calls = [c for c in provider.calls if c.pass_name == "end_validate"]
+    assert len(validate_calls) == 2
+
+
+def test_pipeline_rejects_an_ungrounded_possible_collapse_s(zahn_video):
+    """A coarse-sheet abstain pointing ``possible_collapse_s`` at a
+    timestamp that was never actually shown in that sheet's panels is a
+    fabrication like any other ungrounded citation - it must not be
+    trusted to seed a refine window."""
+    candidate_s = 12.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=1.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
+        if request.pass_name == "end_coarse":
+            return _end_coarse_respond(request, candidate_s)
+        assert request.pass_name == "end_validate"
+        assert request.prompt_version == "zahn-efflux-end-cascade-coarse-v1"
+        payload_response = cascade_abstain_response(request, reason_codes=("ambiguous_evidence",))
+        # Splice in a possible_collapse_s that was never a submitted panel.
+        payload = json.loads(payload_response.raw_text)
+        payload["possible_collapse_s"] = 999.0
+        return RawProviderResponse(
+            model_id=payload_response.model_id,
+            raw_text=json.dumps(payload),
+            latency_s=payload_response.latency_s,
+        )
+
+    provider = StubTimingProvider(respond)
+    outcome = run_llm_timing(
+        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+    )
+
+    assert outcome.verdict.status is TimingStatus.ABSTAIN
+    assert outcome.event is None
+    assert "ungrounded_evidence" in outcome.verdict.reason_codes
+    validate_calls = [c for c in provider.calls if c.pass_name == "end_validate"]
+    assert len(validate_calls) == 1
+
+
+def test_pipeline_rejects_cascade_trend_checkpoints_not_strictly_after_onset(zahn_video):
+    """A CONFIRMED cascade verdict citing a "checkpoint" that is not
+    strictly after its own reported onset (e.g. the onset panel itself)
+    proves nothing about persistence - rejected same as too few
+    checkpoints."""
+    candidate_s = 12.0
+
+    def respond(request: ProviderRequest) -> RawProviderResponse:
+        if request.pass_name == "coarse":
+            return canned_json_response(start_s=1.0, end_s=candidate_s, confidence=0.9)
+        if request.pass_name == "fine":
+            return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
+        if request.pass_name == "end_coarse":
+            return _end_coarse_respond(request, candidate_s)
         assert request.pass_name == "end_validate"
         onset_ts = _candidate_timestamp(request)
-        jitter = _adjacent_jitter_checkpoints(request, onset_ts)
         return canned_json_response(
             start_s=onset_ts,
             end_s=onset_ts,
             confidence=0.9,
-            evidence_frame_timestamps_s=(onset_ts,) + jitter,
-            trend_checkpoint_timestamps_s=jitter,
+            evidence_frame_timestamps_s=(onset_ts,),
+            # Cites the onset itself (not strictly after it) plus only one
+            # other later panel - never satisfies "at least two later".
+            trend_checkpoint_timestamps_s=(onset_ts,),
         )
 
     provider = StubTimingProvider(respond)
@@ -1824,109 +1786,6 @@ def test_pipeline_never_confirms_a_trend_from_adjacent_native_fps_jitter(zahn_vi
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
     assert "insufficient_trend_horizon" in outcome.verdict.reason_codes
-
-
-def test_pipeline_conflict_abstains_when_both_validations_only_cite_jitter(zahn_video):
-    """The exact reported audit shape end to end: a genuine cross-pass
-    conflict (end-coarse's 5.5s vs. the coarse pass's own 21.0s estimate)
-    triggers both validation calls, and BOTH independently claim
-    "confirmed" while citing nothing but adjacent native-fps frames as
-    their trend checkpoints - neither survives the spacing gate, so the
-    run correctly falls through to "neither_confirmed" and safely
-    abstains, never fabricating a choice between two ungrounded trends."""
-    false_candidate_s = 5.5
-    coarse_estimate_s = 21.0
-
-    def respond(request: ProviderRequest) -> RawProviderResponse:
-        if request.pass_name == "coarse":
-            return canned_json_response(start_s=1.0, end_s=coarse_estimate_s, confidence=0.9)
-        if request.pass_name == "fine":
-            return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
-        if request.pass_name == "end_coarse":
-            ts = min(
-                (f.timestamp_s for f in request.frames),
-                key=lambda t: abs(t - false_candidate_s),
-            )
-            return canned_json_response(
-                start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
-            )
-        assert request.pass_name == "end_validate"
-        onset_ts = _candidate_timestamp(request)
-        # Both the primary (near 5.5s) and secondary (near 21.0s) calls
-        # confirm, citing only adjacent-frame jitter - the exact shape of
-        # both real citations in the reported audit.
-        count = 3 if onset_ts < 15.0 else 4
-        jitter = _adjacent_jitter_checkpoints(request, onset_ts, count=count)
-        return canned_json_response(
-            start_s=onset_ts,
-            end_s=onset_ts,
-            confidence=0.9,
-            evidence_frame_timestamps_s=(onset_ts,) + jitter,
-            trend_checkpoint_timestamps_s=jitter,
-        )
-
-    provider = StubTimingProvider(respond)
-    outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
-    )
-
-    assert outcome.verdict.status is TimingStatus.ABSTAIN
-    assert outcome.event is None
-    assert outcome.derived["candidate_conflict"] is True
-    assert outcome.derived["conflict_resolution"] == "neither_confirmed"
-    assert outcome.pass_verdicts["end_validate"].status is TimingStatus.ABSTAIN
-    assert outcome.pass_verdicts["end_validate_conflict"].status is TimingStatus.ABSTAIN
-    assert "insufficient_trend_horizon" in outcome.pass_verdicts["end_validate"].reason_codes
-    assert (
-        "insufficient_trend_horizon" in outcome.pass_verdicts["end_validate_conflict"].reason_codes
-    )
-
-
-def test_pipeline_confirms_an_onset_with_properly_ordered_one_second_checkpoints(zahn_video):
-    """The positive contrast case: an onset whose cited trend checkpoints
-    are genuinely spaced roughly a second apart, each one further along
-    than the last - the shape PROMPT_END_VALIDATE_V4 actually asks for -
-    reaches CONFIRMED without issue. Proves the temporal-spacing gate
-    rejects jitter specifically, not trend checkpoints in general."""
-    candidate_s = 8.0
-
-    def respond(request: ProviderRequest) -> RawProviderResponse:
-        if request.pass_name == "coarse":
-            return canned_json_response(start_s=1.0, end_s=candidate_s, confidence=0.9)
-        if request.pass_name == "fine":
-            return canned_json_response(start_s=1.0, end_s=1.0, confidence=0.9)
-        if request.pass_name == "end_coarse":
-            ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - candidate_s))
-            return canned_json_response(
-                start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
-            )
-        assert request.pass_name == "end_validate"
-        onset_ts = _candidate_timestamp(request)
-        first = min(
-            (f.timestamp_s for f in request.frames if f.timestamp_s > onset_ts),
-            key=lambda t: abs(t - (onset_ts + 1.0)),
-        )
-        second = min(
-            (f.timestamp_s for f in request.frames if f.timestamp_s > first + 0.75),
-            key=lambda t: abs(t - (onset_ts + 2.0)),
-        )
-        checkpoints = (first, second)
-        return canned_json_response(
-            start_s=onset_ts,
-            end_s=onset_ts,
-            confidence=0.9,
-            evidence_frame_timestamps_s=(onset_ts,) + checkpoints,
-            trend_checkpoint_timestamps_s=checkpoints,
-        )
-
-    provider = StubTimingProvider(respond)
-    outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
-    )
-
-    assert outcome.verdict.status is TimingStatus.CONFIRMED
-    assert outcome.event is not None
-    assert outcome.event.end_s == pytest.approx(candidate_s)
 
 
 class TestNearestGroundedEvidenceTs:

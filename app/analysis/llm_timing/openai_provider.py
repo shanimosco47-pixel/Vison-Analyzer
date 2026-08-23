@@ -137,7 +137,11 @@ class OpenAITimingProvider:
         generation_config = {
             "temperature": self._temperature,
             "pass_name": request.pass_name,
-            "frame_timestamps_s": [frame.timestamp_s for frame in request.frames],
+            "frame_timestamps_s": (
+                list(request.grounding_timestamps_s)
+                if request.grounding_timestamps_s is not None
+                else [frame.timestamp_s for frame in request.frames]
+            ),
         }
 
         retries_so_far = 0
@@ -196,7 +200,9 @@ def _build_parts(request: ProviderRequest) -> list[dict]:
     docstring for why a candidate frame gets a distinguishing label."""
     parts: list[dict] = [{"text": request.prompt_text}]
     for frame in request.frames:
-        if frame.is_candidate:
+        if frame.is_contact_sheet:
+            label = "CONTACT SHEET (composite grid - see each panel's own timestamp header)"
+        elif frame.is_candidate:
             label = "CANDIDATE frame"
         elif frame.is_trend_checkpoint:
             label = "TREND CHECKPOINT candidate frame"
@@ -268,6 +274,7 @@ _BASE_RESPONSE_SCHEMA_REQUIRED = (
     "reason_codes",
     "evidence_frame_timestamps_s",
     "trend_checkpoint_timestamps_s",
+    "possible_collapse_s",
     "raw_notes",
 )
 
@@ -303,6 +310,12 @@ def _response_schema_for_pass(pass_name: str, frame_timestamps_s: list[float]) -
     fabrication risk and was missed in the round that introduced it; a
     Codex review caught the gap before any live rerun exercised it.
 
+    "end_validate" (currently the candidate-centred contact-sheet cascade -
+    see ``pipeline._run_end_validation_pass``) also constrains
+    ``possible_collapse_s`` the same way: it must be one of the panel
+    timestamps actually shown in that request's contact sheet, or null -
+    never a computed/interpolated value.
+
     Uses ``anyOf: [{type: number, enum: [...]}, {type: null}]`` for the
     nullable-and-constrained case rather than mixing ``null`` directly into
     one ``enum`` array - both ``anyOf``-for-nullable and
@@ -332,6 +345,7 @@ def _response_schema_for_pass(pass_name: str, frame_timestamps_s: list[float]) -
             "reason_codes": {"type": "array", "items": {"type": "string"}},
             "evidence_frame_timestamps_s": {"type": "array", "items": {"type": "number"}},
             "trend_checkpoint_timestamps_s": {"type": "array", "items": {"type": "number"}},
+            "possible_collapse_s": start_end_property,
             "raw_notes": {"type": "string"},
         },
     }

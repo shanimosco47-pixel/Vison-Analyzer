@@ -2690,3 +2690,186 @@ round. No known limitation remains against this round's diagnosis and
 request. Per the request: **not merged**, PR #5 stays draft; the
 crop/stabilization redesign the report explicitly deferred was not
 attempted this round.
+
+## 29. Candidate-centred contact-sheet cascade (accepted real experiment)
+
+### Context
+
+Two real `gpt-5-mini` experiments (independent 3/3 passes of a three-video
+dev criterion, errors within +/-0.75s, accumulated spend $0.454727/$2.00)
+validated a fundamentally different end-validation mechanism: instead of a
+dense batch of individually-labelled frames, send the model ONE composite
+"contact sheet" image - several small panels, each self-labelled with its
+own timestamp baked into its header, tiled chronologically - and ask it to
+localize the onset across the whole sheet at once. A prior experiment using
+a full-width grid overlay measured 0/3 (the grid added competing visual
+structure); dropping it in favour of a minimal side scale + outlet marker
+overlay is what got the method to 3/3 twice.
+
+This round replaces `_run_end_validation_pass`'s dense-frame mechanism with
+this cascade, per the supervisor's explicit framing: "reuse the existing
+broad/coarse pass to obtain a possible end candidate... do not invent a
+truth-centred window... do not replace or redesign the broad search in this
+slice." The whole-clip coarse pass and the sparse end-coarse candidate
+nomination (§20-22) are untouched; only what happens *after* a candidate is
+nominated changed.
+
+### The cascade, as implemented
+
+1. **Coarse sheet**: 9 panels, 0.5s apart (4.0s total), centred on the
+   end-coarse candidate - shifted (never truncated in count) to stay inside
+   `[locked_start_s, duration_s]` when the candidate sits near either edge
+   (`pipeline._shift_window_into_bounds`/`_cascade_coarse_timestamps`).
+2. If the coarse sheet confirms, that is the answer - no further calls.
+3. If it abstains but points at a `possible_collapse_s` (a panel it saw as
+   a possible-but-unconfirmed collapse), one **refine sheet** runs: 7
+   panels, 0.25s apart, looking back 1.5s from that point
+   (`_cascade_refine_timestamps`), reporting the *first* onset within that
+   denser window, not the more obvious collapse it was centred on.
+4. If the coarse sheet abstains with nothing to point at, the run abstains
+   right there - never a refine sheet built on nothing (`possible_collapse_s`
+   is `None`).
+5. At most 2 calls per candidate (coarse + optional refine) - the same
+   bounded-search discipline every prior round in this spike has followed;
+   a detected cross-pass conflict (§27) can still add a second, independently
+   anchored 2-call cascade, never more.
+
+### Overlay contract (`app/analysis/llm_timing/contact_sheet.py`)
+
+Implemented exactly as specified: 240x360px source crop, outlet at (120,50)
+within it; tile resized to 360x540px (1.5x); red outlet ring at (180,75),
+radius 14px, 3px stroke; black header (y=0..35) with the panel's exact
+timestamp; blue side scale, ticks at source reach 0..300 in 25px steps at
+`y = 75 + 1.5 * reach`, 15px ticks, no full-width lines, no predicted green
+tip; 9-panel coarse sheet as a 3x3 grid; 7-panel refine sheet as a 4+3 grid
+(one blank cell, left solid black). Pure image composition, unit-tested
+directly (`tests/test_contact_sheet.py`, 10 tests) with no video/provider
+involved.
+
+**One flagged assumption, not resolved by this round's report**: the report
+specifies the crop's *size* and where the outlet sits *within* it, both
+tuned against the experiment's own dev footage - but not where that crop
+sits within an arbitrary uploaded video's frame, which is camera-setup-
+specific and was never given. `contact_sheet.default_crop_origin()` uses a
+documented heuristic (horizontally centred, 10% down from the top,
+consistent with this app's existing classical-ROI framing conventions in
+`app/config.py`) rather than blocking again on it, per the "proceed without
+another design round" instruction - but this is a genuine placeholder, not
+a calibrated value, and should be confirmed or replaced with a real
+per-clip origin before any production use.
+
+### Structural (code-enforced) guarantees, not just prompt wording
+
+- `TimingVerdict.possible_collapse_s` (new, optional, valid on both
+  CONFIRMED and ABSTAIN) is re-grounded against the panel that reported it
+  (`pipeline._validate_possible_collapse`) exactly like any other cited
+  timestamp - an ungrounded value converges on ABSTAIN
+  (`ungrounded_evidence`) rather than ever seeding a refine window built on
+  a fabricated hint.
+- `_validate_cascade_trend_checkpoints` requires at least
+  `end_validation_min_trend_checkpoints` (reusing the existing config
+  field, default 2) grounded panels strictly after the reported onset -
+  "later panels are mandatory confirmation" enforced in code. Deliberately
+  does **not** reuse `_validate_trend_checkpoints`'s 0.75s onset-gap/
+  spacing floors (§28): those existed to reject native-fps jitter, which
+  cannot occur here at all - a contact sheet's only citable timestamps are
+  its own fixed, already-spaced panels (0.5s coarse / 0.25s refine). The
+  old dense-frame functions/config fields (`_validate_trend_checkpoints`,
+  `_suggested_trend_checkpoints`, `_build_validation_frames`,
+  `end_validation_pre_s`/`post_s`/`max_span_s`/`min_future_s`/
+  `min_onset_gap_s`/`min_checkpoint_spacing_s`, `PROMPT_END_VALIDATE_V4`)
+  are left in place as dead code, per this spike's established convention
+  (§21) of not deleting superseded machinery mid-round.
+- `ProviderRequest.grounding_timestamps_s` (new, optional) lets a single
+  composite `TimedFrame` still carry several logical, citable panel
+  timestamps - both the OpenAI Structured-Outputs enum constraint
+  (`openai_provider._response_schema_for_pass`, now also covering
+  `possible_collapse_s`) and `pipeline.py`'s own grounding-region
+  construction fall back to per-frame timestamps when unset, so every
+  pre-existing (non-cascade) request is unaffected.
+- Rigid-background rejection (conveyor hangers/fixtures drifting through
+  the outlet corridor) and the first-onset-not-later-collapse contract are
+  prompt-level (`PROMPT_END_CASCADE_COARSE_V1`/`PROMPT_END_CASCADE_REFINE_V1`)
+  - not independently code-verifiable from timestamps alone, same as every
+  other qualitative visual judgement this pipeline already delegates to the
+  model (weak contrast, camera motion).
+
+### Auditability
+
+`end_validation_coarse_cascade_response` / `_conflict_coarse_cascade_response`
+(new, optional `PipelineOutcome` fields) keep the coarse sheet's own
+call individually inspectable (cost/latency/tokens) even when a refine
+sheet supersedes it as the decisive answer - `PipelineOutcome._all_responses()`
+sums every call actually made, never silently dropping a superseded one.
+`llm_run_audit.PASS_ORDER` gained `end_validate_coarse_cascade`/
+`end_validate_conflict_coarse_cascade`, `AUDIT_SCHEMA_VERSION` bumped 1->2.
+`possible_collapse_s` is now part of every pass's audit entry and
+`TimingVerdict.to_dict()`.
+
+### App version
+
+Already git-SHA-based and auto-incrementing per commit (§28) - this
+commit's own build id satisfies "increment it with this update" with no
+further code change.
+
+### Files changed
+
+- `app/analysis/llm_timing/contact_sheet.py` (new) - crop/overlay/panel
+  render + grid compose.
+- `app/analysis/llm_timing/schema.py` - `possible_collapse_s` field;
+  `cascade_needs_refinement`/`cascade_unconfirmed` pipeline reason codes;
+  `rigid_background_object` model reason code.
+- `app/analysis/llm_timing/provider.py` - `ProviderRequest.grounding_timestamps_s`;
+  `TimedFrame.is_contact_sheet`; `possible_collapse_s` parsing;
+  `cascade_confirmed_response`/`cascade_abstain_response` test helpers.
+- `app/analysis/llm_timing/openai_provider.py`, `gemini_provider.py` -
+  CONTACT SHEET frame label; OpenAI `analyze()` prefers
+  `grounding_timestamps_s`; `possible_collapse_s` added to the Structured
+  Outputs schema (enum-constrained like `start_s`/`end_s` for `end_validate`).
+- `app/analysis/llm_timing/prompts.py` - `PROMPT_END_CASCADE_COARSE_V1`,
+  `PROMPT_END_CASCADE_REFINE_V1`.
+- `app/analysis/llm_timing/pipeline.py` - `_run_end_validation_pass`
+  rewritten as the cascade; new `_shift_window_into_bounds`,
+  `_cascade_coarse_timestamps`, `_cascade_refine_timestamps`,
+  `_build_cascade_request`, `_run_cascade_sheet`,
+  `_validate_possible_collapse`, `_validate_cascade_trend_checkpoints`;
+  `_EndValidationOutcome`/`PipelineOutcome` gained the coarse-cascade
+  response fields described above.
+- `app/services/llm_run_audit.py` - `PASS_ORDER`/`_PASS_RESPONSE_ATTR`
+  additions, `possible_collapse_s` in `_pass_audit`, schema version bump.
+- `tests/test_contact_sheet.py` (new, 10 tests).
+- `tests/test_llm_timing_pipeline.py` - `_confirm_validation`/
+  `_candidate_timestamp` retargeted at the cascade shape; three tests whose
+  exact mechanism (native-fps jitter, the old dense pre/post window) no
+  longer exists structurally were retired; six new cascade-specific
+  regressions added (coarse-confirms happy path, refine-when-coarse-abstains,
+  terminal-abstain-with-no-collapse-hint, both-stages-fail, ungrounded
+  `possible_collapse_s` rejected, a checkpoint not strictly after onset
+  rejected); every other `end_validate`-scripting test retargeted at the
+  new request/response shape, with window-bound assertions recomputed for
+  the cascade's own ±2.0s/1.5s-lookback geometry.
+- `tests/test_llm_run_service.py`, `tests/test_llm_run_audit.py`,
+  `tests/test_web_llm_engines.py`, `tests/test_llm_timing_engines.py`,
+  `tests/test_llm_timing_eval_provider_wiring.py`,
+  `tests/test_llm_timing_frame_budget.py`, `tests/test_llm_timing_pricing.py`,
+  `tests_js/playwright/e2e_server.py` - `end_validate` stubs retargeted at
+  the cascade shape via the same pattern (mirrors the `spaced_trend_checkpoints`
+  mass-retrofit precedent from §28, this time via `cascade_confirmed_response`/
+  `cascade_abstain_response`).
+- `tests_js/playwright/llm_flow.test.js` - window-bound assertions updated
+  for the cascade's own [3.5, 7.5]s geometry (was [1.5, 11.5]s under the
+  old dense pre/post margins) in the wrong-candidate scenario.
+
+### Gates
+
+`pytest tests/` - 627 passed. `ruff check .` / `ruff format --check .` -
+clean. `mypy app` - clean (45 source files, no findings). `node --test
+tests_js/*.test.js` - 107/107, unaffected (no JS logic changed this round).
+Browser suite - 25/25 (3 top-level scenarios), window-bound assertions
+updated for the new geometry.
+
+No real-provider smoke test was possible from this sandbox (same
+limitation as every prior round). Per the delivery boundary: no
+architecture rewrite beyond this integration, no further prompt research
+or model search, no paid provider call, automated tests use mocks/fixtures
+only. PR #5 stays draft/unmerged.

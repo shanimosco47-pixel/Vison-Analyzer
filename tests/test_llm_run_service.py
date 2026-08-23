@@ -19,7 +19,7 @@ from app.analysis.llm_timing.provider import (
     RawProviderResponse,
     StubTimingProvider,
     canned_json_response,
-    spaced_trend_checkpoints,
+    cascade_confirmed_response,
 )
 from app.config import AppConfig
 from app.errors import AnalyzerError
@@ -81,11 +81,7 @@ def _confirmed_stub_provider() -> StubTimingProvider:
         if request.pass_name == "fine":
             return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         if request.pass_name == "end_validate":
-            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-            checkpoints = spaced_trend_checkpoints(request.frames, ts)
-            return canned_json_response(
-                start_s=ts, end_s=ts, confidence=0.9, trend_checkpoint_timestamps_s=checkpoints
-            )
+            return cascade_confirmed_response(request)
         assert request.pass_name == "end_coarse"
         return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
 
@@ -269,8 +265,7 @@ def test_a_frames_only_provider_request_never_carries_the_video_file(
     def respond(request: ProviderRequest) -> RawProviderResponse:
         seen_requests.append(request)
         if request.pass_name == "end_validate":
-            candidate_ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-            return canned_json_response(start_s=candidate_ts, end_s=candidate_ts, confidence=0.9)
+            return cascade_confirmed_response(request)
         return canned_json_response(start_s=4.0, end_s=12.0, confidence=0.9)
 
     engine = engine_store.create(

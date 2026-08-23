@@ -36,8 +36,9 @@ from app.analysis.llm_timing.openai_provider import (
     OpenAITimingProvider,
 )
 from app.analysis.llm_timing.prompts import (
+    PROMPT_END_CASCADE_COARSE_V1,
+    PROMPT_END_CASCADE_REFINE_V1,
     PROMPT_END_COARSE_V2,
-    PROMPT_END_VALIDATE_V4,
     PROMPT_START_REFINE_V1,
     PROMPT_V1,
 )
@@ -45,7 +46,6 @@ from app.analysis.llm_timing.provider import (
     PermanentProviderError,
     ProviderRequest,
     TimedFrame,
-    spaced_trend_checkpoints,
 )
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "llm_timing_eval.py"
@@ -79,7 +79,7 @@ _CONFIRMED_JSON = json.dumps(
 _ResponseText = str | Callable[[list[dict]], str]
 
 _FRAME_LABEL_RE = re.compile(r"\[frame at t=([\d.]+)s\]")
-_CANDIDATE_LABEL_RE = re.compile(r"\[CANDIDATE frame at t=([\d.]+)s\]")
+_CONTACT_SHEET_LABEL_RE = re.compile(r"\[CONTACT SHEET[^\]]*? at t=([\d.]+)s\]")
 
 
 def _truth_aware_response(true_start_s: float, true_end_s: float) -> Callable[[list[dict]], str]:
@@ -112,32 +112,34 @@ def _truth_aware_response(true_start_s: float, true_end_s: float) -> Callable[[l
                 start_s, end_s, evidence = true_end_s, true_end_s, (true_end_s,)
             else:
                 return json.dumps({"status": "abstain", "reason_codes": ["no_break_found"]})
-        elif prompt_text == PROMPT_END_VALIDATE_V4:
-            # Perfect trend-validation stub: always confirms whichever
-            # candidate the pipeline flagged (these synthetic truths have a
+        elif prompt_text in (PROMPT_END_CASCADE_COARSE_V1, PROMPT_END_CASCADE_REFINE_V1):
+            # Perfect contact-sheet cascade stub: always confirms the
+            # sheet's own centred candidate (these synthetic truths have a
             # single genuine, sustained break with no recovery to reject).
-            # Evidence includes a baseline (at/before the candidate) and a
-            # later checkpoint (after it); trend_checkpoint_timestamps_s is
-            # a distinct, properly-spaced pair drawn from the actually
-            # submitted frames, matching the pipeline's own temporal-
-            # spacing requirement (pipeline.py's
-            # _validate_trend_checkpoints) - adjacent native-fps frames
-            # would now be structurally rejected as insufficient.
+            # The composite image's individual panel timestamps are baked
+            # into the image pixels, invisible to this text-only stub - only
+            # the one anchor timestamp survives as a text caption - so later
+            # checkpoints are computed from the cascade's own known, fixed
+            # panel spacing (0.5s coarse / 0.25s refine) rather than read
+            # back from the (here, empty) frame-label text.
             candidate_text = " ".join(p.get("text", "") for p in parts[1:])
-            candidate_matches = _CANDIDATE_LABEL_RE.findall(candidate_text)
-            assert candidate_matches, "end-validate request missing a CANDIDATE frame label"
-            candidate_ts = float(candidate_matches[0])
-            baseline_ts = min(frame_timestamps_s) if frame_timestamps_s else candidate_ts
-            later_ts = max(frame_timestamps_s) if frame_timestamps_s else candidate_ts
-            fake_frames = tuple(
-                TimedFrame(timestamp_s=ts, image_bytes=b"") for ts in frame_timestamps_s
+            anchor_matches = _CONTACT_SHEET_LABEL_RE.findall(candidate_text)
+            assert anchor_matches, "end-validate request missing a CONTACT SHEET frame label"
+            candidate_ts = float(anchor_matches[0])
+            step_s = 0.5 if prompt_text == PROMPT_END_CASCADE_COARSE_V1 else 0.25
+            trend_checkpoints = (
+                round(candidate_ts + step_s, 6),
+                round(candidate_ts + 2 * step_s, 6),
             )
-            trend_checkpoints = spaced_trend_checkpoints(fake_frames, candidate_ts)
             start_s, end_s = candidate_ts, candidate_ts
-            evidence = tuple(sorted({baseline_ts, candidate_ts, later_ts} | set(trend_checkpoints)))
+            evidence = (candidate_ts, *trend_checkpoints)
         else:  # pragma: no cover - would mean a new pass was added and this helper wasn't updated
             raise AssertionError(f"unrecognized prompt text: {prompt_text[:80]!r}")
-        trend_checkpoints_out = trend_checkpoints if prompt_text == PROMPT_END_VALIDATE_V4 else ()
+        is_cascade_pass = prompt_text in (
+            PROMPT_END_CASCADE_COARSE_V1,
+            PROMPT_END_CASCADE_REFINE_V1,
+        )
+        trend_checkpoints_out = trend_checkpoints if is_cascade_pass else ()
         return json.dumps(
             {
                 "status": "confirmed",

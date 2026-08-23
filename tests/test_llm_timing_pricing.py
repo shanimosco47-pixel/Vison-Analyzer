@@ -13,7 +13,7 @@ from app.analysis.llm_timing.provider import (
     RawProviderResponse,
     StubTimingProvider,
     canned_json_response,
-    spaced_trend_checkpoints,
+    cascade_confirmed_response,
 )
 from app.errors import ConfigurationError
 
@@ -67,15 +67,7 @@ def _respond_confirming_every_pass(
                 start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
             )
         elif request.pass_name == "end_validate":
-            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-            checkpoints = spaced_trend_checkpoints(request.frames, ts)
-            base = canned_json_response(
-                start_s=ts,
-                end_s=ts,
-                confidence=0.9,
-                evidence_frame_timestamps_s=(ts,) + checkpoints,
-                trend_checkpoint_timestamps_s=checkpoints,
-            )
+            base = cascade_confirmed_response(request)
         elif request.pass_name == "fine":
             # Start-only pass: reports the confirmed start as a degenerate
             # point, never the (discarded) end.

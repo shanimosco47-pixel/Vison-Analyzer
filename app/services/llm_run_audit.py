@@ -47,22 +47,35 @@ from ..logging_setup import get_logger
 
 logger = get_logger(__name__)
 
-AUDIT_SCHEMA_VERSION = 1
+AUDIT_SCHEMA_VERSION = 2
+"""Bumped from 1: added ``possible_collapse_s`` to every pass entry, and the
+``end_validate_coarse_cascade``/``end_validate_conflict_coarse_cascade``
+pass names (see PASS_ORDER's own docstring) - the candidate-centred
+contact-sheet cascade round."""
 
 # Mirrors PipelineOutcome's own per-pass field names - the four passes every
-# run reaches, in the order they run, plus the fifth "end_validate_conflict"
-# pass that only exists when a real run's end-coarse candidate and the
-# coarse pass's own end estimate conflicted badly enough to need a second,
-# independently-anchored trend validation (see pipeline.py's
-# _run_end_validation_pass/_candidates_conflict and
-# diagnostics/llm_spike/DESIGN.md) - absent from ``passes`` like any other
-# pass that never ran, per _pass_audit's own contract.
+# run reaches, in the order they run, plus:
+# - "end_validate_coarse_cascade": the candidate-centred cascade's own
+#   9-panel coarse contact sheet, kept separately auditable only when a
+#   denser 7-panel refine sheet also ran and superseded it as "end_validate"
+#   (see pipeline.py's _run_end_validation_pass/_EndValidationOutcome);
+# - "end_validate_conflict": a second, independently-anchored cascade that
+#   only exists when a real run's end-coarse candidate and the coarse
+#   pass's own end estimate conflicted badly enough to need one (see
+#   pipeline.py's _candidates_conflict);
+# - "end_validate_conflict_coarse_cascade": that second cascade's own
+#   coarse sheet, kept separately auditable the same way as the primary's.
+# Every one of these is absent from ``passes`` like any other pass that
+# never ran, per _pass_audit's own contract - see
+# diagnostics/llm_spike/DESIGN.md for the full write-up.
 PASS_ORDER: tuple[str, ...] = (
     "coarse",
     "fine",
     "end_coarse",
     "end_validate",
+    "end_validate_coarse_cascade",
     "end_validate_conflict",
+    "end_validate_conflict_coarse_cascade",
 )
 
 _PASS_RESPONSE_ATTR: dict[str, str] = {
@@ -70,7 +83,9 @@ _PASS_RESPONSE_ATTR: dict[str, str] = {
     "fine": "fine_response",
     "end_coarse": "end_coarse_response",
     "end_validate": "end_validation_response",
+    "end_validate_coarse_cascade": "end_validation_coarse_cascade_response",
     "end_validate_conflict": "end_validation_conflict_response",
+    "end_validate_conflict_coarse_cascade": "end_validation_conflict_coarse_cascade_response",
 }
 
 # Safe as a filename component: exactly what uuid.uuid4().hex produces (the
@@ -111,6 +126,7 @@ def _pass_audit(name: str, outcome: PipelineOutcome) -> dict[str, Any] | None:
         "raw_notes": sanitize_untrusted_text(verdict.raw_notes),
         "evidence_frame_timestamps_s": list(verdict.evidence_frame_timestamps_s),
         "trend_checkpoint_timestamps_s": list(verdict.trend_checkpoint_timestamps_s),
+        "possible_collapse_s": verdict.possible_collapse_s,
         "model_id": response.model_id if response is not None else None,
         "latency_s": response.latency_s if response is not None else None,
         "retries": response.retries if response is not None else None,

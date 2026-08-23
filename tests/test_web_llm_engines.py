@@ -23,7 +23,7 @@ from app.analysis.llm_timing.provider import (
     RawProviderResponse,
     StubTimingProvider,
     canned_json_response,
-    spaced_trend_checkpoints,
+    cascade_confirmed_response,
 )
 
 
@@ -60,11 +60,7 @@ def _confirmed_stub_provider():
         if request.pass_name == "fine":
             return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         if request.pass_name == "end_validate":
-            ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-            checkpoints = spaced_trend_checkpoints(request.frames, ts)
-            return canned_json_response(
-                start_s=ts, end_s=ts, confidence=0.9, trend_checkpoint_timestamps_s=checkpoints
-            )
+            return cascade_confirmed_response(request)
         assert request.pass_name == "end_coarse"
         return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
 

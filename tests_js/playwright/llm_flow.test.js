@@ -373,9 +373,9 @@ test("Experimental LLM analysis - full browser flow against a stub provider", as
 
 test("Experimental LLM analysis - the wrong-candidate audit trail explains itself", async (t) => {
   // The exact shape a real operator reported: end-coarse nominates a
-  // too-early candidate (5.5s), so the dense validation window built
-  // around it ([1.5, 11.5]s) never sees the clip's actual continuation
-  // past 17s, and the run abstains. This proves the "How the AI decided"
+  // too-early candidate (5.5s), so the coarse contact sheet built around
+  // it ([3.5, 7.5]s) never sees the clip's actual continuation past 17s,
+  // and the run abstains. This proves the "How the AI decided"
   // section - not just the pipeline/audit-builder layer already covered
   // by test_pipeline_derived_decisions_survive_a_rejected_end_candidate
   // and test_build_audit_record_for_a_rejected_candidate_still_shows_the_chain
@@ -434,12 +434,10 @@ test("Experimental LLM analysis - the wrong-candidate audit trail explains itsel
     });
     assert.notEqual(rows["End coarse"], "Not run");
     assert.notEqual(rows["End validate"], "Not run");
-    // The dense validation window itself is still [1.5, 11.5]s (see the
-    // "How the AI decided" assertions below), but the actual submitted
-    // range now also includes the sparse, bounded future checkpoints added
-    // beyond it (up to the clip's own end, 26.0s here) - advisory-only
-    // evidence sent in the same request, not a second scan.
-    assert.match(rows["End validate"], /1\.5s to 26\.0s/);
+    // The coarse contact sheet's own 9 panels, evenly spaced across
+    // [3.5, 7.5]s (see the "How the AI decided" assertions below) - a
+    // single bounded composite image, not an open-ended scan.
+    assert.match(rows["End validate"], /3\.5s to 7\.5s/);
   });
 
   await t.test("How the AI decided explains the candidate -> window -> abstain chain", async () => {
@@ -456,8 +454,8 @@ test("Experimental LLM analysis - the wrong-candidate audit trail explains itsel
     const endCoarse = paragraphs.find((p) => p.heading === "End coarse");
     assert.ok(endCoarse, "no End coarse block found");
     assert.match(endCoarse.text, /candidate break at t = 5\.5s/);
-    assert.match(endCoarse.text, /1\.5s/);
-    assert.match(endCoarse.text, /11\.5s/);
+    assert.match(endCoarse.text, /3\.5s/);
+    assert.match(endCoarse.text, /7\.5s/);
 
     const endValidate = paragraphs.find((p) => p.heading === "End validate");
     assert.ok(endValidate, "no End validate block found");
@@ -476,7 +474,7 @@ test("Experimental LLM analysis - the wrong-candidate audit trail explains itsel
     const audit = JSON.parse(fs.readFileSync(downloadPath, "utf8"));
     assert.equal(audit["final_verdict"]["status"], "abstain");
     assert.equal(audit["derived"]["end_coarse_candidate_s"], 5.5);
-    assert.deepEqual(audit["derived"]["end_validation_window_s"], [1.5, 11.5]);
+    assert.deepEqual(audit["derived"]["end_validation_window_s"], [3.5, 7.5]);
     // The downloaded audit must be matchable against the running backend
     // and the page that produced it - all three carry the same build id.
     const shownVersion = await page.$eval("#app-version", (el) => el.textContent.trim());

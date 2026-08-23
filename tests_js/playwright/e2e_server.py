@@ -55,7 +55,7 @@ from app.analysis.llm_timing.provider import (  # noqa: E402
     RawProviderResponse,
     StubTimingProvider,
     canned_json_response,
-    spaced_trend_checkpoints,
+    cascade_confirmed_response,
 )
 from app.config import AppConfig  # noqa: E402
 from app.services.llm_engine_store import LLMEngineStore  # noqa: E402
@@ -92,22 +92,18 @@ def _confirmed_respond(request: ProviderRequest) -> RawProviderResponse:
     if request.pass_name == "fine":
         return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
     if request.pass_name == "end_validate":
-        ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-        checkpoints = spaced_trend_checkpoints(request.frames, ts)
-        return canned_json_response(
-            start_s=ts, end_s=ts, confidence=0.9, trend_checkpoint_timestamps_s=checkpoints
-        )
+        return cascade_confirmed_response(request)
     assert request.pass_name == "end_coarse"
     return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
 
 
 def _wrong_candidate_respond(request: ProviderRequest) -> RawProviderResponse:
     """The exact wrong-result shape a real operator reported: end-coarse
-    nominates a too-early candidate (5.5s); the dense validation window
-    the pipeline builds around it is consequently only [1.5, 11.5]s even
+    nominates a too-early candidate (5.5s); the coarse contact sheet the
+    pipeline builds around it is consequently only [3.5, 7.5]s even
     though the clip (26s here) continues well past that - and the
-    validation pass, seeing no sustained break in that narrow window,
-    abstains. Same numbers as
+    cascade, seeing no sustained break in that narrow sheet, abstains.
+    Same numbers as
     tests/test_llm_timing_pipeline.py::test_pipeline_derived_decisions_survive_a_rejected_end_candidate,
     so the browser-level assertions and the pipeline-level ones describe
     the same scenario."""
@@ -159,9 +155,10 @@ def _conflict_respond(request: ProviderRequest) -> RawProviderResponse:
             start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
         )
     assert request.pass_name == "end_validate"
-    candidate_ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+    panels = sorted(request.grounding_timestamps_s or ())
+    candidate_ts = panels[len(panels) // 2]
     if candidate_ts < 15.0:
-        # The early, wrong candidate's own narrow window: a correctly-
+        # The early, wrong candidate's own narrow sheet: a correctly-
         # behaving model rejects it (step-then-plateau, not a sustained
         # trend) rather than repeating the real reported bug.
         return RawProviderResponse(
@@ -169,17 +166,10 @@ def _conflict_respond(request: ProviderRequest) -> RawProviderResponse:
             raw_text='{"status": "abstain", "reason_codes": ["no_break_found"]}',
             latency_s=0.01,
         )
-    # The coarse-estimate-anchored window: independently confirms the real,
+    # The coarse-estimate-anchored sheet: independently confirms the real,
     # later break.
-    ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - true_break_s))
-    checkpoints = spaced_trend_checkpoints(request.frames, ts)
-    return canned_json_response(
-        start_s=ts,
-        end_s=ts,
-        confidence=0.9,
-        evidence_frame_timestamps_s=(ts,) + checkpoints,
-        trend_checkpoint_timestamps_s=checkpoints,
-    )
+    onset_index = panels.index(min(panels, key=lambda t: abs(t - true_break_s)))
+    return cascade_confirmed_response(request, onset_index=onset_index)
 
 
 _SCENARIOS = {

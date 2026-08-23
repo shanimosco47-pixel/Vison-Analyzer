@@ -75,7 +75,22 @@ PIPELINE_REASON_CODES = frozenset(
         # roughly a second apart, each showing further shortening) are
         # different questions; this fires when trend_checkpoint_timestamps_s
         # has too few entries, isn't grounded, or isn't spaced far enough
-        # from the onset and from each other to be more than jitter
+        # from the onset and from each other to be more than jitter. Also
+        # reused (unchanged meaning: "too few/ungrounded checkpoints") by
+        # the candidate-centred contact-sheet cascade's own trend check -
+        # see pipeline._validate_cascade_trend_checkpoints.
+        "cascade_needs_refinement",  # the coarse (9-panel) contact sheet
+        # could not itself confirm a sustained trend but the model flagged
+        # a possible/obvious collapse worth a denser look-back at - see
+        # TimingVerdict.possible_collapse_s and
+        # pipeline._run_end_validation_pass's refine step. Not a terminal
+        # abstain reason on its own; the pipeline either replaces it with
+        # the refine cascade's own verdict, or - if the refine step also
+        # fails to confirm - with "cascade_unconfirmed".
+        "cascade_unconfirmed",  # neither the coarse contact sheet nor the
+        # denser refine look-back (when one ran) could confirm a sustained
+        # trend - the candidate-centred cascade's own final abstain reason,
+        # see pipeline._run_end_validation_pass.
     }
 )
 
@@ -88,6 +103,10 @@ MODEL_REASON_CODES = frozenset(
         "ambiguous_evidence",  # coarse+fine passes did not converge on one frame
         "resumed_flow",  # stream broke and reconnected; genuinely ambiguous per spec
         "missing_outlet",  # cup outlet not visible/identifiable in frame
+        "rigid_background_object",  # apparent recovery/shortening was actually a
+        # rigid structure (e.g. a conveyor hanger) drifting laterally through the
+        # outlet corridor, not real liquid motion - contact-sheet cascade prompts
+        # ask the model to reject this explicitly rather than count it as evidence
     }
 )
 
@@ -126,6 +145,22 @@ class TimingVerdict:
             pass, and for an end-validate verdict that cites no checkpoints
             (which the pipeline then treats as failing to demonstrate a
             trend at all, not as "trust the onset anyway").
+        possible_collapse_s: only meaningful for the candidate-centred
+            contact-sheet cascade (see ``pipeline._run_end_validation_pass``
+            and ``prompts.PROMPT_END_CASCADE_COARSE_V1``). The coarse
+            (9-panel) contact sheet may see a possible-but-unconfirmed
+            collapse without being able to confirm a sustained trend from
+            its own panels alone - this is the timestamp (one of the
+            panels actually shown) it points at, so the pipeline can build
+            a denser 7-panel look-back sheet around it, per the
+            supervisor's authorization: "reuse the existing broad pass...
+            do not invent a truth-centred window". ``None`` for every
+            other pass, and for a cascade verdict with nothing specific to
+            point at. Never trusted as a claim by itself - the pipeline
+            re-grounds it against the frames actually submitted for the
+            pass that reported it (see
+            ``pipeline._validate_possible_collapse``) before ever using it
+            to seed the refine window.
         model_id: identifier of the model/version that produced this verdict.
         prompt_version: identifier of the prompt template used (see
             ``prompts.py``). Pinned so a later prompt edit cannot silently
@@ -146,6 +181,7 @@ class TimingVerdict:
     prompt_version: str
     raw_notes: str = ""
     trend_checkpoint_timestamps_s: tuple[float, ...] = ()
+    possible_collapse_s: float | None = None
 
     def __post_init__(self) -> None:
         # Every numeric field is untrusted (it may have come straight from a
@@ -158,6 +194,11 @@ class TimingVerdict:
             raise ConfigurationError(
                 "A timing verdict's confidence must be a finite number between 0 and 1.",
                 detail=f"confidence={self.confidence!r}",
+            )
+        if self.possible_collapse_s is not None and not math.isfinite(self.possible_collapse_s):
+            raise ConfigurationError(
+                "A timing verdict's possible_collapse_s must be a finite number or None.",
+                detail=f"possible_collapse_s={self.possible_collapse_s!r}",
             )
         if not math.isfinite(self.start_uncertainty_s) or not math.isfinite(self.end_uncertainty_s):
             raise ConfigurationError(
@@ -215,6 +256,7 @@ class TimingVerdict:
             "reason_codes": list(self.reason_codes),
             "evidence_frame_timestamps_s": list(self.evidence_frame_timestamps_s),
             "trend_checkpoint_timestamps_s": list(self.trend_checkpoint_timestamps_s),
+            "possible_collapse_s": self.possible_collapse_s,
             "model_id": self.model_id,
             "prompt_version": self.prompt_version,
             "raw_notes": self.raw_notes,
@@ -228,6 +270,7 @@ class TimingVerdict:
         prompt_version: str,
         confidence: float = 0.0,
         raw_notes: str = "",
+        possible_collapse_s: float | None = None,
     ) -> TimingVerdict:
         """Build the abstain verdict every failure path converges on."""
         return TimingVerdict(
@@ -242,4 +285,5 @@ class TimingVerdict:
             model_id=model_id,
             prompt_version=prompt_version,
             raw_notes=raw_notes,
+            possible_collapse_s=possible_collapse_s,
         )
