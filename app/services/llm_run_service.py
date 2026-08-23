@@ -35,6 +35,7 @@ from ..analysis.llm_timing.schema import TimingStatus
 from ..config import AppConfig
 from ..errors import AnalyzerError, NotFoundError
 from ..logging_setup import get_logger
+from ..version import app_version
 from .llm_engine_store import LLMEngineStore
 from .llm_run_audit import LLMRunAuditStore, build_audit_record
 from .storage import VideoRecord
@@ -387,6 +388,7 @@ class LLMRunService:
                 finished_at=job.finished_at,
                 error=job.error,
                 outcome=outcome,
+                app_version=app_version(),
             )
             self._audit_store.save(audit)
         except Exception:  # noqa: BLE001 - persistence must never crash the worker

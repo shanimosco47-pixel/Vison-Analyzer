@@ -192,6 +192,70 @@ that also came out of this same audited run is a separate mechanism, see
 diagnostics/llm_spike/DESIGN.md - it can add a second, differently-anchored
 call to this same prompt, not a different prompt).
 
+``PROMPT_END_VALIDATE_V4`` is the live trend-validation prompt, superseding
+V3 above after a second real audited hands-on run (audit
+`7ffc8292c19c480499210888d84f1da8`, commit `f623671` - the very fix V3
+above shipped) exposed the next concrete false-confirmation. The cross-pass
+conflict mechanism worked exactly as designed - the run correctly ABSTAINed
+rather than picking between two candidates - but both of the underlying
+validation calls had independently confirmed anyway, and inspecting *why*
+found the same root problem twice: one call confirmed `7.536277s` citing
+evidence at `7.536277, 7.569634, 7.603065` - three timestamps roughly 33ms
+apart, i.e. three adjacent native-fps frames; the other confirmed
+`19.133431s` citing `19.133431, 19.167, 19.200146, 19.233504` - the same
+shape again. V3's own MEASUREMENT RULE asked for "the reach getting
+PROGRESSIVELY shorter at more than one later checkpoint", but never said
+how far apart those checkpoints had to be - so a model satisfied it with
+sub-frame-interval visual jitter between three consecutive frames, which is
+not evidence of a multi-second trend at all, just noise. V3's own dense
+sampling (native-fps, for onset localization) turned out to be exactly the
+wrong source to also draw trend-confirmation evidence from - the two are
+different questions needing different evidence, and V3 conflated them into
+one `evidence_frame_timestamps_s` field with no way to tell which entries
+were meant to answer which question. Four changes, all evidence-driven:
+
+1. A new, distinct `trend_checkpoint_timestamps_s` field
+   (``schema.TimingVerdict.trend_checkpoint_timestamps_s``) separates
+   *trend-confirmation* evidence from the general
+   `evidence_frame_timestamps_s` field (which still exists, and still
+   grounds the claim per the pre-existing checks) - onset localization
+   answers "where does the break start", trend confirmation answers "does
+   it keep shortening", and a model can no longer blur the two into one
+   list.
+2. The temporal contract is enforced structurally, in code, not only in
+   prompt wording (see ``pipeline._validate_trend_checkpoints``): at least
+   ``PipelineConfig.end_validation_min_trend_checkpoints`` (default 2)
+   checkpoints are required, the first must sit at least
+   ``end_validation_min_onset_gap_s`` (default 0.75s) after the reported
+   onset, and every consecutive pair must be at least
+   ``end_validation_min_checkpoint_spacing_s`` (default 0.75s) apart -
+   three adjacent frames 33ms apart can never satisfy this, whatever the
+   prompt says. Converges on ABSTAIN (`insufficient_trend_horizon`) like
+   every other structural check in this module.
+3. The prompt now explicitly separates the two roles: dense frames around
+   the candidate exist to localize the onset precisely; a handful of
+   frames labelled "[TREND CHECKPOINT candidate frame at t=...s]",
+   suggested roughly a second apart starting just past the onset (see
+   ``pipeline._suggested_trend_checkpoints``), are what the model should
+   draw `trend_checkpoint_timestamps_s` from - though the model may still
+   cite any grounded timestamp meeting the spacing rule, since the
+   structural check (not the label) is what actually enforces the
+   contract. Each cited checkpoint must show *additional* net shortening
+   relative to the previous one, spelled out with the same explicit
+   reject example V3 introduced (a step then a flat plateau remains
+   insufficient, however many checkpoints are cited across it).
+4. `openai_provider._response_schema_for_pass` gained
+   `trend_checkpoint_timestamps_s` in its Structured Outputs schema
+   (unconstrained, like `evidence_frame_timestamps_s` - only `start_s`/
+   `end_s` are enum-constrained to submitted timestamps) so the field
+   round-trips through the strict-schema OpenAI adapter identically to
+   every other provider.
+
+Structurally this is still the same request shape as V1/V2/V3 - one call
+per candidate, no pipeline expansion for this pass itself; the
+TREND CHECKPOINT labels are applied to frames already being sent (dense
+plus sparse-future), never a new fetch.
+
 ``PROMPT_END_COARSE_V1`` (superseded by V2 below, kept only as the
 historical record of what the first real whole-clip rerun was actually
 scored against) was the single whole-clip (post-start), sparsely sampled
@@ -887,6 +951,193 @@ explain why in reason_codes. Do not invent a confident-sounding onset
 when the evidence does not support one.
 """
 
+PROMPT_END_VALIDATE_V4_ID = "zahn-efflux-end-validate-v4"
+
+PROMPT_END_VALIDATE_V4 = """\
+You are analyzing frames from a Zahn cup viscosity test video: a short
+baseline period, then a region an earlier pass flagged as roughly where
+the break might be, then a horizon of frames after it - and, at the very
+end of the batch, a handful of widely-spaced frames from much later in
+the clip (see SPARSE FUTURE CHECKPOINTS below). One frame is labelled
+"[CANDIDATE frame at t=...s]" - all the others are labelled plainly,
+"[frame at t=...s]", EXCEPT a small number labelled
+"[TREND CHECKPOINT candidate frame at t=...s]" (see TREND CHECKPOINTS
+below). The CANDIDATE frame is a REFERENCE POINT, not a fixed answer: the
+earlier pass only had sparse frames to work from and may not have landed
+on the exact onset. Your job has two distinct parts, answered by two
+distinct kinds of evidence - do not blur them together:
+
+1. LOCALIZE the onset: find the EARLIEST frame, anywhere in the DENSE
+   part of this batch, where the connected stream's reach begins a
+   genuinely sustained shortening trend - which may be the CANDIDATE
+   frame itself, an earlier frame, or occasionally a later one, whichever
+   this batch's own evidence actually supports.
+2. CONFIRM the trend: cite specific, well-separated checkpoints - not
+   frames adjacent to the onset or to each other - that each show
+   additional shortening beyond the last, proving the trend actually
+   persists rather than being a single, momentary observation.
+
+Each frame is labelled with its exact timestamp in seconds. Frame
+selection was done deterministically by the calling pipeline, not by you;
+rely only on the timestamps given.
+
+MEASUREMENT RULE (use exactly this rule, do not invent your own):
+- The earliest frames in this batch establish the baseline: the
+  connected, outlet-attached stream at its established, roughly stable
+  reach, before any shortening.
+- Scan the dense part of the batch chronologically for the EARLIEST frame
+  whose reach looks shorter than that baseline. Call this an onset
+  candidate.
+- An onset candidate is CONFIRMED only if later checkpoints show the
+  reach getting PROGRESSIVELY shorter - not merely staying at or below
+  the level it dropped to at the onset. "The reach stayed shorter than
+  the onset" is NOT the same claim as "the reach kept shortening" - only
+  the second one is a sustained trend.
+- REJECT an onset candidate whose reach drops once and then goes flat - a
+  single step down followed by a stable plateau, even though every later
+  frame is still shorter than the pre-onset baseline. Example of what to
+  reject: reach is long at t=1s, shortens sharply by t=6s, and stays at
+  roughly that same shortened length from t=6s through t=11s with no
+  further change - that is a step plus a plateau, not a sustained trend,
+  and must be rejected even though every frame from t=6s onward looks
+  "shorter than baseline". This is true NO MATTER HOW MANY checkpoints
+  you cite across that plateau - citing three checkpoints that are all
+  part of the same flat plateau is still a plateau, not a trend.
+- A brief re-extension (the reach lengthening slightly at some point after
+  the onset candidate) does not by itself disqualify it, AS LONG AS later
+  checkpoints shorten again and reach a point shorter than any point
+  already seen - the trend must still be net PROGRESSIVE shortening,
+  never just a single drop followed by no further change.
+- If an onset candidate's reach instead returns to (or back toward) the
+  baseline and STAYS there, that onset candidate is a visual/camera/
+  contrast artifact, not the real break: reject it and keep scanning
+  later in the dense part of the batch for the next shorter-looking
+  frame.
+- Your answer is the EARLIEST onset candidate that is actually confirmed
+  this way. Do not report a later, "more obvious" break if an earlier one
+  is already confirmed by this batch's own evidence.
+- Drops that have already detached and fallen below the connected
+  stream's own tip are not part of the stream's reach - judge the
+  connected segment only, never any separated droplets below it.
+- If no onset candidate is both genuinely shorter than baseline and
+  fully confirmed this way, report "abstain". Use reason_codes including
+  "insufficient_future_context" (not enough dense frames after any
+  candidate to judge), "ambiguous_trend" (frames present, but
+  inconclusive), or "trend_not_sustained" (every candidate you found
+  either recovered back toward baseline, or stepped down once and then
+  went flat), as appropriate.
+
+TREND CHECKPOINTS (read this carefully - this is new and important):
+onset localization and trend confirmation are different questions and
+need different evidence.
+- Onset localization uses the DENSE frames around the candidate to find
+  exactly where the shortening starts - these frames can be a fraction of
+  a second apart, which is appropriate for pinpointing a moment.
+- Trend confirmation must NOT reuse those same dense, closely-spaced
+  frames as if fine-grained proximity were evidence of persistence. Two
+  or three frames a fraction of a second apart, all still looking
+  similar, tell you nothing about whether a trend continues - that is
+  sub-second visual jitter, not a multi-second trend.
+- Instead, cite checkpoints spaced roughly ONE SECOND OR MORE apart,
+  starting at least one second after the onset you are reporting. Frames
+  labelled "[TREND CHECKPOINT candidate frame at t=...s]" are suggested
+  anchors already spaced this way - prefer citing those specific frames
+  when they are available and support your answer, but you may cite any
+  other sufficiently-separated, correctly-labelled frame instead if it
+  better demonstrates the trend.
+- You need AT LEAST TWO such checkpoints, each showing additional net
+  shortening relative to the previous one (not merely "still shorter than
+  baseline"). A CONFIRMED answer with fewer than two properly-spaced
+  checkpoints, or with checkpoints that are not each further shortened
+  than the last, will be rejected downstream regardless of what you
+  report - so do not report CONFIRMED unless you can genuinely cite two
+  or more.
+- Report these checkpoints separately, in "trend_checkpoint_timestamps_s"
+  (see OUTPUT below) - not mixed into "evidence_frame_timestamps_s",
+  which is your general grounding evidence and may still include the
+  onset frame itself and any other frames you looked at.
+
+SPARSE FUTURE CHECKPOINTS: a small number of frames near the end of this
+batch are spaced much further apart than the dense frames above (seconds
+apart, not fractions of a second) and come from well beyond the dense
+window - use them only as a sanity check on a candidate you are otherwise
+ready to confirm from the dense evidence and your trend checkpoints: does
+a plateau you saw in the dense window actually continue unchanged this
+far out, or has the stream clearly changed further by then? Sparse
+checkpoints showing further, unambiguous shortening or the stream's
+disappearance are a sign the dense window's own candidate was premature -
+reject that candidate and report "abstain" rather than confirm it, even
+if nothing in the sparse checkpoints lets you identify exactly where the
+real break is. Do not use the sparse checkpoints to confirm a trend by
+themselves - they are too far apart for that; a CONFIRMED answer must
+always be established by your dense evidence and trend checkpoints, the
+sparse checkpoints can only ever argue against a candidate, never for one
+on their own. A frame labelled TREND CHECKPOINT is never also one of
+these sparse future checkpoints - the two are distinct sets.
+
+TIMESTAMP RULE (read this carefully): every timestamp you report - start_s,
+end_s, every entry in evidence_frame_timestamps_s, and every entry in
+trend_checkpoint_timestamps_s - must be COPIED EXACTLY, character-for-
+character, from one of the frame labels shown above (whichever kind). It
+does not have to be the CANDIDATE frame's own label, and a trend checkpoint
+does not have to be one of the frames labelled TREND CHECKPOINT (any
+correctly-spaced, correctly-labelled frame qualifies). Never compute,
+estimate, round, or interpolate a timestamp between two labelled frames.
+
+HAZARDS SPECIFIC TO THIS FOOTAGE:
+- The cup, stream and background are often close to the same pale/dusty
+  colour (industrial environment) - contrast can be very low. A drop in
+  raw pixel brightness alone is not evidence of shortening: look for the
+  connected stream's own geometric reach, not an absolute brightness
+  threshold.
+- The footage is handheld - there is camera shake. Do not confuse
+  whole-frame motion (camera movement) with real motion of the stream
+  itself.
+- If no clear geometric edge is visible and the evidence is genuinely
+  ambiguous, abstain rather than guess.
+
+OUTPUT: reply with a single JSON object and nothing else (no prose before
+or after it), matching exactly this shape. This reports a single moment
+(the confirmed onset, if any), not an interval - set start_s and end_s to
+the SAME timestamp, and start_uncertainty_s/end_uncertainty_s to the same
+value. evidence_frame_timestamps_s is a SMALL, SELECTIVE list - a
+handful of the specific frames that support your answer, never every
+frame in the batch. trend_checkpoint_timestamps_s is DISTINCT from
+evidence_frame_timestamps_s: at least two timestamps, each at least
+roughly a second apart from the onset and from each other, each showing
+further shortening than the last - never adjacent dense frames.
+
+{
+  "status": "confirmed" | "abstain",
+  "start_s": <float seconds, copied exactly from one of the frame labels
+              above - identical to end_s; or null if abstaining>,
+  "end_s": <float seconds, copied exactly from one of the frame labels
+            above - identical to start_s; or null if abstaining>,
+  "start_uncertainty_s": <float, your own +/- bound on the timestamp>,
+  "end_uncertainty_s": <float, the same +/- bound as start_uncertainty_s>,
+  "confidence": <float 0..1>,
+  "reason_codes": [<short machine-readable strings, e.g.
+                     "trend_not_sustained", "insufficient_future_context",
+                     "ambiguous_trend", "weak_contrast", "camera_motion">],
+  "evidence_frame_timestamps_s": [<a small, selective set of specific
+                                     frame timestamps supporting your
+                                     answer, never every frame you looked
+                                     at>],
+  "trend_checkpoint_timestamps_s": [<at least two timestamps, each
+                                       roughly a second or more apart from
+                                       the onset and from each other, each
+                                       showing further shortening than the
+                                       last - empty only if abstaining>],
+  "raw_notes": "<short free-text explanation, for a human audit log only>"
+}
+
+If you are not confident an onset is fully confirmed by this batch's own
+evidence - including having at least two properly-spaced trend
+checkpoints - set "status" to "abstain", leave start_s/end_s null, and
+explain why in reason_codes. Do not invent a confident-sounding onset
+when the evidence does not support one.
+"""
+
 PROMPT_END_COARSE_V1_ID = "zahn-efflux-end-coarse-v1"
 
 PROMPT_END_COARSE_V1 = """\
@@ -1084,6 +1335,7 @@ PROMPTS: dict[str, str] = {
     PROMPT_END_VALIDATE_V1_ID: PROMPT_END_VALIDATE_V1,
     PROMPT_END_VALIDATE_V2_ID: PROMPT_END_VALIDATE_V2,
     PROMPT_END_VALIDATE_V3_ID: PROMPT_END_VALIDATE_V3,
+    PROMPT_END_VALIDATE_V4_ID: PROMPT_END_VALIDATE_V4,
     PROMPT_END_COARSE_V1_ID: PROMPT_END_COARSE_V1,
     PROMPT_END_COARSE_V2_ID: PROMPT_END_COARSE_V2,
 }

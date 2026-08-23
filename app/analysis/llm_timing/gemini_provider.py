@@ -199,11 +199,19 @@ def _build_parts(request: ProviderRequest) -> list[dict]:
     end-scan trend-validation pass sets this) gets a distinguishing
     "CANDIDATE" label instead of the plain one, so the (version-pinned,
     otherwise-static) prompt text can refer to "the CANDIDATE frame" without
-    needing to embed a numeric timestamp of its own.
+    needing to embed a numeric timestamp of its own. A frame with
+    ``is_trend_checkpoint=True`` similarly gets a "TREND CHECKPOINT
+    candidate" label - a suggested anchor for the prompt's distinct
+    trend-confirmation evidence, separate from onset localization.
     """
     parts: list[dict] = [{"text": request.prompt_text}]
     for frame in request.frames:
-        label = "CANDIDATE frame" if frame.is_candidate else "frame"
+        if frame.is_candidate:
+            label = "CANDIDATE frame"
+        elif frame.is_trend_checkpoint:
+            label = "TREND CHECKPOINT candidate frame"
+        else:
+            label = "frame"
         parts.append({"text": f"[{label} at t={frame.timestamp_s:.3f}s]"})
         parts.append(
             {

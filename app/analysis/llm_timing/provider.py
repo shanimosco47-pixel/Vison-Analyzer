@@ -74,12 +74,23 @@ class TimedFrame:
     putting a numeric value into the (version-pinned, otherwise-static)
     prompt text itself. See ``gemini_provider._build_parts``/
     ``openai_provider._build_parts`` for the resulting frame label.
+
+    ``is_trend_checkpoint`` marks a frame the pipeline is suggesting as a
+    *trend-confirmation* anchor - roughly a second past the candidate onset,
+    then a second past that, and so on (see
+    ``pipeline._suggested_trend_checkpoints``) - distinct from the dense
+    frames around the candidate itself, which only localize *where* the
+    onset is. A label only: the model may still cite any grounded
+    timestamp in ``trend_checkpoint_timestamps_s``, and
+    ``pipeline._validate_trend_checkpoints`` is what actually enforces the
+    spacing contract, independent of which frames carry this label.
     """
 
     timestamp_s: float
     image_bytes: bytes
     media_type: str = "image/jpeg"
     is_candidate: bool = False
+    is_trend_checkpoint: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,6 +170,7 @@ def canned_json_response(
     confidence: float = 0.9,
     reason_codes: tuple[str, ...] = (),
     evidence_frame_timestamps_s: tuple[float, ...] | None = None,
+    trend_checkpoint_timestamps_s: tuple[float, ...] = (),
     latency_s: float = 0.01,
 ) -> RawProviderResponse:
     """Build a well-formed CONFIRMED raw response - the common test case.
@@ -169,6 +181,13 @@ def canned_json_response(
     callers of this helper are testing something else and don't want to
     think about evidence timestamps. Pass an explicit value (including
     ``()``) to test grounding failures themselves.
+
+    ``trend_checkpoint_timestamps_s`` has no such convenience default - it
+    is only meaningful for an end-validate CONFIRMED verdict, and a caller
+    testing that path must decide deliberately what to cite (see
+    :func:`spaced_trend_checkpoints`) rather than get a default that could
+    silently satisfy or silently fail
+    ``pipeline._validate_trend_checkpoints``.
     """
     if evidence_frame_timestamps_s is None:
         evidence_frame_timestamps_s = (start_s, end_s)
@@ -181,8 +200,38 @@ def canned_json_response(
         "confidence": confidence,
         "reason_codes": list(reason_codes),
         "evidence_frame_timestamps_s": list(evidence_frame_timestamps_s),
+        "trend_checkpoint_timestamps_s": list(trend_checkpoint_timestamps_s),
     }
     return RawProviderResponse(model_id=model_id, raw_text=json.dumps(payload), latency_s=latency_s)
+
+
+def spaced_trend_checkpoints(
+    frames: tuple[TimedFrame, ...],
+    onset_ts: float,
+    *,
+    min_gap_s: float = 0.75,
+    count: int = 2,
+) -> tuple[float, ...]:
+    """Test helper: pick ``count`` real, already-submitted frame timestamps
+    from ``frames``, each at least ``min_gap_s`` after ``onset_ts`` and at
+    least ``min_gap_s`` after the previously picked one - i.e. a
+    deliberately compliant trend-checkpoint citation, for a stub provider
+    that wants an end-validate response to actually reach CONFIRMED under
+    ``pipeline._validate_trend_checkpoints``. Returns fewer than ``count``
+    entries (possibly none) if ``frames`` doesn't have enough room; callers
+    testing the gate itself should pass a deliberately non-compliant tuple
+    by hand instead of using this helper.
+    """
+    available = sorted({frame.timestamp_s for frame in frames if frame.timestamp_s > onset_ts})
+    picked: list[float] = []
+    floor = onset_ts + min_gap_s
+    for ts in available:
+        if ts >= floor - 1e-9:
+            picked.append(ts)
+            floor = ts + min_gap_s
+            if len(picked) >= count:
+                break
+    return tuple(picked)
 
 
 def _abstain(
@@ -209,6 +258,9 @@ def _parse_confirmed(
     the whole thing total (see :func:`parse_raw_response`).
     """
     evidence = tuple(float(t) for t in (payload.get("evidence_frame_timestamps_s") or ()))
+    trend_checkpoints = tuple(
+        float(t) for t in (payload.get("trend_checkpoint_timestamps_s") or ())
+    )
     return TimingVerdict(
         status=TimingStatus.CONFIRMED,
         start_s=float(payload["start_s"]),
@@ -218,6 +270,7 @@ def _parse_confirmed(
         confidence=float(payload["confidence"]),
         reason_codes=reason_codes,
         evidence_frame_timestamps_s=evidence,
+        trend_checkpoint_timestamps_s=trend_checkpoints,
         model_id=response.model_id,
         prompt_version=prompt_version,
         raw_notes=sanitize_untrusted_text(str(payload.get("raw_notes", ""))),

@@ -38,6 +38,7 @@ from ..services.llm_engine_store import LLMEngineStore
 from ..services.llm_run_service import LLMRunService
 from ..services.secret_store import SecretStore
 from ..services.storage import VideoStore
+from ..version import app_version
 from ..video.reader import VideoReader, encode_jpeg
 from .llm_engine_routes import llm_engines
 
@@ -89,6 +90,7 @@ def index() -> str:
         modes=available_modes(),
         max_upload_mb=config.max_upload_mb,
         allowed_extensions=", ".join(config.allowed_extensions),
+        app_version=app_version(),
     )
 
 
@@ -100,6 +102,16 @@ def index() -> str:
 @api.get("/health")
 def health() -> Response:
     return jsonify({"status": "ok"})
+
+
+@api.get("/version")
+def version() -> Response:
+    """The running backend's own build identifier - see
+    ``app.version.app_version``. Never derived from anything the request
+    supplies (no query string, no header); a client-facing peer to the
+    same value already rendered into the page and stored in every LLM run
+    audit, so the three can be matched against each other."""
+    return jsonify({"app_version": app_version()})
 
 
 @api.get("/modes")

@@ -196,7 +196,12 @@ def _build_parts(request: ProviderRequest) -> list[dict]:
     docstring for why a candidate frame gets a distinguishing label."""
     parts: list[dict] = [{"text": request.prompt_text}]
     for frame in request.frames:
-        label = "CANDIDATE frame" if frame.is_candidate else "frame"
+        if frame.is_candidate:
+            label = "CANDIDATE frame"
+        elif frame.is_trend_checkpoint:
+            label = "TREND CHECKPOINT candidate frame"
+        else:
+            label = "frame"
         parts.append({"text": f"[{label} at t={frame.timestamp_s:.3f}s]"})
         parts.append(
             {"inline_data": {"mime_type": frame.media_type, "image_bytes": frame.image_bytes}}
@@ -262,6 +267,7 @@ _BASE_RESPONSE_SCHEMA_REQUIRED = (
     "confidence",
     "reason_codes",
     "evidence_frame_timestamps_s",
+    "trend_checkpoint_timestamps_s",
     "raw_notes",
 )
 
@@ -325,6 +331,7 @@ def _response_schema_for_pass(pass_name: str, frame_timestamps_s: list[float]) -
             "confidence": {"type": "number"},
             "reason_codes": {"type": "array", "items": {"type": "string"}},
             "evidence_frame_timestamps_s": {"type": "array", "items": {"type": "number"}},
+            "trend_checkpoint_timestamps_s": {"type": "array", "items": {"type": "number"}},
             "raw_notes": {"type": "string"},
         },
     }

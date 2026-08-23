@@ -29,6 +29,7 @@ from app.analysis.llm_timing.provider import (
     StubTimingProvider,
     TimedFrame,
     canned_json_response,
+    spaced_trend_checkpoints,
 )
 from app.analysis.llm_timing.schema import TimingStatus, TimingVerdict
 
@@ -169,11 +170,13 @@ def _stub_matching_truth(truth: dict[str, float]):
             # Perfect trend-validation stub: always confirms whichever
             # candidate the pipeline flagged.
             candidate_ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
+            checkpoints = spaced_trend_checkpoints(request.frames, candidate_ts)
             return canned_json_response(
                 start_s=candidate_ts,
                 end_s=candidate_ts,
                 confidence=0.9,
-                evidence_frame_timestamps_s=(candidate_ts,),
+                evidence_frame_timestamps_s=(candidate_ts,) + checkpoints,
+                trend_checkpoint_timestamps_s=checkpoints,
             )
         assert request.pass_name == "end_coarse"
         window_times = [f.timestamp_s for f in request.frames]

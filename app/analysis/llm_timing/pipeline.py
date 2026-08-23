@@ -32,8 +32,8 @@ from .pricing import PRICING_TABLE_VERSION, ModelPricing, estimate_cost_usd
 from .prompts import (
     PROMPT_END_COARSE_V2,
     PROMPT_END_COARSE_V2_ID,
-    PROMPT_END_VALIDATE_V3,
-    PROMPT_END_VALIDATE_V3_ID,
+    PROMPT_END_VALIDATE_V4,
+    PROMPT_END_VALIDATE_V4_ID,
     PROMPT_START_REFINE_V1,
     PROMPT_START_REFINE_V1_ID,
 )
@@ -143,6 +143,26 @@ class PipelineConfig:
             the window at the clip's end still allows a refined onset with
             enough room after it. Supervisor-specified floor is "~2s"; this
             is that default.
+        end_validation_min_trend_checkpoints: the fewest
+            ``trend_checkpoint_timestamps_s`` entries a CONFIRMED
+            end-validate verdict may cite - see
+            ``_validate_trend_checkpoints``. A second real audited run
+            confirmed a "sustained trend" from a single cluster of
+            adjacent native-fps frames; at least two independently-spaced
+            checkpoints are required to demonstrate persistence rather than
+            one localized observation. Supervisor-specified floor is "at
+            least two".
+        end_validation_min_onset_gap_s: how far past the reported onset the
+            *first* trend checkpoint must sit. Default 0.75s - the same
+            floor as ``target_tolerance_s`` (gate 1's own accuracy bound) -
+            chosen so this can never be satisfied by native-fps jitter
+            (tens of milliseconds) while still being achievable well inside
+            ``end_validation_post_s``/``end_validation_min_future_s``.
+        end_validation_min_checkpoint_spacing_s: how far apart *consecutive*
+            trend checkpoints must sit. Same default and rationale as
+            ``end_validation_min_onset_gap_s`` - three checkpoints only
+            ~33ms apart (a real audited run's exact shape) is exactly what
+            this rejects.
     """
 
     coarse_step_s: float = 0.5
@@ -159,6 +179,9 @@ class PipelineConfig:
     end_validation_post_s: float = 6.0
     end_validation_max_span_s: float = 10.0
     end_validation_min_future_s: float = 2.0
+    end_validation_min_trend_checkpoints: int = 2
+    end_validation_min_onset_gap_s: float = 0.75
+    end_validation_min_checkpoint_spacing_s: float = 0.75
 
     def validate(self) -> None:
         if self.coarse_step_s <= 0:
@@ -202,6 +225,15 @@ class PipelineConfig:
             )
         if self.max_request_bytes <= 0:
             raise ConfigurationError("max_request_bytes must be positive.")
+        if self.end_validation_min_trend_checkpoints < 2:
+            raise ConfigurationError(
+                "end_validation_min_trend_checkpoints must be at least 2 - a single "
+                "checkpoint cannot demonstrate a sustained trend, only one observation."
+            )
+        if self.end_validation_min_onset_gap_s <= 0:
+            raise ConfigurationError("end_validation_min_onset_gap_s must be positive.")
+        if self.end_validation_min_checkpoint_spacing_s <= 0:
+            raise ConfigurationError("end_validation_min_checkpoint_spacing_s must be positive.")
 
 
 @dataclass
@@ -920,6 +952,14 @@ _MAX_END_VALIDATE_EVIDENCE = 8
 # actually does much later, within the same request.
 _MAX_SPARSE_FUTURE_CHECKPOINTS = 6
 
+# Suggested spacing/count for the TREND CHECKPOINT frame labels - a
+# labelling aid (see TimedFrame.is_trend_checkpoint), deliberately spaced
+# wider than PipelineConfig.end_validation_min_onset_gap_s/
+# end_validation_min_checkpoint_spacing_s's own enforced floor so the
+# suggested anchors comfortably satisfy it, not just barely.
+_TREND_CHECKPOINT_LABEL_SPACING_S = 1.0
+_MAX_TREND_CHECKPOINT_LABELS = 4
+
 
 def _validation_window_for(
     candidate_ts: float, locked_start_s: float, duration_s: float, cfg: PipelineConfig
@@ -968,7 +1008,7 @@ def _bound_end_validate_evidence(verdict: TimingVerdict) -> TimingVerdict:
     selective evidence list is enforced structurally here; the complementary
     half (that the *cited* checkpoints actually span a baseline and a later,
     continued-shortening point) is asked for in the prompt itself
-    (``PROMPT_END_VALIDATE_V3``'s OUTPUT section) rather than enforced here,
+    (``PROMPT_END_VALIDATE_V4``'s OUTPUT section) rather than enforced here,
     since it cannot be verified from timestamps alone - only the count can.
     Converges on ABSTAIN like every other grounding failure; a no-op for an
     already-ABSTAIN verdict."""
@@ -983,6 +1023,101 @@ def _bound_end_validate_evidence(verdict: TimingVerdict) -> TimingVerdict:
             f"{_MAX_END_VALIDATE_EVIDENCE}, too broad to show which specific "
             f"checkpoints demonstrate a sustained trend",
         )
+    return verdict
+
+
+def _suggested_trend_checkpoints(
+    onset_ts: float,
+    available_ts: list[float],
+    *,
+    spacing_s: float,
+    max_count: int,
+) -> list[float]:
+    """Up to ``max_count`` suggested trend-checkpoint anchors, roughly
+    ``spacing_s`` apart starting just past ``onset_ts``, each snapped to
+    the nearest timestamp actually in ``available_ts`` - a labelling aid
+    only (see ``TimedFrame.is_trend_checkpoint``), not itself the
+    enforcement mechanism (that is ``_validate_trend_checkpoints``, which
+    accepts any grounded, sufficiently-spaced citation regardless of which
+    frames carry this label). Deterministic and duplicate-free; empty if
+    ``available_ts`` is empty."""
+    if not available_ts:
+        return []
+    picked: list[float] = []
+    target = onset_ts + spacing_s
+    ceiling = max(available_ts)
+    while target <= ceiling + _BOUNDS_EPSILON_S and len(picked) < max_count:
+        nearest = min(available_ts, key=lambda ts: abs(ts - target))
+        if nearest > onset_ts and nearest not in picked:
+            picked.append(nearest)
+        target += spacing_s
+    return picked
+
+
+def _validate_trend_checkpoints(
+    verdict: TimingVerdict, *, region: _GroundingRegion, cfg: PipelineConfig
+) -> TimingVerdict:
+    """The temporal-spacing gate a second real audited run's false
+    confirmation exposed: a CONFIRMED end_validate verdict cited three
+    "trend checkpoints" only ~33ms apart - adjacent native-fps frames,
+    sub-frame-interval jitter, not a multi-second sustained trend. Onset
+    localization (a dense frame pinpointing *where* a break starts) and
+    trend confirmation (specific checkpoints, spaced roughly a second
+    apart, each showing further shortening) are different questions;
+    prompt wording alone was not enough to keep a real model from
+    conflating them, so this enforces the temporal contract structurally,
+    in code, on ``TimingVerdict.trend_checkpoint_timestamps_s`` - a field
+    kept separate from ``evidence_frame_timestamps_s`` for exactly this
+    reason (see ``_bound_end_validate_evidence`` for the sibling check on
+    that field). Converges on ABSTAIN like every other grounding failure;
+    a no-op for an already-ABSTAIN verdict."""
+    if verdict.status is not TimingStatus.CONFIRMED:
+        return verdict
+    assert verdict.end_s is not None
+    checkpoints = verdict.trend_checkpoint_timestamps_s
+
+    def _matches_region(ts: float) -> bool:
+        return any(
+            abs(ts - sent) <= region.time_tolerance_s for sent in region.submitted_timestamps_s
+        )
+
+    ungrounded = [ts for ts in checkpoints if not _matches_region(ts)]
+    if ungrounded:
+        return _grounding_abstain(
+            verdict,
+            "insufficient_trend_horizon",
+            f"trend_checkpoint_timestamps_s {ungrounded} do not correspond to any frame "
+            f"actually submitted in this request",
+        )
+    if len(checkpoints) < cfg.end_validation_min_trend_checkpoints:
+        return _grounding_abstain(
+            verdict,
+            "insufficient_trend_horizon",
+            f"cited only {len(checkpoints)} trend checkpoint(s) - at least "
+            f"{cfg.end_validation_min_trend_checkpoints} are required to demonstrate a "
+            f"sustained trend rather than a single onset-adjacent observation",
+        )
+    ordered = sorted(checkpoints)
+    first_gap = ordered[0] - verdict.end_s
+    if first_gap < cfg.end_validation_min_onset_gap_s - _BOUNDS_EPSILON_S:
+        return _grounding_abstain(
+            verdict,
+            "insufficient_trend_horizon",
+            f"first trend checkpoint at t={ordered[0]:.3f}s is only {first_gap:.3f}s after "
+            f"the reported onset t={verdict.end_s:.3f}s - needs at least "
+            f"{cfg.end_validation_min_onset_gap_s:.2f}s to be more than native-fps jitter",
+        )
+    for earlier, later in zip(ordered, ordered[1:], strict=False):
+        gap = later - earlier
+        if gap < cfg.end_validation_min_checkpoint_spacing_s - _BOUNDS_EPSILON_S:
+            return _grounding_abstain(
+                verdict,
+                "insufficient_trend_horizon",
+                f"trend checkpoints at t={earlier:.3f}s and t={later:.3f}s are only "
+                f"{gap:.3f}s apart - needs at least "
+                f"{cfg.end_validation_min_checkpoint_spacing_s:.2f}s between checkpoints to "
+                f"be more than native-fps jitter",
+            )
     return verdict
 
 
@@ -1026,7 +1161,7 @@ def _run_end_validation_pass(
         fine_step_s=fine_step_s,
         max_dimension_px=cfg.max_frame_dimension_px,
         jpeg_quality=cfg.jpeg_quality,
-        prompt_text=PROMPT_END_VALIDATE_V3,
+        prompt_text=PROMPT_END_VALIDATE_V4,
         max_request_bytes=cfg.max_request_bytes,
         target_tolerance_s=cfg.target_tolerance_s,
     )
@@ -1048,9 +1183,24 @@ def _run_end_validation_pass(
     )
     all_frames = _merge_frames_sorted(dense_frames, future_frames)
 
+    checkpoint_labels = set(
+        _suggested_trend_checkpoints(
+            candidate_ts,
+            [frame.timestamp_s for frame in all_frames],
+            spacing_s=_TREND_CHECKPOINT_LABEL_SPACING_S,
+            max_count=_MAX_TREND_CHECKPOINT_LABELS,
+        )
+    )
+    all_frames = [
+        replace(frame, is_trend_checkpoint=True)
+        if frame.timestamp_s in checkpoint_labels and not frame.is_candidate
+        else frame
+        for frame in all_frames
+    ]
+
     request = ProviderRequest(
-        prompt_version=PROMPT_END_VALIDATE_V3_ID,
-        prompt_text=PROMPT_END_VALIDATE_V3,
+        prompt_version=PROMPT_END_VALIDATE_V4_ID,
+        prompt_text=PROMPT_END_VALIDATE_V4,
         frames=tuple(all_frames),
         pass_name="end_validate",
     )
@@ -1058,7 +1208,7 @@ def _run_end_validation_pass(
         on_stage("end_validate")
     response = provider.analyze(request)
     verdict = parse_raw_response(
-        response, prompt_version=PROMPT_END_VALIDATE_V3_ID, min_confidence=cfg.min_confidence
+        response, prompt_version=PROMPT_END_VALIDATE_V4_ID, min_confidence=cfg.min_confidence
     )
     submitted = tuple(frame.timestamp_s for frame in all_frames)
     region_hi = max(validation_hi, future_timestamps[-1]) if future_timestamps else validation_hi
@@ -1071,11 +1221,12 @@ def _run_end_validation_pass(
         verdict, start_region=region, end_region=region, max_uncertainty_s=cfg.max_uncertainty_s
     )
     verdict = _bound_end_validate_evidence(verdict)
+    verdict = _validate_trend_checkpoints(verdict, region=region, cfg=cfg)
     if verdict.status is TimingStatus.CONFIRMED:
         # The dense future-context floor is unchanged and still checked
         # against validation_hi (the dense window's own edge), not the
         # sparse checkpoints further out - those inform the model's own
-        # judgement (see PROMPT_END_VALIDATE_V3's SPARSE FUTURE
+        # judgement (see PROMPT_END_VALIDATE_V4's SPARSE FUTURE
         # CHECKPOINTS section) but are too sparse to themselves satisfy a
         # dense-evidence requirement.
         assert verdict.end_s is not None
@@ -1494,7 +1645,7 @@ def run_llm_timing(
                 candidate_ts, locked_start_s, duration_s, cfg
             )
             abstain = _oversized_abstain(
-                PROMPT_END_VALIDATE_V3_ID,
+                PROMPT_END_VALIDATE_V4_ID,
                 "end_validate",
                 f"candidate at t={candidate_ts:.2f}s: validation window "
                 f"[{validation_lo:.2f}, {validation_hi:.2f}]s still exceeds the request "
@@ -1588,7 +1739,7 @@ def run_llm_timing(
                 abstain_verdict = TimingVerdict.abstain(
                     reason_codes=("ambiguous_evidence",),
                     model_id=primary.verdict.model_id,
-                    prompt_version=PROMPT_END_VALIDATE_V3_ID,
+                    prompt_version=PROMPT_END_VALIDATE_V4_ID,
                     raw_notes=(
                         f"both the end-coarse candidate (confirmed at "
                         f"t={primary.verdict.end_s:.3f}s) and the coarse pass's own "
@@ -1620,7 +1771,7 @@ def run_llm_timing(
 
         # Report the chosen validation pass's own (possibly refined) onset,
         # not necessarily the end-coarse candidate that nominated the
-        # primary window: PROMPT_END_VALIDATE_V3 is deliberately allowed to
+        # primary window: PROMPT_END_VALIDATE_V4 is deliberately allowed to
         # localize the true onset anywhere within its own grounded window,
         # and - when a conflict was resolved in the coarse estimate's
         # favor - the reported onset instead comes from that independently-
@@ -1668,13 +1819,14 @@ def run_llm_timing(
                     | set(chosen.verdict.evidence_frame_timestamps_s)
                 )
             ),
+            trend_checkpoint_timestamps_s=chosen.verdict.trend_checkpoint_timestamps_s,
             model_id=chosen.verdict.model_id,
-            prompt_version=PROMPT_END_VALIDATE_V3_ID,
+            prompt_version=PROMPT_END_VALIDATE_V4_ID,
             raw_notes=(
                 f"start confirmed via {PROMPT_START_REFINE_V1_ID}; candidate break "
                 f"nominated via {PROMPT_END_COARSE_V2_ID} at t={candidate_ts:.3f}s"
                 f"{conflict_note}; refined and confirmed as a sustained trend via "
-                f"{PROMPT_END_VALIDATE_V3_ID} at t={chosen.verdict.end_s:.3f}s"
+                f"{PROMPT_END_VALIDATE_V4_ID} at t={chosen.verdict.end_s:.3f}s"
                 f"{source_note}"
             ),
         )
@@ -1709,10 +1861,11 @@ def run_llm_timing(
                 "start_uncertainty_s": final_verdict.start_uncertainty_s,
                 "end_uncertainty_s": final_verdict.end_uncertainty_s,
                 "evidence_frame_timestamps_s": list(final_verdict.evidence_frame_timestamps_s),
+                "trend_checkpoint_timestamps_s": list(final_verdict.trend_checkpoint_timestamps_s),
                 "model_id": final_verdict.model_id,
                 "start_prompt_version": PROMPT_START_REFINE_V1_ID,
                 "end_coarse_prompt_version": PROMPT_END_COARSE_V2_ID,
-                "end_validate_prompt_version": PROMPT_END_VALIDATE_V3_ID,
+                "end_validate_prompt_version": PROMPT_END_VALIDATE_V4_ID,
                 "coarse_start_s": coarse_verdict.start_s,
                 "coarse_end_s": coarse_verdict.end_s,
                 "end_coarse_candidate_s": candidate_ts,

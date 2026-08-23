@@ -1708,6 +1708,21 @@ function llmPassPlainLanguage(passName, entry) {
     sentence += ` Did not produce a confident answer${reasons}.`;
   }
 
+  // Trend checkpoints are a distinct, role-labelled kind of evidence - only
+  // meaningful for the end-validate passes - kept separate from the general
+  // evidence-timestamp citation so a reader can see exactly what was cited
+  // as proof of a *sustained* trend, whether or not it held up.
+  if (
+    (passName === "end_validate" || passName === "end_validate_conflict") &&
+    entry.trend_checkpoint_timestamps_s &&
+    entry.trend_checkpoint_timestamps_s.length
+  ) {
+    const checkpointList = entry.trend_checkpoint_timestamps_s
+      .map((ts) => `${ts.toFixed(2)}s`)
+      .join(", ");
+    sentence += ` Trend checkpoints cited: ${checkpointList}.`;
+  }
+
   if (entry.raw_notes) {
     sentence += ` Notes: ${entry.raw_notes}`;
   }

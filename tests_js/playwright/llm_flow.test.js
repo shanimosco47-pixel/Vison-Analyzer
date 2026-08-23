@@ -161,6 +161,16 @@ test("Experimental LLM analysis - full browser flow against a stub provider", as
     await page.waitForSelector("#step-llm:not(.disabled)");
   });
 
+  await t.test("the page shows a build version matching the backend's own API", async () => {
+    const shown = await page.$eval("#app-version", (el) => el.textContent.trim());
+    const apiVersion = await page.evaluate(async () => {
+      const res = await fetch("/api/version");
+      return (await res.json()).app_version;
+    });
+    assert.equal(shown, `Build ${apiVersion}`);
+    assert.notEqual(apiVersion, "");
+  });
+
   await t.test("add an engine using the Provider + Model dropdowns", async () => {
     await page.click("#llm-add-engine");
     await page.waitForSelector("#llm-engine-form:not(.hidden)");
@@ -467,6 +477,10 @@ test("Experimental LLM analysis - the wrong-candidate audit trail explains itsel
     assert.equal(audit["final_verdict"]["status"], "abstain");
     assert.equal(audit["derived"]["end_coarse_candidate_s"], 5.5);
     assert.deepEqual(audit["derived"]["end_validation_window_s"], [1.5, 11.5]);
+    // The downloaded audit must be matchable against the running backend
+    // and the page that produced it - all three carry the same build id.
+    const shownVersion = await page.$eval("#app-version", (el) => el.textContent.trim());
+    assert.equal(shownVersion, `Build ${audit["app_version"]}`);
   });
 
   await t.test("a page refresh restores the same explanation from the durable audit", async () => {

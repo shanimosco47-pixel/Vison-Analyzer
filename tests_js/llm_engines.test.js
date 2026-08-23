@@ -312,6 +312,67 @@ test("llmPassPlainLanguage", async (t) => {
     assert.match(text, /a confirmed break at t = 5\.8s/);
   });
 
+  await t.test("trend checkpoints are listed for end-validate passes when present", () => {
+    const text = llmPassPlainLanguage("end_validate", {
+      submitted_count: 19,
+      submitted_range_s: [1.5, 11.5],
+      status: "confirmed",
+      start_s: 5.8,
+      end_s: 5.8,
+      confidence: 0.85,
+      reason_codes: [],
+      raw_notes: "",
+      trend_checkpoint_timestamps_s: [6.8, 7.9],
+    });
+    assert.match(text, /Trend checkpoints cited: 6\.80s, 7\.90s\./);
+  });
+
+  await t.test("trend checkpoints are shown for a rejected end-validate-conflict pass too", () => {
+    const text = llmPassPlainLanguage("end_validate_conflict", {
+      submitted_count: 12,
+      submitted_range_s: [17.0, 26.0],
+      status: "abstain",
+      start_s: null,
+      end_s: null,
+      confidence: 0.0,
+      reason_codes: ["insufficient_trend_horizon"],
+      raw_notes: "",
+      trend_checkpoint_timestamps_s: [19.167, 19.200146],
+    });
+    assert.match(text, /insufficient_trend_horizon/);
+    assert.match(text, /Trend checkpoints cited: 19\.17s, 19\.20s\./);
+  });
+
+  await t.test("no trend-checkpoint sentence when the list is empty", () => {
+    const text = llmPassPlainLanguage("end_validate", {
+      submitted_count: 19,
+      submitted_range_s: [1.5, 11.5],
+      status: "confirmed",
+      start_s: 5.8,
+      end_s: 5.8,
+      confidence: 0.85,
+      reason_codes: [],
+      raw_notes: "",
+      trend_checkpoint_timestamps_s: [],
+    });
+    assert.doesNotMatch(text, /Trend checkpoints cited/);
+  });
+
+  await t.test("no trend-checkpoint sentence for passes other than end-validate", () => {
+    const text = llmPassPlainLanguage("end_coarse", {
+      submitted_count: 5,
+      submitted_range_s: [1.0, 10.0],
+      status: "confirmed",
+      start_s: 5.5,
+      end_s: 5.5,
+      confidence: 0.9,
+      reason_codes: [],
+      raw_notes: "",
+      trend_checkpoint_timestamps_s: [6.8, 7.9],
+    });
+    assert.doesNotMatch(text, /Trend checkpoints cited/);
+  });
+
   await t.test("an abstained pass names its reason codes instead of a timestamp", () => {
     const text = llmPassPlainLanguage("end_validate", {
       submitted_count: 19,

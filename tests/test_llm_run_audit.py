@@ -31,6 +31,7 @@ from app.analysis.llm_timing.provider import (
     RawProviderResponse,
     StubTimingProvider,
     canned_json_response,
+    spaced_trend_checkpoints,
 )
 from app.config import AppConfig
 from app.errors import NotFoundError
@@ -85,7 +86,10 @@ def _confirmed_stub_provider() -> StubTimingProvider:
             return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
         if request.pass_name == "end_validate":
             ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-            return canned_json_response(start_s=ts, end_s=ts, confidence=0.9)
+            checkpoints = spaced_trend_checkpoints(request.frames, ts)
+            return canned_json_response(
+                start_s=ts, end_s=ts, confidence=0.9, trend_checkpoint_timestamps_s=checkpoints
+            )
         assert request.pass_name == "end_coarse"
         return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
 
@@ -129,6 +133,47 @@ def test_build_audit_record_for_a_confirmed_outcome_has_every_pass(zahn_video):
     assert audit["derived"]["end_coarse_candidate_s"] == pytest.approx(12.0)
     assert audit["final_verdict"]["status"] == "confirmed"
     assert audit["event"] is not None
+
+
+def test_build_audit_record_carries_the_running_backends_app_version():
+    """Supervisor-directed operational requirement: the audit must record
+    the backend build that produced it, so a downloaded audit, the page
+    that showed it, and the running backend can be matched against each
+    other. Never derived here - passed in by the caller (see
+    app.version.app_version) - and defaults to "unknown" rather than
+    raising when a caller doesn't supply one."""
+    audit = build_audit_record(
+        run_id="deadbeefdeadbeefdeadbeefdeadbeef",
+        video_id="vid-1",
+        engine_id="eng-1",
+        engine_display_name="My Engine",
+        provider_name="openai",
+        model_id="gpt-4.1-mini",
+        status="failed",
+        created_at=1.0,
+        started_at=1.0,
+        finished_at=2.0,
+        error="boom",
+        outcome=None,
+        app_version="abc1234",
+    )
+    assert audit["app_version"] == "abc1234"
+
+    audit_default = build_audit_record(
+        run_id="deadbeefdeadbeefdeadbeefdeadbeef",
+        video_id="vid-1",
+        engine_id="eng-1",
+        engine_display_name="My Engine",
+        provider_name="openai",
+        model_id="gpt-4.1-mini",
+        status="failed",
+        created_at=1.0,
+        started_at=1.0,
+        finished_at=2.0,
+        error="boom",
+        outcome=None,
+    )
+    assert audit_default["app_version"] == "unknown"
 
 
 def test_build_audit_record_exact_post_thinning_timestamps_match_pass_frames(zahn_video):
@@ -419,6 +464,10 @@ def test_a_completed_run_is_automatically_persisted_and_retrievable(
         assert audit["engine_id"] == engine.engine_id
         assert audit["status"] == "complete"
         assert set(audit["passes"].keys()) == {"coarse", "fine", "end_coarse", "end_validate"}
+        # LLMRunService threads the real, running backend's own build
+        # identifier through automatically - never "unknown" here, since a
+        # real git checkout is present.
+        assert audit["app_version"] and audit["app_version"] != "unknown"
 
         latest = service.get_latest_audit_for_engine(engine.engine_id)
         assert latest["run_id"] == job.run_id

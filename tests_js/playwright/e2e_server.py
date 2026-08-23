@@ -55,6 +55,7 @@ from app.analysis.llm_timing.provider import (  # noqa: E402
     RawProviderResponse,
     StubTimingProvider,
     canned_json_response,
+    spaced_trend_checkpoints,
 )
 from app.config import AppConfig  # noqa: E402
 from app.services.llm_engine_store import LLMEngineStore  # noqa: E402
@@ -92,7 +93,10 @@ def _confirmed_respond(request: ProviderRequest) -> RawProviderResponse:
         return canned_json_response(start_s=4.0, end_s=4.0, confidence=0.9)
     if request.pass_name == "end_validate":
         ts = next(f.timestamp_s for f in request.frames if f.is_candidate)
-        return canned_json_response(start_s=ts, end_s=ts, confidence=0.9)
+        checkpoints = spaced_trend_checkpoints(request.frames, ts)
+        return canned_json_response(
+            start_s=ts, end_s=ts, confidence=0.9, trend_checkpoint_timestamps_s=checkpoints
+        )
     assert request.pass_name == "end_coarse"
     return canned_json_response(start_s=candidate_s, end_s=candidate_s, confidence=0.9)
 
@@ -168,8 +172,13 @@ def _conflict_respond(request: ProviderRequest) -> RawProviderResponse:
     # The coarse-estimate-anchored window: independently confirms the real,
     # later break.
     ts = min((f.timestamp_s for f in request.frames), key=lambda t: abs(t - true_break_s))
+    checkpoints = spaced_trend_checkpoints(request.frames, ts)
     return canned_json_response(
-        start_s=ts, end_s=ts, confidence=0.9, evidence_frame_timestamps_s=(ts,)
+        start_s=ts,
+        end_s=ts,
+        confidence=0.9,
+        evidence_frame_timestamps_s=(ts,) + checkpoints,
+        trend_checkpoint_timestamps_s=checkpoints,
     )
 
 

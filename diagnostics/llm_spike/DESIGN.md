@@ -2483,3 +2483,210 @@ round. No known limitation remains against this round's diagnosis and
 request. Per the request: **not merged**, PR #5 stays draft; the
 algorithm change here is explicitly scoped to the reported
 false-confirmation failure mode only - no other tuning was made.
+
+## 28. CODEX REAL-RUN FOLLOW-UP: native-fps jitter cited as a trend
+
+A follow-up real audit (`7ffc8292c19c480499210888d84f1da8`, against commit
+`f623671` - §27's own fix) reported good news and a next concrete defect in
+the same message: the cross-pass conflict mechanism worked exactly as
+designed - the run correctly ABSTAINed rather than choosing between the
+false early candidate and the later one - but inspecting *why* both
+underlying validation calls had independently "confirmed" anyway found a
+new false-confirmation mechanism, one level deeper than §27's.
+
+### The exact evidence and why it slipped through every existing check
+
+One validation call confirmed **7.536277s**, citing evidence at
+`7.536277, 7.569634, 7.603065` - roughly **33ms apart**. The other confirmed
+**19.133431s**, citing `19.133431, 19.167, 19.200146, 19.233504` - the same
+~33ms shape. Both are three-to-four *consecutive native-fps frames*, not a
+multi-second trend: `_bound_end_validate_evidence` (§27) only caps the
+*count* of cited evidence, and `_validate_grounding` only checks that cited
+timestamps were actually submitted and sit near the claim - neither has any
+concept of *spacing*, so three adjacent frames pass both checks as easily as
+three genuinely-separated ones. `PROMPT_END_VALIDATE_V3`'s own wording asked
+for "the reach getting PROGRESSIVELY shorter at more than one later
+checkpoint," but never said how far apart "later" had to be - sub-frame-
+interval visual jitter between three consecutive frames technically
+satisfies "more than one checkpoint" while proving nothing about
+persistence.
+
+### The fix: a distinct, temporally-gated evidence field
+
+1. **Separate the two questions.** `schema.TimingVerdict` gained
+   `trend_checkpoint_timestamps_s: tuple[float, ...] = ()`, a field
+   distinct from `evidence_frame_timestamps_s` - onset *localization*
+   (dense frames pinpointing where a break starts) and trend
+   *confirmation* (specific, well-separated checkpoints proving it
+   persists) are different questions needing different evidence, and a
+   model can no longer answer both by dumping timestamps into one list.
+   Threaded through `provider.py`'s JSON parsing/`canned_json_response`,
+   `openai_provider._response_schema_for_pass` (new schema property,
+   unconstrained like `evidence_frame_timestamps_s`), and
+   `TimedFrame.is_trend_checkpoint` (a new frame-role label, mirroring the
+   existing `is_candidate` mechanism, for `[TREND CHECKPOINT candidate
+   frame at t=...s]` labels in both provider adapters' `_build_parts`).
+2. **Enforce spacing in code, not prompt wording alone**
+   (`pipeline._validate_trend_checkpoints`, called from
+   `_run_end_validation_pass` right after `_bound_end_validate_evidence`):
+   a CONFIRMED end-validate verdict must cite at least
+   `PipelineConfig.end_validation_min_trend_checkpoints` (2, floor enforced
+   in `validate()`) checkpoints, all grounded against the same
+   `_GroundingRegion` evidence already uses; the first must sit at least
+   `end_validation_min_onset_gap_s` (0.75s) past the reported onset; every
+   consecutive pair must be at least `end_validation_min_checkpoint_spacing_s`
+   (0.75s) apart. Three frames 33ms apart fail on both counts, structurally,
+   regardless of what the model's own `raw_notes` claims. Converges on
+   ABSTAIN with the new reason code `insufficient_trend_horizon`, same
+   discipline as every other grounding failure.
+3. **`PROMPT_END_VALIDATE_V4`** (new version, V3 kept as history) explains
+   the two roles explicitly, names the exact failure mode ("two or three
+   frames a fraction of a second apart... is sub-second visual jitter, not
+   a multi-second trend"), asks for checkpoints "roughly one second or more
+   apart," and states plainly that a structural check downstream will
+   reject anything less - the prompt and the code now make the same claim,
+   instead of the prompt asking for something the code didn't check.
+   `pipeline._suggested_trend_checkpoints` computes suggested ~1s-spaced
+   anchor timestamps (labelled via `is_trend_checkpoint`) purely as a
+   labelling aid; the model may still cite any grounded timestamp meeting
+   the spacing rule, since `_validate_trend_checkpoints` - not the label -
+   is what actually enforces the contract.
+
+### Retrofit cost, and why it was worth it this time
+
+Every existing test stub confirming an end-validate pass had to gain a
+compliant `trend_checkpoint_timestamps_s` citation, or the new structural
+gate would convert its CONFIRMED into ABSTAIN. Unlike §27's dropped
+"baseline + later checkpoint" check (an elaboration invented last round,
+not evidenced, and abandoned rather than retrofitted), this round's
+temporal-spacing gate is exactly what this round's report explicitly
+demands ("Enforce the temporal contract in code, not prompt wording
+alone... Require at least two future checkpoints. Adjacent native-FPS
+frames can never satisfy this gate.") - so the retrofit across ~14 call
+sites in `tests/test_llm_timing_pipeline.py`,
+`tests/test_llm_timing_pricing.py`, `tests/test_llm_run_audit.py`,
+`tests/test_llm_run_service.py`, `tests/test_web_llm_engines.py`,
+`tests/test_llm_timing_engines.py`,
+`tests/test_llm_timing_eval_provider_wiring.py`,
+`tests/test_llm_timing_frame_budget.py`, and
+`tests_js/playwright/e2e_server.py` was done in full, not simplified away.
+A new shared test helper, `provider.spaced_trend_checkpoints(frames,
+onset_ts, ...)`, picks real, already-submitted, correctly-spaced
+timestamps from a stub's own request - kept it a one-line change at most
+call sites.
+
+### App version (supervisor operational requirement, same round)
+
+New `app/version.py`: `app_version()` resolves this build's short git
+commit SHA via `git rev-parse --short HEAD` against this checkout, cached
+per-process (`lru_cache`), falling back to `"unknown"` rather than raising
+if git isn't available - resolved server-side only, never from anything a
+client supplies (the request explicitly rules out a URL query string).
+Exposed three ways, so the UI, a downloaded audit, and the running backend
+can all be matched against each other:
+
+- Rendered into the page itself (`index()`'s existing bootstrap-payload
+  pattern, `render_template("index.html", app_version=app_version())`) -
+  a small `Build <sha>` line under the page header, always visible, no
+  DevTools needed.
+- `GET /api/version` - the same value, for programmatic checks.
+- `llm_run_audit.build_audit_record`'s new `app_version` parameter (passed
+  explicitly by `LLMRunService._save_audit`, keeping the record-assembler
+  itself a pure function with no subprocess access of its own) - every
+  audit JSON now carries the exact backend build that produced it.
+
+### Files changed
+
+- `app/analysis/llm_timing/schema.py` - `TimingVerdict
+  .trend_checkpoint_timestamps_s`; new reason code
+  `insufficient_trend_horizon`.
+- `app/analysis/llm_timing/provider.py` - `TimedFrame.is_trend_checkpoint`;
+  `canned_json_response`'s new parameter;
+  `_parse_confirmed`'s new field parsing; new test helper
+  `spaced_trend_checkpoints`.
+- `app/analysis/llm_timing/openai_provider.py`,
+  `app/analysis/llm_timing/gemini_provider.py` - `trend_checkpoint_timestamps_s`
+  in the Structured Outputs schema (OpenAI only) and both adapters'
+  `_build_parts` TREND CHECKPOINT frame label.
+- `app/analysis/llm_timing/prompts.py` - `PROMPT_END_VALIDATE_V4`/`_ID`
+  (V3 kept, superseded).
+- `app/analysis/llm_timing/pipeline.py` - `_suggested_trend_checkpoints`,
+  `_validate_trend_checkpoints`; three new `PipelineConfig` fields +
+  `validate()` checks; wired into `_run_end_validation_pass` (frame
+  labelling + the new gate call); `PROMPT_END_VALIDATE_V3` → `V4`
+  references updated throughout `run_llm_timing`'s end-of-clip section;
+  `trend_checkpoint_timestamps_s` threaded into the final `TimingVerdict`
+  and `Event.details`.
+- `app/version.py` - new: `app_version()`.
+- `app/services/llm_run_audit.py` - `_pass_audit`'s new
+  `trend_checkpoint_timestamps_s` key; `build_audit_record`'s new
+  `app_version` parameter/key.
+- `app/services/llm_run_service.py` - passes `app_version()` into
+  `_save_audit`.
+- `app/web/routes.py` - `GET /api/version`; `index()` renders `app_version`.
+- `app/web/templates/index.html`, `app/web/static/styles.css` - the
+  `Build <sha>` line under the page header.
+- `app/web/static/app.js` - `llmPassPlainLanguage` names cited trend
+  checkpoints for the two end-validate pass kinds.
+- `tests/test_llm_timing_pipeline.py` - three new regression tests (below);
+  ~14 existing stubs retrofitted with compliant trend checkpoints.
+- `tests/test_llm_timing_pricing.py`, `tests/test_llm_run_audit.py`,
+  `tests/test_llm_run_service.py`, `tests/test_web_llm_engines.py`,
+  `tests/test_llm_timing_engines.py`,
+  `tests/test_llm_timing_eval_provider_wiring.py`,
+  `tests/test_llm_timing_frame_budget.py` - same retrofit; the eval-
+  provider-wiring file's `_truth_aware_response` also moved from V3 to V4.
+- `tests/test_version.py` (new), `tests/test_web.py` - `app_version()`
+  unit coverage; `/api/version` and page-render integration tests.
+- `tests_js/llm_engines.test.js` - unit tests for the new trend-checkpoint
+  sentence in `llmPassPlainLanguage`.
+- `tests_js/playwright/e2e_server.py`, `tests_js/playwright/llm_flow.test.js` -
+  `_confirmed_respond`/`_conflict_respond` retrofitted with compliant
+  trend checkpoints; new page/API/downloaded-audit version-matching
+  assertions across two of the three suites.
+
+### Regression coverage
+
+- **Both reported evidence sequences never confirm**:
+  `test_pipeline_never_confirms_a_trend_from_adjacent_native_fps_jitter`
+  (a single-candidate, no-conflict case: three consecutive native-fps
+  frames cited as trend checkpoints -> ABSTAIN, `insufficient_trend_horizon`)
+  and `test_pipeline_conflict_abstains_when_both_validations_only_cite_jitter`
+  (the full two-candidate conflict shape from §27, both calls confirming
+  with only jitter -> `neither_confirmed` -> safe ABSTAIN, matching "neither
+  may produce CONFIRMED" for both reported sequences at once).
+- **A valid ~1s-spaced trend still confirms**:
+  `test_pipeline_confirms_an_onset_with_properly_ordered_one_second_checkpoints`
+  - proves the gate rejects jitter specifically, not trend checkpoints in
+  general.
+- **App version, end to end**: `test_app_version_matches_the_real_git_short_sha`/
+  `..._is_cached_not_recomputed_every_call`/`..._falls_back_to_unknown_when_git_is_unavailable`/
+  `..._when_git_command_fails` (`tests/test_version.py`);
+  `test_version_endpoint_reports_a_non_empty_string`/
+  `test_index_page_shows_a_build_version_matching_the_api` (`tests/test_web.py`);
+  `test_build_audit_record_carries_the_running_backends_app_version`
+  (explicit value and the `"unknown"` default) plus an integration
+  assertion in `test_a_completed_run_is_automatically_persisted_and_retrievable`
+  that a real `LLMRunService` run's audit carries a real (non-"unknown")
+  SHA; two Playwright assertions confirming the page's `Build <sha>` text
+  matches `/api/version` on load, and again matches a downloaded audit's
+  own `app_version` field after a real run.
+
+### Gates
+
+`pytest tests/` - 616 passed (up from 606; +10: 3 pipeline regression tests,
+1 audit-record test, 4 `test_version.py` tests, 2 `test_web.py` tests).
+`ruff check .` / `ruff format --check .` - clean (two files reformatted
+along the way). `mypy app` - clean except the same pre-existing, unrelated
+`app/web/routes.py` finding noted since §11 (line number shifted only
+because of code added above it). `node --test tests_js/*.test.js` -
+107/107 (up from 103; +4 for the new trend-checkpoint sentence coverage).
+Browser suite - three top-level tests, 25 subtests total, all passing
+(up from 24; +1 for the page/API version-match check).
+
+No real-provider smoke test was possible from this sandbox (no vendor SDK
+installed, no API key here) - the same limitation noted in every prior
+round. No known limitation remains against this round's diagnosis and
+request. Per the request: **not merged**, PR #5 stays draft; the
+crop/stabilization redesign the report explicitly deferred was not
+attempted this round.

@@ -66,6 +66,16 @@ PIPELINE_REASON_CODES = frozenset(
         "evidence_not_selective",  # more evidence timestamps cited than the
         # selective-checkpoint cap allows - citing "all of it" is not
         # grounding, it is the absence of grounding
+        "insufficient_trend_horizon",  # a second real audited run's finding:
+        # a CONFIRMED end-validate verdict cited "trend checkpoints" that
+        # were really just adjacent native-fps frames (~33ms apart) -
+        # sub-frame-interval jitter, not a multi-second sustained trend.
+        # Onset localization (a dense frame pinpointing where a break
+        # starts) and trend confirmation (specific checkpoints, spaced
+        # roughly a second apart, each showing further shortening) are
+        # different questions; this fires when trend_checkpoint_timestamps_s
+        # has too few entries, isn't grounded, or isn't spaced far enough
+        # from the onset and from each other to be more than jitter
     }
 )
 
@@ -103,6 +113,19 @@ class TimingVerdict:
             non-empty for ABSTAIN. May be empty for a clean CONFIRMED.
         evidence_frame_timestamps_s: timestamps of the frames the provider
             says it examined around its decision, for audit/replay.
+        trend_checkpoint_timestamps_s: a distinct, role-labelled subset of
+            evidence - only meaningful for the end-validate pass - the
+            specific submitted timestamps the provider is designating as
+            *trend-confirmation* checkpoints (each showing further
+            shortening than the last), as opposed to the dense frame(s)
+            that merely localize *where* a break's onset sits. Kept
+            separate from ``evidence_frame_timestamps_s`` (general
+            grounding evidence) so onset localization and trend
+            confirmation can be validated against different rules - see
+            ``pipeline._validate_trend_checkpoints``. Empty for every other
+            pass, and for an end-validate verdict that cites no checkpoints
+            (which the pipeline then treats as failing to demonstrate a
+            trend at all, not as "trust the onset anyway").
         model_id: identifier of the model/version that produced this verdict.
         prompt_version: identifier of the prompt template used (see
             ``prompts.py``). Pinned so a later prompt edit cannot silently
@@ -122,6 +145,7 @@ class TimingVerdict:
     model_id: str
     prompt_version: str
     raw_notes: str = ""
+    trend_checkpoint_timestamps_s: tuple[float, ...] = ()
 
     def __post_init__(self) -> None:
         # Every numeric field is untrusted (it may have come straight from a
@@ -190,6 +214,7 @@ class TimingVerdict:
             "confidence": round(self.confidence, 4),
             "reason_codes": list(self.reason_codes),
             "evidence_frame_timestamps_s": list(self.evidence_frame_timestamps_s),
+            "trend_checkpoint_timestamps_s": list(self.trend_checkpoint_timestamps_s),
             "model_id": self.model_id,
             "prompt_version": self.prompt_version,
             "raw_notes": self.raw_notes,

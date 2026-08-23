@@ -110,6 +110,7 @@ def _pass_audit(name: str, outcome: PipelineOutcome) -> dict[str, Any] | None:
         "reason_codes": list(verdict.reason_codes),
         "raw_notes": sanitize_untrusted_text(verdict.raw_notes),
         "evidence_frame_timestamps_s": list(verdict.evidence_frame_timestamps_s),
+        "trend_checkpoint_timestamps_s": list(verdict.trend_checkpoint_timestamps_s),
         "model_id": response.model_id if response is not None else None,
         "latency_s": response.latency_s if response is not None else None,
         "retries": response.retries if response is not None else None,
@@ -133,6 +134,7 @@ def build_audit_record(
     finished_at: float | None,
     error: str | None,
     outcome: PipelineOutcome | None,
+    app_version: str = "unknown",
 ) -> dict[str, Any]:
     """Assemble one run's full audit record.
 
@@ -142,6 +144,13 @@ def build_audit_record(
     whatever ``error`` says, so even that failure mode leaves a durable,
     inspectable trace (supervisor requirement: "persist safe partial
     information for ABSTAIN, failure and cancellation too").
+
+    ``app_version`` is the running backend's own build identifier (see
+    ``app.version.app_version``) - passed in explicitly, never resolved
+    here, so this function stays a pure record-assembler with no
+    subprocess/filesystem access of its own. Lets a downloaded audit be
+    matched against the exact backend build that produced it, per the
+    supervisor's operational requirement.
     """
     passes: dict[str, Any] = {}
     derived: dict[str, Any] = {}
@@ -158,6 +167,7 @@ def build_audit_record(
 
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
+        "app_version": app_version,
         "run_id": run_id,
         "video_id": video_id,
         "engine_id": engine_id,
