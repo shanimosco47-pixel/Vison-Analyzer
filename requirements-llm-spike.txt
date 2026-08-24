@@ -1,0 +1,31 @@
+# Optional dependencies for the LLM timing spike (app/analysis/llm_timing)
+# and its experimental app-integration slice (app/services/secret_store.py,
+# app/web/llm_engine_routes.py).
+#
+# Not part of requirements.txt: the spike is opt-in, behind an explicit
+# "Experimental" UI section (see diagnostics/llm_spike/DESIGN.md), and
+# nothing in it - including the full test suite - imports any of these
+# packages at module load time. Each is imported lazily inside its own one
+# function, and none is called unless the corresponding feature is
+# actually used.
+#
+# Install only the one(s) you're actually going to use:
+#     pip install -r requirements-llm-spike.txt
+#
+# google-genai is the current GA SDK (https://pypi.org/project/google-genai/).
+# The older google-generativeai package is deprecated by Google and is
+# deliberately not used here.
+google-genai>=1.0,<2
+
+# openai is the official Python SDK (https://pypi.org/project/openai/),
+# used here only via the Responses API (client.responses.create) - never
+# the older Chat Completions API.
+openai>=1.0,<2
+
+# keyring (https://pypi.org/project/keyring/) is how app/services/secret_store.py
+# saves an engine's API key to an OS-protected mechanism - Windows Credential
+# Manager (backed by DPAPI) on Windows, Keychain on macOS, Secret Service on
+# Linux desktops - auto-selected per platform. Only needed for the "Save an
+# API key" path in the Experimental LLM analysis section; the
+# environment-variable reference path needs nothing from this file.
+keyring>=24,<26

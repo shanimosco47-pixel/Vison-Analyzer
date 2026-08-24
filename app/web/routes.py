@@ -34,8 +34,13 @@ from ..logging_setup import configure_logging, get_logger
 from ..services.analysis_service import AnalysisService
 from ..services.diagnostics import draw_overlay
 from ..services.event_log import parse_recording_start
+from ..services.llm_engine_store import LLMEngineStore
+from ..services.llm_run_service import LLMRunService
+from ..services.secret_store import SecretStore
 from ..services.storage import VideoStore
+from ..version import app_version
 from ..video.reader import VideoReader, encode_jpeg
+from .llm_engine_routes import llm_engines
 
 logger = get_logger(__name__)
 
@@ -85,6 +90,7 @@ def index() -> str:
         modes=available_modes(),
         max_upload_mb=config.max_upload_mb,
         allowed_extensions=", ".join(config.allowed_extensions),
+        app_version=app_version(),
     )
 
 
@@ -96,6 +102,16 @@ def index() -> str:
 @api.get("/health")
 def health() -> Response:
     return jsonify({"status": "ok"})
+
+
+@api.get("/version")
+def version() -> Response:
+    """The running backend's own build identifier - see
+    ``app.version.app_version``. Never derived from anything the request
+    supplies (no query string, no header); a client-facing peer to the
+    same value already rendered into the page and stored in every LLM run
+    audit, so the three can be matched against each other."""
+    return jsonify({"app_version": app_version()})
 
 
 @api.get("/modes")
@@ -234,12 +250,20 @@ def create_app(config: AppConfig | None = None) -> Flask:
     store.purge_orphans()
     service = AnalysisService(config, store)
 
+    secret_store = SecretStore()
+    engine_store = LLMEngineStore(config, secret_store)
+    llm_run_service = LLMRunService(engine_store, config)
+
     app.extensions["app_config"] = config
     app.extensions["video_store"] = store
     app.extensions["analysis_service"] = service
+    app.extensions["secret_store"] = secret_store
+    app.extensions["llm_engine_store"] = engine_store
+    app.extensions["llm_run_service"] = llm_run_service
 
     app.register_blueprint(pages)
     app.register_blueprint(api, url_prefix="/api")
+    app.register_blueprint(llm_engines, url_prefix="/api")
 
     @app.errorhandler(AnalyzerError)
     def handle_analyzer_error(error: AnalyzerError) -> Response:

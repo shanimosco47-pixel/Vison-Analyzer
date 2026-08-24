@@ -16,6 +16,7 @@
 <header class="page-header">
   <h1>Video Analyzer</h1>
   <p class="subtitle">Local analysis of recorded video &mdash; nothing is uploaded to the internet.</p>
+  <p class="app-version" id="app-version" title="Backend build identifier (short git commit SHA)">Build {{ app_version }}</p>
 </header>
 
 <main>
@@ -47,6 +48,91 @@
       <p id="meta-warnings" class="warning hidden"></p>
       <video id="preview" class="preview" controls preload="metadata"></video>
     </div>
+  </section>
+
+  <!-- Experimental: LLM analysis ---------------------------------------- -->
+  <section class="step disabled" id="step-llm">
+    <h2><span class="step-number">&#10024;</span> Experimental: LLM analysis
+      <span class="badge review">Experimental</span></h2>
+    <p class="hint">
+      Sends only individually extracted video frames &mdash; never the original video
+      file &mdash; to a vision-capable AI model you configure below, as an alternative
+      way to measure timing. Independent of the classical analysis below. Every
+      result here is marked "review required": check it against the video yourself
+      before relying on it.
+    </p>
+
+    <div id="llm-outlet-picker">
+      <p class="instruction">
+        Play the preview until the cup and the outlet hole are clearly visible, press
+        &ldquo;Use the frame currently shown&rdquo;, then click exactly on the outlet
+        hole. This anchors every AI engine&#39;s frames around the real outlet, and is
+        required before running one.
+      </p>
+      <div class="frame-toolbar">
+        <button type="button" class="secondary" id="llm-grab-frame">
+          Use the frame currently shown in the preview
+        </button>
+        <span class="hint" id="llm-frame-time-label"></span>
+        <button type="button" class="secondary hidden" id="llm-clear-outlet">
+          Clear outlet mark
+        </button>
+      </div>
+      <div class="frame-holder">
+        <img id="llm-outlet-image" alt="Video frame for marking the cup outlet">
+        <canvas id="llm-outlet-canvas"></canvas>
+      </div>
+      <p class="hint" id="llm-outlet-summary">
+        No outlet marked yet - this is required before running an AI engine.
+      </p>
+    </div>
+
+    <div id="llm-engine-list" class="llm-engine-list"></div>
+
+    <div class="action-row">
+      <button type="button" id="llm-add-engine" class="secondary">+ Add engine</button>
+    </div>
+
+    <form id="llm-engine-form" class="llm-engine-form hidden">
+      <div class="settings-grid">
+        <label>
+          Display name
+          <input type="text" id="llm-engine-display-name" placeholder="e.g. OpenAI mini">
+        </label>
+        <label>
+          Provider
+          <select id="llm-engine-provider">
+            <option value="openai">OpenAI</option>
+            <option value="gemini">Google Gemini</option>
+          </select>
+        </label>
+        <label>
+          Model
+          <select id="llm-engine-model-id" required></select>
+          <span id="llm-engine-model-hint" class="hint warning hidden"></span>
+        </label>
+      </div>
+      <fieldset class="llm-credential-fieldset">
+        <legend>Credential</legend>
+        <label class="llm-credential-option">
+          <input type="radio" name="llm-credential-mode" value="api_key" checked>
+          Save an API key (OS-protected storage)
+        </label>
+        <input type="password" id="llm-engine-api-key" placeholder="Paste the API key"
+               autocomplete="off">
+        <label class="llm-credential-option">
+          <input type="radio" name="llm-credential-mode" value="env_var">
+          Advanced: use an environment variable already set on this machine
+        </label>
+        <input type="text" id="llm-engine-env-var" placeholder="e.g. OPENAI_API_KEY" class="hidden">
+        <span class="hint">A saved key is never shown again, never sent back to this
+          page, and never written to the repository, logs, or diagnostics.</span>
+      </fieldset>
+      <div class="action-row">
+        <button type="submit" class="primary" id="llm-engine-save">Save engine</button>
+        <button type="button" class="secondary" id="llm-engine-cancel">Cancel</button>
+      </div>
+    </form>
   </section>
 
   <!-- Step 2 ---------------------------------------------------------- -->

@@ -1,0 +1,409 @@
+"""Backend registry for the Experimental LLM analysis section's configured
+engines.
+
+Persists :class:`~app.analysis.llm_timing.engine_config.EngineConfig`
+metadata (provider, model, display name, enabled) to one JSON file under
+``AppConfig.data_dir`` - **never** a secret value, only a ``credential_ref``
+(see that class's own docstring for why). This module is where a
+``credential_ref`` is actually resolved back into a usable
+``TimingProvider``, and it recognises exactly two reference shapes:
+
+- ``"secret:<key>"`` - a real API key the user saved through the UI, stored
+  OS-protected via :class:`~app.services.secret_store.SecretStore`.
+- ``"env:<VAR_NAME>"`` - a pre-set environment variable the operator
+  manages themselves (the documented development fallback); nothing is
+  stored server-side for this path beyond the variable's own name.
+
+Building a real provider goes through the existing
+``build_default_openai_client``/``build_default_gemini_client`` factories,
+each of which accepts an ``api_key`` keyword argument (in addition to
+their original ``api_key_env_var`` positional one): a resolved
+``"secret:<key>"`` credential is passed straight through as ``api_key``,
+never written into ``os.environ`` - a Codex review of an earlier version
+of this module caught it doing exactly that (materializing the secret
+into a process-wide environment variable before building the client),
+which left a saved key readable by the whole process for the server's
+entire lifetime with no cleanup, the opposite of the OS-secret-store
+boundary the key was saved to protect in the first place. An
+``"env:<VAR_NAME>"`` credential is unaffected by any of this: it is still
+passed as the plain ``api_key_env_var`` positional argument, so the
+factory reads it from ``os.environ`` itself, exactly as before - this
+module never touches ``os.environ`` for either credential shape.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import threading
+import uuid
+
+from ..analysis.llm_timing.engine_config import EngineConfig
+from ..analysis.llm_timing.provider import TimingProvider
+from ..analysis.llm_timing.redaction import sanitize_untrusted_text
+from ..config import AppConfig
+from ..errors import AnalyzerError, ConfigurationError, NotFoundError
+from ..logging_setup import get_logger
+from .secret_store import SecretStore, SecretStoreUnavailable
+
+logger = get_logger(__name__)
+
+SUPPORTED_PROVIDERS: tuple[str, ...] = ("openai", "gemini")
+
+# The one server-side source of truth for which model IDs a user can select
+# for each provider - deliberately not "whatever the vendor happens to
+# offer": per the supervisor's explicit instruction, a model is listed only
+# once this codebase has actually called it, with a real key, against a
+# real clip, and confirmed it returns schema-conformant structured output
+# for the image-batch requests this pipeline sends - never merely because
+# the vendor's catalog includes it. See diagnostics/llm_spike/DESIGN.md for
+# each entry's provenance:
+#
+# - "gpt-4.1-mini": the model behind every real gate-1 rerun from the
+#   chronological end-scan experiments through the two-stage/wide-window
+#   redesign and the app-integration acceptance (DESIGN.md sections 14-24)
+#   - dozens of real, schema-conformant calls on record.
+# - "gemini-3.5-flash-lite"/"gemini-3.5-flash": both completed real calls
+#   successfully in the four-model gate-1 round (DESIGN.md section 14) -
+#   the reported *timing accuracy* was poor for both, but that is a
+#   separate question from "does this model accept the required image +
+#   structured-output request shape", which this list is scoped to.
+#
+# openai_provider.DEFAULT_OPENAI_MODEL_ID ("gpt-5-mini") and
+# gemini_provider.DEFAULT_GEMINI_MODEL_ID ("gemini-2.5-flash-lite") are
+# each module's own fallback when no model_id is given at all - unrelated
+# to this list, and not automatically eligible for it: LLMEngineStore
+# always passes an explicit model_id, so those defaults are never actually
+# reached via this UI. Neither has a real-call record in this repository's
+# own history; add it here only once one exists.
+SUPPORTED_MODELS: dict[str, tuple[str, ...]] = {
+    "openai": ("gpt-4.1-mini",),
+    "gemini": ("gemini-3.5-flash-lite", "gemini-3.5-flash"),
+}
+
+_SECRET_REF_PREFIX = "secret:"
+_ENV_REF_PREFIX = "env:"
+
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _looks_like_an_env_var_name(value: str) -> bool:
+    return bool(_ENV_VAR_NAME_RE.match(value))
+
+
+class LLMEngineStore:
+    """CRUD for configured LLM engines, plus resolving one into a real
+    :class:`~app.analysis.llm_timing.provider.TimingProvider`."""
+
+    def __init__(self, config: AppConfig, secret_store: SecretStore) -> None:
+        self._path = config.data_dir / "llm_engines.json"
+        self._secret_store = secret_store
+        self._lock = threading.RLock()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._entries: dict[str, EngineConfig] = self._load()
+
+    # -- persistence ---------------------------------------------------- #
+
+    def _load(self) -> dict[str, EngineConfig]:
+        if not self._path.is_file():
+            return {}
+        try:
+            raw = json.loads(self._path.read_text())
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Could not read %s, starting with no configured engines: %s", self._path, exc
+            )
+            return {}
+        entries: dict[str, EngineConfig] = {}
+        for item in raw if isinstance(raw, list) else []:
+            try:
+                entry = EngineConfig(
+                    engine_id=item["engine_id"],
+                    provider_name=item["provider_name"],
+                    model_id=item["model_id"],
+                    credential_ref=item["credential_ref"],
+                    enabled=bool(item.get("enabled", True)),
+                    display_name=item.get("display_name", ""),
+                )
+            except (KeyError, TypeError, ConfigurationError) as exc:
+                logger.warning("Skipping a malformed saved engine entry: %s", exc)
+                continue
+            entries[entry.engine_id] = entry
+        return entries
+
+    def _save_locked(self) -> None:
+        """Caller must already hold ``self._lock``."""
+        payload = [
+            {
+                "engine_id": e.engine_id,
+                "provider_name": e.provider_name,
+                "model_id": e.model_id,
+                "credential_ref": e.credential_ref,
+                "enabled": e.enabled,
+                "display_name": e.display_name,
+            }
+            for e in self._entries.values()
+        ]
+        tmp = self._path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        tmp.replace(self._path)  # atomic on both POSIX and Windows
+
+    # -- CRUD ------------------------------------------------------------ #
+
+    def list(self) -> list[EngineConfig]:
+        with self._lock:
+            return list(self._entries.values())
+
+    def get(self, engine_id: str) -> EngineConfig:
+        with self._lock:
+            entry = self._entries.get(engine_id)
+        if entry is None:
+            raise NotFoundError("That engine configuration no longer exists.")
+        return entry
+
+    def create(
+        self,
+        *,
+        provider_name: str,
+        model_id: str,
+        display_name: str = "",
+        api_key: str | None = None,
+        env_var: str | None = None,
+        enabled: bool = True,
+    ) -> EngineConfig:
+        provider_name = _validated_provider_name(provider_name)
+        model_id = _validated_model_id(provider_name, model_id)
+
+        engine_id = uuid.uuid4().hex
+        credential_ref = self._new_credential_ref(
+            api_key=api_key, env_var=env_var, engine_id=engine_id
+        )
+        engine = EngineConfig(
+            engine_id=engine_id,
+            provider_name=provider_name,
+            model_id=model_id,
+            credential_ref=credential_ref,
+            enabled=enabled,
+            display_name=(display_name or "").strip(),
+        )
+        with self._lock:
+            self._entries[engine_id] = engine
+            self._save_locked()
+        logger.info("Configured a new LLM engine %s (%s/%s)", engine_id, provider_name, model_id)
+        return engine
+
+    def update(
+        self,
+        engine_id: str,
+        *,
+        provider_name: str | None = None,
+        model_id: str | None = None,
+        display_name: str | None = None,
+        enabled: bool | None = None,
+        api_key: str | None = None,
+        env_var: str | None = None,
+    ) -> EngineConfig:
+        with self._lock:
+            existing = self._entries.get(engine_id)
+            if existing is None:
+                raise NotFoundError("That engine configuration no longer exists.")
+
+            credential_ref = existing.credential_ref
+            if api_key is not None or env_var is not None:
+                new_ref = self._new_credential_ref(
+                    api_key=api_key, env_var=env_var, engine_id=engine_id
+                )
+                old_secret_key = _secret_key_of(existing.credential_ref)
+                old_ref = f"{_SECRET_REF_PREFIX}{old_secret_key}"
+                if old_secret_key is not None and old_ref != new_ref:
+                    self._secret_store.delete(old_secret_key)
+                credential_ref = new_ref
+
+            new_display_name = (
+                existing.display_name if display_name is None else display_name.strip()
+            )
+            new_provider_name = _validated_provider_name(provider_name or existing.provider_name)
+            # A model_id is only re-validated (and required) when either it
+            # was explicitly given, or the provider changed - preserving an
+            # untouched, still-valid model across an edit that only renames
+            # the engine, say, rather than forcing a reselection every time.
+            # If the provider changed and the *existing* model_id is not on
+            # the new provider's list, this raises rather than silently
+            # keeping a now-invalid model or silently swapping to some
+            # arbitrary default - the user must explicitly choose one for
+            # the new provider (supervisor-directed, see
+            # diagnostics/llm_spike/DESIGN.md).
+            if model_id is not None or new_provider_name != existing.provider_name:
+                new_model_id = _validated_model_id(new_provider_name, model_id or existing.model_id)
+            else:
+                new_model_id = existing.model_id
+            updated = EngineConfig(
+                engine_id=engine_id,
+                provider_name=new_provider_name,
+                model_id=new_model_id,
+                credential_ref=credential_ref,
+                enabled=existing.enabled if enabled is None else enabled,
+                display_name=new_display_name,
+            )
+            self._entries[engine_id] = updated
+            self._save_locked()
+        logger.info("Updated LLM engine %s", engine_id)
+        return updated
+
+    def delete(self, engine_id: str) -> None:
+        with self._lock:
+            entry = self._entries.pop(engine_id, None)
+            if entry is None:
+                raise NotFoundError("That engine configuration no longer exists.")
+            self._save_locked()
+        secret_key = _secret_key_of(entry.credential_ref)
+        if secret_key is not None:
+            self._secret_store.delete(secret_key)
+        logger.info("Deleted LLM engine %s", engine_id)
+
+    # -- credentials ------------------------------------------------------ #
+
+    def _new_credential_ref(
+        self, *, api_key: str | None, env_var: str | None, engine_id: str
+    ) -> str:
+        if bool(api_key) == bool(env_var):
+            raise AnalyzerError(
+                "Provide exactly one of an API key to save, or the name of an "
+                "environment variable that already holds it."
+            )
+        if env_var is not None:
+            env_var = env_var.strip()
+            if not env_var or not _looks_like_an_env_var_name(env_var):
+                raise AnalyzerError(
+                    "That does not look like a valid environment variable name "
+                    "(letters, digits, underscores only, must not start with a digit)."
+                )
+            return f"{_ENV_REF_PREFIX}{env_var}"
+
+        assert api_key is not None
+        api_key = api_key.strip()
+        if not api_key:
+            raise AnalyzerError("The API key was empty.")
+        try:
+            self._secret_store.save(engine_id, api_key)
+        except SecretStoreUnavailable as exc:
+            raise AnalyzerError(
+                "This machine has no OS-protected place to save an API key. "
+                "Set it as an environment variable instead and reference its "
+                "name here.",
+                detail=str(exc),
+            ) from exc
+        return f"{_SECRET_REF_PREFIX}{engine_id}"
+
+    def build_provider(self, engine: EngineConfig) -> TimingProvider:
+        """Resolve ``engine``'s credential and construct a real
+        ``TimingProvider`` for it. Raises :class:`AnalyzerError` (a message
+        safe to show a user - never the credential's value) if the
+        credential can't be resolved or the provider is unsupported.
+
+        Never touches ``os.environ``: a ``"secret:<key>"`` credential's
+        resolved value is passed straight into the vendor client factory's
+        ``api_key`` keyword argument; a ``"env:<VAR_NAME>"`` credential is
+        passed as the factory's ``api_key_env_var`` positional argument
+        unchanged, so the factory reads it from the environment itself,
+        exactly as it always has - see :meth:`_resolve_credential`.
+        """
+        api_key, api_key_env_var = self._resolve_credential(engine)
+        if engine.provider_name == "openai":
+            from ..analysis.llm_timing.openai_provider import (
+                OpenAITimingProvider,
+                build_default_openai_client,
+            )
+
+            if api_key is not None:
+                openai_client = build_default_openai_client(api_key=api_key)
+            else:
+                assert api_key_env_var is not None  # _resolve_credential's own contract
+                openai_client = build_default_openai_client(api_key_env_var)
+            return OpenAITimingProvider(openai_client, model_id=engine.model_id)
+        if engine.provider_name == "gemini":
+            from ..analysis.llm_timing.gemini_provider import (
+                GeminiTimingProvider,
+                build_default_gemini_client,
+            )
+
+            if api_key is not None:
+                gemini_client = build_default_gemini_client(api_key=api_key)
+            else:
+                assert api_key_env_var is not None  # _resolve_credential's own contract
+                gemini_client = build_default_gemini_client(api_key_env_var)
+            return GeminiTimingProvider(gemini_client, model_id=engine.model_id)
+        raise AnalyzerError(f"Unsupported provider '{engine.provider_name}'.")  # pragma: no cover
+
+    def _resolve_credential(self, engine: EngineConfig) -> tuple[str | None, str | None]:
+        """Returns ``(api_key, api_key_env_var)`` - exactly one is not
+        ``None``. A ``"secret:<key>"`` reference resolves to the actual
+        key value (``api_key``); an ``"env:<VAR_NAME>"`` reference resolves
+        to the variable's own *name* only (``api_key_env_var``) - this
+        method itself never reads or writes ``os.environ``, that stays the
+        vendor client factory's job for the env-var path, unchanged from
+        before."""
+        ref = engine.credential_ref
+        if ref.startswith(_ENV_REF_PREFIX):
+            return None, ref[len(_ENV_REF_PREFIX) :]
+        if ref.startswith(_SECRET_REF_PREFIX):
+            secret_key = ref[len(_SECRET_REF_PREFIX) :]
+            value = self._secret_store.resolve(secret_key)
+            if not value:
+                raise AnalyzerError(
+                    "This engine's saved API key could not be found. Re-enter "
+                    "it in the engine's settings."
+                )
+            return value, None
+        raise AnalyzerError("This engine's credential reference is not valid.")  # pragma: no cover
+
+    def test(self, engine_id: str) -> dict:
+        """Best-effort readiness check for the "Test" button: resolves the
+        credential and constructs a real provider client. Deliberately does
+        NOT make a live API call - that would cost real time/money on every
+        click - so ``ok: True`` means "this key/model is configured and the
+        client builds", not "a request to the vendor round-tripped"."""
+        engine = self.get(engine_id)
+        try:
+            self.build_provider(engine)
+        except AnalyzerError as exc:
+            return {"ok": False, "message": exc.user_message}
+        except Exception as exc:  # e.g. the vendor SDK package isn't installed
+            return {"ok": False, "message": sanitize_untrusted_text(str(exc))}
+        return {
+            "ok": True,
+            "message": "Credential resolved and the client constructed successfully. "
+            "This does not confirm a live request would succeed.",
+        }
+
+
+def _validated_provider_name(provider_name: str) -> str:
+    provider_name = (provider_name or "").strip().lower()
+    if provider_name not in SUPPORTED_PROVIDERS:
+        raise AnalyzerError(
+            f"Unsupported provider '{provider_name}'. Choose one of: "
+            + ", ".join(SUPPORTED_PROVIDERS)
+        )
+    return provider_name
+
+
+def _validated_model_id(provider_name: str, model_id: str | None) -> str:
+    """Reject anything not on ``SUPPORTED_MODELS[provider_name]`` - the
+    single server-side allowlist. Called on every create/update
+    unconditionally, so a request that bypasses the dropdown (a hand-
+    crafted API call, a tampered DOM) can never select an unlisted model
+    just because the client claimed one."""
+    model_id = (model_id or "").strip()
+    allowed = SUPPORTED_MODELS.get(provider_name, ())
+    if model_id not in allowed:
+        raise AnalyzerError(
+            f"'{model_id or '(empty)'}' is not a supported model for {provider_name}. "
+            f"Choose one of: {', '.join(allowed) if allowed else '(none available)'}."
+        )
+    return model_id
+
+
+def _secret_key_of(credential_ref: str) -> str | None:
+    if credential_ref.startswith(_SECRET_REF_PREFIX):
+        return credential_ref[len(_SECRET_REF_PREFIX) :]
+    return None

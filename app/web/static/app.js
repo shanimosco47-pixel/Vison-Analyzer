@@ -21,6 +21,10 @@ const state = {
   mode: null,         // selected analysis mode
   outlet: null,       // {x, y} in source pixels (Zahn)
   roi: null,          // {x, y, width, height} in source pixels
+  llmOutlet: null,    // {x, y} in source pixels, marked for the Experimental LLM section -
+                       // independent of `outlet` above (its own picker, its own state), since
+                       // the LLM section works without ever going through the classical
+                       // mode/frame-picker steps.
   frameTime: 0,       // timestamp of the frame shown in the picker
   jobId: null,
   pollTimer: null,
@@ -282,11 +286,22 @@ function onVideoUploaded(info) {
   preview.src = `/api/videos/${info.video_id}/media`;
   preview.load();
 
+  // A fresh video invalidates any previously-marked outlet: its pixel
+  // coordinates almost certainly no longer point at this video's outlet.
+  state.llmOutlet = null;
+  drawLLMOutlet();
+  updateLLMOutletSummary();
+  el("llm-outlet-image").src = "";
+  el("llm-frame-time-label").textContent = "";
+  el("llm-clear-outlet").classList.add("hidden");
+
   el("video-details").classList.remove("hidden");
   enableStep("step-mode", true);
   enableStep("step-configure", true);
   enableStep("step-analyse", true);
+  enableStep("step-llm", true);
   updateRunButton();
+  renderLLMEngineList(); // now that state.video exists, Run buttons become usable
 }
 
 /* ------------------------------------------------------------------ */
@@ -378,9 +393,10 @@ function loadFrameFromPreview() {
   el("clear-region").classList.remove("hidden");
 }
 
-/** Convert a pointer event into source-video pixel coordinates. */
-function toSourceCoords(event) {
-  const canvas = el("frame-canvas");
+/** Convert a pointer event into source-video pixel coordinates for a given
+ * canvas (the canvas's own width/height already hold the source frame's
+ * true pixel dimensions - set on image "load", see below). */
+function toSourceCoords(event, canvas) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = canvas.width / rect.width;
   const scaleY = canvas.height / rect.height;
@@ -392,18 +408,18 @@ function toSourceCoords(event) {
 
 function onPointerDown(event) {
   if (!el("frame-image").src) return;
-  state.dragStart = toSourceCoords(event);
+  state.dragStart = toSourceCoords(event, el("frame-canvas"));
 }
 
 function onPointerMove(event) {
   if (!state.dragStart) return;
-  const current = toSourceCoords(event);
+  const current = toSourceCoords(event, el("frame-canvas"));
   drawRegion(rectFrom(state.dragStart, current));
 }
 
 function onPointerUp(event) {
   if (!state.dragStart) return;
-  const current = toSourceCoords(event);
+  const current = toSourceCoords(event, el("frame-canvas"));
   const rect = rectFrom(state.dragStart, current);
   const isClick = rect.width < 8 || rect.height < 8;
 
@@ -478,6 +494,88 @@ function updateRegionSummary() {
       ? "No outlet marked yet - this is required for Zahn cup analysis."
       : "No region selected - the whole frame will be analysed.";
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Experimental LLM section - outlet picker                            */
+/*                                                                      */
+/* Independent of the classical picker above (state.outlet/state.roi): */
+/* the Experimental section is documented as usable without visiting   */
+/* the classical mode/frame-picker steps, so it keeps its own anchor   */
+/* in state.llmOutlet and its own frame/canvas pair.                   */
+/* ------------------------------------------------------------------ */
+
+function initLLMOutletPicker() {
+  el("llm-grab-frame").addEventListener("click", loadLLMFrameFromPreview);
+  el("llm-clear-outlet").addEventListener("click", () => {
+    state.llmOutlet = null;
+    drawLLMOutlet();
+    updateLLMOutletSummary();
+    updateLLMRunButtons();
+  });
+
+  const canvas = el("llm-outlet-canvas");
+  canvas.addEventListener("pointerup", onLLMOutletPointerUp);
+
+  el("llm-outlet-image").addEventListener("load", () => {
+    const image = el("llm-outlet-image");
+    const canvasEl = el("llm-outlet-canvas");
+    canvasEl.width = image.naturalWidth;
+    canvasEl.height = image.naturalHeight;
+    drawLLMOutlet();
+  });
+}
+
+function loadLLMFrameFromPreview() {
+  if (!state.video) return;
+  const time = el("preview").currentTime || 0;
+  el("llm-outlet-image").src =
+    `/api/videos/${state.video.video_id}/frame?t=${encodeURIComponent(time.toFixed(3))}`;
+  el("llm-frame-time-label").textContent = `Frame at ${time.toFixed(2)} s`;
+  el("llm-clear-outlet").classList.remove("hidden");
+}
+
+function onLLMOutletPointerUp(event) {
+  if (!el("llm-outlet-image").src) return;
+  state.llmOutlet = toSourceCoords(event, el("llm-outlet-canvas"));
+  drawLLMOutlet();
+  updateLLMOutletSummary();
+  updateLLMRunButtons();
+}
+
+function drawLLMOutlet() {
+  const canvas = el("llm-outlet-canvas");
+  const context = canvas.getContext("2d");
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  if (!state.llmOutlet) return;
+
+  const lineWidth = Math.max(2, Math.round(canvas.width / 400));
+  const radius = Math.max(6, Math.round(canvas.width / 90));
+  context.strokeStyle = "#ffaa00";
+  context.lineWidth = lineWidth;
+  context.beginPath();
+  context.arc(state.llmOutlet.x, state.llmOutlet.y, radius, 0, Math.PI * 2);
+  context.stroke();
+}
+
+function updateLLMOutletSummary() {
+  const summary = el("llm-outlet-summary");
+  summary.textContent = state.llmOutlet
+    ? `Outlet marked at x=${state.llmOutlet.x}, y=${state.llmOutlet.y}. `
+      + "AI engines will crop and analyse frames anchored on this point."
+    : "No outlet marked yet - this is required before running an AI engine.";
+}
+
+/** Re-applies the outlet-marked precondition to every rendered engine
+ * card's Run button - called whenever state.llmOutlet changes and after
+ * renderLLMEngineList() rebuilds the cards from scratch. */
+function updateLLMRunButtons() {
+  llmState.engines.forEach((engine) => {
+    const card = findLLMCard(engine.engine_id);
+    if (!card) return;
+    const runBtn = card.querySelector(".llm-run-btn");
+    if (runBtn) runBtn.disabled = !engine.enabled || !state.video || !state.llmOutlet;
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1022,6 +1120,977 @@ function updateReviewBoundaryMarkers() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Experimental: LLM analysis                                          */
+/*                                                                      */
+/* Independent of the classical analysis above: it only needs an       */
+/* uploaded video (state.video), not a chosen mode. Sends only          */
+/* individually extracted frames to the configured provider - never the */
+/* original video file (see run_llm_timing/_extract_frames). Every      */
+/* result is explicitly marked Experimental / review required - see     */
+/* diagnostics/llm_spike/DESIGN.md.                                     */
+/* ------------------------------------------------------------------ */
+
+const LLM_POLL_INTERVAL_MS = 1200;
+
+// Order the "Frames sent to AI" section is rendered in, and the label shown
+// for each pass - mirrors the pipeline's own pass names (see
+// PipelineOutcome.pass_frames / Event stage names) so this can never drift
+// from what the backend actually calls each pass.
+// "end_validate_conflict" only ever appears when a run's end-coarse
+// candidate conflicted with the coarse pass's own independent end estimate
+// (see pipeline._candidates_conflict) - like every other pass, its absence
+// from a given run's audit record just means it did not run, and
+// llmPassPlainLanguage already renders that as "This pass did not run."
+const LLM_PASS_ORDER = ["coarse", "fine", "end_coarse", "end_validate", "end_validate_conflict"];
+const LLM_PASS_LABELS = {
+  coarse: "Start coarse",
+  fine: "Start refine",
+  end_coarse: "End coarse",
+  end_validate: "End validate",
+  end_validate_conflict: "End validate (conflict check)",
+};
+
+const llmState = {
+  engines: [],
+  editingEngineId: null,
+  runs: {}, // engine_id -> { runId }
+  modelOptions: {}, // provider_name -> [model_id, ...], from GET /api/llm-model-options
+};
+
+/** Pure: "provider / model" subtitle line for an engine card. */
+function llmEngineSubtitle(engine) {
+  if (!engine) return "";
+  return `${engine.provider_name} / ${engine.model_id}`;
+}
+
+/** Pure: badge text + CSS class for a finished run's verdict status. */
+function llmResultBadge(verdictStatus) {
+  if (verdictStatus === "confirmed") return { text: "Confirmed", cls: "ok" };
+  if (verdictStatus === "abstain") return { text: "Abstained - no confident result", cls: "review" };
+  return { text: "Unknown result", cls: "review" };
+}
+
+/** Pure: one-line progress/status message for a run job (as returned by
+ * GET /api/llm-runs/<id>). */
+function llmRunStatusLine(job) {
+  if (!job) return "";
+  if (job.status === "queued") return "Queued";
+  if (job.status === "running") {
+    const elapsed = typeof job.elapsed_s === "number" ? job.elapsed_s.toFixed(1) : "0.0";
+    return `${job.message || "Running"} (${elapsed}s elapsed)`;
+  }
+  if (job.status === "complete") return job.message || "Complete";
+  if (job.status === "cancelled") return "Cancelled";
+  if (job.status === "failed") return job.error || "Failed";
+  return job.status || "";
+}
+
+/** Pure: validate the add/edit engine form before submitting. Returns an
+ * array of error strings; empty means the form is valid. `form` is
+ * { providerName, modelId, credentialMode, apiKey, envVar }.
+ * `credentialMode` may be "unchanged" (editing an existing engine without
+ * touching its credential), which needs neither field filled in. */
+function validateLLMEngineForm(form) {
+  const errors = [];
+  if (!form.providerName) errors.push("Choose a provider.");
+  if (!form.modelId || !form.modelId.trim()) errors.push("Choose a model.");
+  if (form.credentialMode === "api_key") {
+    if (!form.apiKey || !form.apiKey.trim()) {
+      errors.push("Paste an API key, or switch to the environment-variable option.");
+    }
+  } else if (form.credentialMode === "env_var") {
+    if (!form.envVar || !form.envVar.trim()) {
+      errors.push("Enter the environment variable's name.");
+    }
+  } else if (form.credentialMode !== "unchanged") {
+    errors.push("Choose how to provide credentials.");
+  }
+  return errors;
+}
+
+/** Pure: "Not run", or "first.Ts to last.Ts - N frame(s)", for one pass's
+ * actual submitted timestamps. `timestamps` is undefined/empty for a pass
+ * that never ran (see PipelineOutcome.pass_frames' absent-key contract) -
+ * both are treated the same way, deliberately, rather than showing an
+ * empty range that could be misread as "ran with zero frames". */
+function llmPassFrameSummary(timestamps) {
+  if (!timestamps || !timestamps.length) return "Not run";
+  const sorted = [...timestamps].slice().sort((a, b) => a - b);
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  const frameWord = sorted.length === 1 ? "frame" : "frames";
+  return `${first.toFixed(1)}s to ${last.toFixed(1)}s - ${sorted.length} ${frameWord}`;
+}
+
+/** Pure: every actual submitted timestamp for a pass, sorted, comma-joined,
+ * each to 0.1s - so a sparse/thinned request is shown as the exact discrete
+ * timestamps sent, never collapsed back into a misleading continuous range. */
+function llmFormatFrameTimestamps(timestamps) {
+  if (!timestamps || !timestamps.length) return "";
+  return timestamps
+    .slice()
+    .sort((a, b) => a - b)
+    .map((t) => `${t.toFixed(1)}s`)
+    .join(", ");
+}
+
+/** Pure: the overlay label for an evidence image, or the explicit
+ * no-evidence message - never fabricates a timestamp. */
+function llmEvidenceLabel(evidenceS) {
+  if (typeof evidenceS !== "number" || !Number.isFinite(evidenceS)) {
+    return "No grounded evidence image available";
+  }
+  return `t = ${evidenceS.toFixed(1)}s`;
+}
+
+function initLLMSection() {
+  el("llm-add-engine").addEventListener("click", () => openLLMEngineForm(null));
+  el("llm-engine-cancel").addEventListener("click", closeLLMEngineForm);
+  el("llm-engine-form").addEventListener("submit", onLLMEngineFormSubmit);
+  el("llm-engine-provider").addEventListener("change", () => populateLLMModelSelect());
+  document.querySelectorAll('input[name="llm-credential-mode"]').forEach((radio) => {
+    radio.addEventListener("change", updateLLMCredentialFieldVisibility);
+  });
+  initLLMOutletPicker();
+  loadLLMModelOptions();
+  loadLLMEngines();
+}
+
+/** Fetches the server-side model allowlist per provider - the single
+ * source of truth also enforced independently by LLMEngineStore.create/
+ * update, so DOM/request tampering can't select an unsupported model. */
+async function loadLLMModelOptions() {
+  try {
+    llmState.modelOptions = await getJSON("/api/llm-model-options");
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+/** Repopulates the Model <select> from llmState.modelOptions for the
+ * currently-chosen provider. When `selectedModelId` is given but is not on
+ * that provider's allowlist (e.g. editing an engine whose saved model was
+ * since removed, or the provider was just switched), this deliberately
+ * does NOT silently fall back to the first available model - it shows a
+ * disabled placeholder plus a visible warning and requires an explicit new
+ * selection, per the supervisor's requirement. */
+function populateLLMModelSelect(selectedModelId) {
+  const select = el("llm-engine-model-id");
+  const hint = el("llm-engine-model-hint");
+  const provider = el("llm-engine-provider").value;
+  const options = llmState.modelOptions[provider] || [];
+  select.innerHTML = "";
+
+  const isKnownSelection = !!selectedModelId && options.includes(selectedModelId);
+  if (selectedModelId && !isKnownSelection) {
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Choose a model";
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    select.appendChild(placeholder);
+    hint.textContent =
+      `"${selectedModelId}" is no longer a supported model for this provider. Choose a new one.`;
+    hint.classList.remove("hidden");
+  } else {
+    hint.textContent = "";
+    hint.classList.add("hidden");
+  }
+
+  options.forEach((modelId) => {
+    const option = document.createElement("option");
+    option.value = modelId;
+    option.textContent = modelId;
+    if (modelId === selectedModelId) option.selected = true;
+    select.appendChild(option);
+  });
+}
+
+function updateLLMCredentialFieldVisibility() {
+  const checked = document.querySelector('input[name="llm-credential-mode"]:checked');
+  const mode = checked ? checked.value : "api_key";
+  el("llm-engine-api-key").classList.toggle("hidden", mode !== "api_key");
+  el("llm-engine-env-var").classList.toggle("hidden", mode !== "env_var");
+}
+
+async function loadLLMEngines() {
+  try {
+    const payload = await getJSON("/api/llm-engines");
+    llmState.engines = payload.engines;
+    renderLLMEngineList();
+    // Restores each engine's last result after a page refresh (a fresh
+    // load has no in-progress poll to produce one) - the durable audit
+    // store is exactly what makes this possible; see
+    // llm_run_audit.py/get_latest_audit_for_engine.
+    llmState.engines.forEach((engine) => loadLatestAuditForEngine(engine.engine_id));
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+/** Best-effort: an engine that has never completed a run simply has
+ * nothing to show yet (404), which is not an error worth surfacing. */
+async function loadLatestAuditForEngine(engineId) {
+  const card = findLLMCard(engineId);
+  if (!card) return;
+  let audit;
+  try {
+    audit = await getJSON(`/api/llm-engines/${engineId}/latest-audit`);
+  } catch (err) {
+    return;
+  }
+  const resultEl = card.querySelector(".llm-result");
+  if (!resultEl) return;
+  const pseudoJob = { run_id: audit.run_id, status: audit.status, error: audit.error };
+  renderLLMResult(resultEl, pseudoJob, audit);
+  resultEl.classList.remove("hidden");
+}
+
+function findLLMCard(engineId) {
+  return el("llm-engine-list").querySelector(`[data-engine-id="${engineId}"]`);
+}
+
+function renderLLMEngineList() {
+  const container = el("llm-engine-list");
+  container.innerHTML = "";
+  llmState.engines.forEach((engine) => container.appendChild(buildLLMEngineCard(engine)));
+}
+
+function buildLLMEngineCard(engine) {
+  const card = document.createElement("div");
+  card.className = "llm-engine-card";
+  card.dataset.engineId = engine.engine_id;
+
+  const header = document.createElement("div");
+  header.className = "llm-engine-card-header";
+  const name = document.createElement("span");
+  name.className = "llm-engine-name";
+  name.textContent = engine.display_name || engine.model_id;
+  const subtitle = document.createElement("span");
+  subtitle.className = "llm-engine-subtitle";
+  subtitle.textContent = llmEngineSubtitle(engine);
+  header.appendChild(name);
+  header.appendChild(subtitle);
+  if (!engine.enabled) {
+    const disabledBadge = document.createElement("span");
+    disabledBadge.className = "badge review";
+    disabledBadge.textContent = "Disabled";
+    header.appendChild(disabledBadge);
+  }
+  card.appendChild(header);
+
+  const actions = document.createElement("div");
+  actions.className = "action-row";
+
+  const runBtn = document.createElement("button");
+  runBtn.type = "button";
+  runBtn.className = "primary llm-run-btn";
+  runBtn.textContent = "Run";
+  runBtn.disabled = !engine.enabled || !state.video || !state.llmOutlet;
+  runBtn.addEventListener("click", () => runLLMEngine(engine));
+  actions.appendChild(runBtn);
+
+  const cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.className = "secondary llm-cancel-btn hidden";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", () => cancelLLMRun(engine.engine_id));
+  actions.appendChild(cancelBtn);
+
+  const testBtn = document.createElement("button");
+  testBtn.type = "button";
+  testBtn.className = "secondary llm-test-btn";
+  testBtn.textContent = "Test";
+  testBtn.addEventListener("click", () => testLLMEngine(engine.engine_id, testBtn));
+  actions.appendChild(testBtn);
+
+  const editBtn = document.createElement("button");
+  editBtn.type = "button";
+  editBtn.className = "secondary";
+  editBtn.textContent = "Edit";
+  editBtn.addEventListener("click", () => openLLMEngineForm(engine));
+  actions.appendChild(editBtn);
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.type = "button";
+  deleteBtn.className = "secondary";
+  deleteBtn.textContent = "Delete";
+  deleteBtn.addEventListener("click", () => deleteLLMEngine(engine.engine_id));
+  actions.appendChild(deleteBtn);
+  card.appendChild(actions);
+
+  const progress = document.createElement("div");
+  progress.className = "llm-run-progress hidden";
+  const progressBar = document.createElement("div");
+  progressBar.className = "progress";
+  const bar = document.createElement("div");
+  bar.className = "progress-bar";
+  progressBar.appendChild(bar);
+  const message = document.createElement("p");
+  message.className = "progress-message";
+  progress.appendChild(progressBar);
+  progress.appendChild(message);
+  card.appendChild(progress);
+
+  const result = document.createElement("div");
+  result.className = "llm-result hidden";
+  card.appendChild(result);
+
+  const testResult = document.createElement("p");
+  testResult.className = "hint llm-test-result hidden";
+  card.appendChild(testResult);
+
+  return card;
+}
+
+async function runLLMEngine(engine) {
+  if (!state.video) return;
+  if (!state.llmOutlet) {
+    showError("Mark the outlet hole of the cup on the video frame before running an AI engine.");
+    return;
+  }
+  const card = findLLMCard(engine.engine_id);
+  if (!card) return;
+  const runBtn = card.querySelector(".llm-run-btn");
+  const cancelBtn = card.querySelector(".llm-cancel-btn");
+  const progress = card.querySelector(".llm-run-progress");
+  const message = card.querySelector(".progress-message");
+  const resultEl = card.querySelector(".llm-result");
+
+  runBtn.disabled = true;
+  cancelBtn.classList.remove("hidden");
+  cancelBtn.disabled = false;
+  cancelBtn.textContent = "Cancel";
+  progress.classList.remove("hidden");
+  resultEl.classList.add("hidden");
+  message.textContent = "Starting...";
+
+  try {
+    const job = await getJSON(`/api/videos/${state.video.video_id}/llm-runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ engine_id: engine.engine_id, outlet: state.llmOutlet }),
+    });
+    llmState.runs[engine.engine_id] = { runId: job.run_id };
+    pollLLMRun(engine.engine_id);
+  } catch (err) {
+    runBtn.disabled = !engine.enabled;
+    cancelBtn.classList.add("hidden");
+    progress.classList.add("hidden");
+    showError(err.message);
+  }
+}
+
+function pollLLMRun(engineId) {
+  const runInfo = llmState.runs[engineId];
+  if (!runInfo) return;
+  const card = findLLMCard(engineId);
+  if (!card) return;
+
+  getJSON(`/api/llm-runs/${runInfo.runId}`)
+    .then((job) => {
+      updateLLMRunCard(card, job);
+      if (job.status === "queued" || job.status === "running") {
+        window.setTimeout(() => pollLLMRun(engineId), LLM_POLL_INTERVAL_MS);
+      } else {
+        delete llmState.runs[engineId];
+      }
+    })
+    .catch((err) => {
+      showError(err.message);
+      delete llmState.runs[engineId];
+    });
+}
+
+/** Fetches this run's durable audit record and renders the result card
+ * from it, once the job has reached a terminal state. The audit fetch is
+ * best-effort: if it fails (network hiccup), the card still renders from
+ * `job` alone - it just won't have the Frames-sent-to-AI/evidence/How-the-
+ * AI-decided sections until the next successful fetch (e.g. a later page
+ * load, since the audit itself is already durably saved server-side by
+ * the time job.status went terminal - see llm_run_service.py's own
+ * ordering guarantee). */
+async function fetchLLMAuditAndRender(resultEl, job) {
+  let audit = null;
+  if (job.run_id) {
+    try {
+      audit = await getJSON(`/api/llm-runs/${job.run_id}/audit`);
+    } catch (err) {
+      // Non-fatal - render without the audit-dependent sections below.
+    }
+  }
+  renderLLMResult(resultEl, job, audit);
+}
+
+function updateLLMRunCard(card, job) {
+  const runBtn = card.querySelector(".llm-run-btn");
+  const cancelBtn = card.querySelector(".llm-cancel-btn");
+  const progress = card.querySelector(".llm-run-progress");
+  const bar = card.querySelector(".progress-bar");
+  const message = card.querySelector(".progress-message");
+  const resultEl = card.querySelector(".llm-result");
+
+  message.textContent = llmRunStatusLine(job);
+  const running = job.status === "queued" || job.status === "running";
+  cancelBtn.classList.toggle("hidden", !running);
+  progress.classList.toggle("hidden", !running);
+  // The server reports named stages, not a fraction - a settled two-thirds
+  // fill communicates "in progress" without implying false precision.
+  bar.style.width = running ? "60%" : "100%";
+  runBtn.disabled = running;
+
+  if (!running) {
+    resultEl.classList.remove("hidden");
+    fetchLLMAuditAndRender(resultEl, job);
+  }
+}
+
+function appendDetail(dl, label, value) {
+  const wrap = document.createElement("div");
+  const dt = document.createElement("dt");
+  dt.textContent = label;
+  const dd = document.createElement("dd");
+  dd.textContent = value;
+  wrap.appendChild(dt);
+  wrap.appendChild(dd);
+  dl.appendChild(wrap);
+}
+
+function renderLLMResult(container, job, audit) {
+  container.innerHTML = "";
+
+  const reviewBadge = document.createElement("span");
+  reviewBadge.className = "badge review";
+  reviewBadge.textContent = "Experimental - review required";
+  container.appendChild(reviewBadge);
+
+  if (job.status === "failed") {
+    const badge = document.createElement("span");
+    badge.className = "badge bad";
+    badge.textContent = "Error";
+    container.appendChild(badge);
+    const msg = document.createElement("p");
+    msg.className = "hint";
+    msg.textContent = job.error || "The run failed.";
+    container.appendChild(msg);
+    if (job.run_id) container.appendChild(buildAuditDownloadLink(job.run_id));
+    return;
+  }
+  if (job.status === "cancelled") {
+    const badge = document.createElement("span");
+    badge.className = "badge review";
+    badge.textContent = "Cancelled";
+    container.appendChild(badge);
+    if (job.run_id) container.appendChild(buildAuditDownloadLink(job.run_id));
+    return;
+  }
+
+  const verdict = job.outcome
+    ? job.outcome.verdict
+    : audit && audit.final_verdict;
+  const badgeInfo = llmResultBadge(verdict ? verdict.status : null);
+  const badge = document.createElement("span");
+  badge.className = `badge ${badgeInfo.cls}`;
+  badge.textContent = badgeInfo.text;
+  container.appendChild(badge);
+
+  if (verdict && verdict.status === "confirmed" && verdict.start_s !== null && verdict.end_s !== null) {
+    const dl = document.createElement("dl");
+    dl.className = "details-grid";
+    appendDetail(dl, "Start", `${verdict.start_s.toFixed(2)} s`);
+    appendDetail(dl, "End", `${verdict.end_s.toFixed(2)} s`);
+    appendDetail(dl, "Duration", formatDuration(verdict.end_s - verdict.start_s));
+    appendDetail(dl, "Confidence", verdict.confidence.toFixed(2));
+    const uncertainty = Math.max(verdict.start_uncertainty_s || 0, verdict.end_uncertainty_s || 0);
+    appendDetail(dl, "Uncertainty", `±${uncertainty.toFixed(2)} s`);
+    container.appendChild(dl);
+  }
+
+  if (verdict && verdict.reason_codes && verdict.reason_codes.length) {
+    const notes = document.createElement("p");
+    notes.className = "hint";
+    notes.textContent = `Notes: ${verdict.reason_codes.join(", ")}`;
+    container.appendChild(notes);
+  }
+
+  // Auditability: exactly what was sent to the AI, and (on a confirmed
+  // result) the two decisive evidence frames - see
+  // diagnostics/llm_spike/DESIGN.md's "what did the AI see" requirement.
+  // Sourced from the durable audit record (not job.outcome) so this
+  // section renders identically whether it just finished live or is
+  // being restored after a page refresh from the persisted audit alone.
+  if (audit) {
+    const framesSection = buildLLMFramesSentSection(audit);
+    if (framesSection) container.appendChild(framesSection);
+
+    if (verdict && verdict.status === "confirmed") {
+      container.appendChild(buildLLMEvidenceSection(job, audit));
+    }
+
+    container.appendChild(buildHowAIDecidedSection(audit));
+  }
+
+  if (job.run_id) {
+    container.appendChild(buildAuditDownloadLink(job.run_id));
+  }
+}
+
+/** The "Frames sent to AI" audit section: one row per pipeline pass, each
+ * showing the actual submitted-frame range/count (never the theoretical
+ * extraction plan - see PipelineOutcome.pass_frames), with an expandable
+ * list of every individual submitted timestamp so a sparse/thinned
+ * request can never be misrepresented as a continuous range. Returns
+ * `null` when the audit record has no passes at all (e.g. a failed run
+ * that never reached the pipeline). Reads from the durable audit
+ * record's `passes` map (`GET /api/llm-runs/<id>/audit`), the single
+ * source of truth both for a just-finished run and one restored after a
+ * page refresh. */
+function buildLLMFramesSentSection(audit) {
+  const passes = audit.passes;
+  if (!passes || !Object.keys(passes).length) return null;
+
+  const details = document.createElement("details");
+  details.className = "llm-frames-sent";
+  const summary = document.createElement("summary");
+  summary.textContent = "Frames sent to AI";
+  details.appendChild(summary);
+
+  const explanation = document.createElement("p");
+  explanation.className = "hint";
+  explanation.textContent =
+    "Each pass below sees a different range of the video - the frames actually " +
+    "submitted after budget thinning, not a plan. Start refine is centered on the " +
+    "coarse start estimate; current default margin is ±1.5 s (3.0 s total), " +
+    "widened if the reported uncertainty is larger.";
+  details.appendChild(explanation);
+
+  const fineFrames = passes.fine && passes.fine.submitted_timestamps_s;
+  if (fineFrames && fineFrames.length) {
+    const actualRange = document.createElement("p");
+    actualRange.className = "hint";
+    actualRange.textContent = `Actual start-refine range used for this run: ${llmPassFrameSummary(fineFrames)}.`;
+    details.appendChild(actualRange);
+  }
+
+  const dl = document.createElement("dl");
+  dl.className = "details-grid";
+  LLM_PASS_ORDER.forEach((passName) => {
+    // "end_validate_conflict" only exists on a run whose end-coarse
+    // candidate conflicted with the coarse pass's own end estimate - unlike
+    // the four passes every run reaches, it stays out of this section
+    // entirely (not even a "Not run" row) on the overwhelmingly common run
+    // that never triggers it.
+    if (passName === "end_validate_conflict" && !passes[passName]) return;
+    const timestamps = passes[passName] && passes[passName].submitted_timestamps_s;
+    // .details-grid is a CSS grid over its *direct* children (see
+    // appendDetail above) - each dt/dd pair must be wrapped in its own
+    // div, or the grid places dt and dd as separate cells and the labels
+    // drift out of alignment with their values.
+    const wrap = document.createElement("div");
+    const dt = document.createElement("dt");
+    dt.textContent = LLM_PASS_LABELS[passName];
+    const dd = document.createElement("dd");
+    dd.textContent = llmPassFrameSummary(timestamps);
+
+    if (timestamps && timestamps.length) {
+      const passDetail = document.createElement("details");
+      passDetail.className = "llm-frame-timestamps";
+      const passSummary = document.createElement("summary");
+      passSummary.textContent = `All ${timestamps.length} submitted timestamps`;
+      passDetail.appendChild(passSummary);
+      const list = document.createElement("p");
+      list.textContent = llmFormatFrameTimestamps(timestamps);
+      passDetail.appendChild(list);
+      dd.appendChild(passDetail);
+    }
+
+    wrap.appendChild(dt);
+    wrap.appendChild(dd);
+    dl.appendChild(wrap);
+  });
+  details.appendChild(dl);
+
+  return details;
+}
+
+/** The two decisive evidence images (Start/End) for a confirmed result -
+ * see pipeline._nearest_grounded_evidence_ts for how the server selects
+ * (and grounds) each timestamp; this only ever renders what the server
+ * already decided, never a client-chosen frame. Timestamps come from the
+ * durable audit's `derived` map - same source as buildLLMFramesSentSection,
+ * so this section also survives a page refresh unchanged. */
+function buildLLMEvidenceSection(job, audit) {
+  const derived = audit.derived || {};
+  const section = document.createElement("div");
+  section.className = "llm-evidence-section";
+  const heading = document.createElement("h4");
+  heading.className = "llm-evidence-heading";
+  heading.textContent = "Decisive evidence";
+  section.appendChild(heading);
+
+  const grid = document.createElement("div");
+  grid.className = "llm-evidence-grid";
+  grid.appendChild(buildLLMEvidenceFigure(job, "start", "Start evidence", derived.start_evidence_s));
+  grid.appendChild(buildLLMEvidenceFigure(job, "end", "End evidence", derived.end_evidence_s));
+  section.appendChild(grid);
+  return section;
+}
+
+function buildLLMEvidenceFigure(job, boundary, label, evidenceS) {
+  const figure = document.createElement("figure");
+  figure.className = "llm-evidence-figure";
+  const caption = document.createElement("figcaption");
+  caption.textContent = label;
+  figure.appendChild(caption);
+
+  if (typeof evidenceS !== "number" || !Number.isFinite(evidenceS)) {
+    const missing = document.createElement("p");
+    missing.className = "hint";
+    missing.textContent = llmEvidenceLabel(evidenceS);
+    figure.appendChild(missing);
+    return figure;
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "llm-evidence-image-wrap";
+  const img = document.createElement("img");
+  img.className = "llm-evidence-image";
+  img.src = `/api/llm-runs/${job.run_id}/evidence/${boundary}`;
+  img.alt = `${label} frame`;
+  const timestampLabel = document.createElement("span");
+  timestampLabel.className = "llm-evidence-timestamp-label";
+  timestampLabel.textContent = llmEvidenceLabel(evidenceS);
+  wrap.appendChild(img);
+  wrap.appendChild(timestampLabel);
+  figure.appendChild(wrap);
+  return figure;
+}
+
+// Which field of a pass's audit entry holds "the boundary it reported",
+// and what to call that boundary in plain language - coarse is the one
+// exception (it reports both a start and an end estimate at once).
+const LLM_PASS_BOUNDARY_WORD = {
+  fine: "start",
+  end_coarse: "candidate break",
+  end_validate: "confirmed break",
+  end_validate_conflict: "coarse-estimate break",
+};
+
+/** Pure: a plain-language paragraph describing what one pass reported -
+ * grounded only in that pass's own recorded audit fields, no jargon. This
+ * is what the "How the AI decided" section shows per pass, so a wrong
+ * result can be understood without DevTools or reading raw JSON. `entry`
+ * is one value from an audit record's `passes` map, or null/undefined if
+ * that pass never ran. */
+function llmPassPlainLanguage(passName, entry) {
+  if (!entry) return "This pass did not run.";
+
+  const frameWord = entry.submitted_count === 1 ? "frame" : "frames";
+  const rangeText = entry.submitted_range_s
+    ? `${entry.submitted_range_s[0].toFixed(1)}s to ${entry.submitted_range_s[1].toFixed(1)}s`
+    : "no frames";
+  let sentence = `Looked at ${entry.submitted_count} ${frameWord} spanning ${rangeText}.`;
+
+  if (entry.status === "confirmed") {
+    if (passName === "coarse") {
+      sentence +=
+        ` Reported an approximate start at t = ${entry.start_s.toFixed(1)}s and end at ` +
+        `t = ${entry.end_s.toFixed(1)}s (confidence ${entry.confidence.toFixed(2)}).`;
+    } else {
+      const boundaryS = passName === "fine" ? entry.start_s : entry.end_s;
+      const boundaryWord = LLM_PASS_BOUNDARY_WORD[passName] || "boundary";
+      sentence +=
+        ` Reported a ${boundaryWord} at t = ${boundaryS.toFixed(1)}s ` +
+        `(confidence ${entry.confidence.toFixed(2)}).`;
+    }
+  } else {
+    const reasons =
+      entry.reason_codes && entry.reason_codes.length ? ` (${entry.reason_codes.join(", ")})` : "";
+    sentence += ` Did not produce a confident answer${reasons}.`;
+  }
+
+  // Trend checkpoints are a distinct, role-labelled kind of evidence - only
+  // meaningful for the end-validate passes - kept separate from the general
+  // evidence-timestamp citation so a reader can see exactly what was cited
+  // as proof of a *sustained* trend, whether or not it held up.
+  if (
+    (passName === "end_validate" || passName === "end_validate_conflict") &&
+    entry.trend_checkpoint_timestamps_s &&
+    entry.trend_checkpoint_timestamps_s.length
+  ) {
+    const checkpointList = entry.trend_checkpoint_timestamps_s
+      .map((ts) => `${ts.toFixed(2)}s`)
+      .join(", ");
+    sentence += ` Trend checkpoints cited: ${checkpointList}.`;
+  }
+
+  if (entry.raw_notes) {
+    sentence += ` Notes: ${entry.raw_notes}`;
+  }
+  return sentence;
+}
+
+/** Pure: the sentence connecting the end-coarse pass's sparse candidate to
+ * the dense validation window built around it - the exact link the
+ * supervisor's audit requirement calls out by name ("how its candidate
+ * produced the end-validation window"). Empty string when either half of
+ * that chain is missing (e.g. the run never reached end-coarse at all). */
+function llmEndCoarseToValidateExplanation(derived) {
+  if (!derived || derived.end_coarse_candidate_s == null || !derived.end_validation_window_s) {
+    return "";
+  }
+  const [lo, hi] = derived.end_validation_window_s;
+  return (
+    `Because the end-coarse pass nominated t = ${derived.end_coarse_candidate_s.toFixed(1)}s ` +
+    `as a possible break, the pipeline built a dense validation window from ${lo.toFixed(1)}s ` +
+    `to ${hi.toFixed(1)}s around it, and re-examined every frame in that range before trusting ` +
+    `the candidate.`
+  );
+}
+
+// Plain-language explanation for each way a candidate-conflict can resolve
+// (see pipeline.py's five-branch resolution logic, derived.conflict_resolution) -
+// keyed exactly to the string the backend records, so this can never drift
+// from what the pipeline actually decided.
+const LLM_CONFLICT_RESOLUTION_TEXT = {
+  both_confirmed_conflict_abstain:
+    "Both were independently confirmed as sustained trends, which is genuinely " +
+    "ambiguous - the AI abstained rather than confidently picking one over the other.",
+  end_coarse_candidate_confirmed:
+    "Only the end-coarse candidate held up as a sustained trend, so it was used " +
+    "for the final result.",
+  coarse_estimate_confirmed:
+    "Only the coarse pass's own end estimate held up as a sustained trend, so it " +
+    "was used for the final result instead of the end-coarse candidate.",
+  neither_confirmed:
+    "Neither the end-coarse candidate nor the coarse pass's own end estimate held " +
+    "up as a sustained trend, so the AI abstained.",
+};
+
+/** Pure: a plain-language paragraph explaining a cross-pass candidate
+ * conflict and how it was resolved - the supervisor-required "candidate-
+ * conflict/selection result" half of "How the AI decided". Returns "" when
+ * no conflict was detected for this run (the common case), so the section
+ * stays uncluttered. `derived` is an audit record's `derived` map. */
+function llmConflictResolutionExplanation(derived) {
+  if (!derived || !derived.candidate_conflict) return "";
+  const candidateS = derived.end_coarse_candidate_s;
+  const estimateS = derived.coarse_end_estimate_s;
+  const lead =
+    typeof candidateS === "number" && typeof estimateS === "number"
+      ? `The end-coarse candidate (t = ${candidateS.toFixed(1)}s) conflicted with the coarse ` +
+        `pass's own independent end estimate (t = ${estimateS.toFixed(1)}s) - neither's own ` +
+        `validation window contained the other, so both were checked independently. `
+      : "The end-coarse candidate conflicted with the coarse pass's own independent end " +
+        "estimate, so both were checked independently. ";
+  const outcome =
+    LLM_CONFLICT_RESOLUTION_TEXT[derived.conflict_resolution] ||
+    "The conflict was resolved without a clear-cut outcome recorded.";
+  return lead + outcome;
+}
+
+/** The "How the AI decided" section: one pass at a time, in plain
+ * language, in the order the pipeline ran them - including a pass that
+ * never ran ("Not run") and one whose own answer was later rejected, so
+ * a wrong or abstained result is exactly as explainable as a right one.
+ * Built entirely from the durable audit record - never job.outcome - so
+ * it renders identically live or after a page refresh. */
+function buildHowAIDecidedSection(audit) {
+  const details = document.createElement("details");
+  details.className = "llm-how-decided";
+  const summary = document.createElement("summary");
+  summary.textContent = "How the AI decided";
+  details.appendChild(summary);
+
+  const intro = document.createElement("p");
+  intro.className = "hint";
+  intro.textContent =
+    "Each pass is shown separately, in the order it ran, including passes that did not " +
+    "lead anywhere - this is the full chain behind the result above, not just the final answer.";
+  details.appendChild(intro);
+
+  LLM_PASS_ORDER.forEach((passName) => {
+    const entry = audit.passes && audit.passes[passName];
+    // Same "stay out entirely, not even Not run" rule as the Frames-sent-
+    // to-AI section - see buildLLMFramesSentSection.
+    if (passName === "end_validate_conflict" && !entry) return;
+    const block = document.createElement("div");
+    block.className = "llm-how-decided-pass";
+    const heading = document.createElement("h5");
+    heading.textContent = LLM_PASS_LABELS[passName];
+    block.appendChild(heading);
+    const para = document.createElement("p");
+    para.textContent = llmPassPlainLanguage(passName, entry);
+    block.appendChild(para);
+
+    if (passName === "end_coarse") {
+      const explanation = llmEndCoarseToValidateExplanation(audit.derived);
+      if (explanation) {
+        const connector = document.createElement("p");
+        connector.className = "hint";
+        connector.textContent = explanation;
+        block.appendChild(connector);
+      }
+    }
+
+    details.appendChild(block);
+  });
+
+  const conflictExplanation = llmConflictResolutionExplanation(audit.derived);
+  if (conflictExplanation) {
+    const conflictBlock = document.createElement("div");
+    conflictBlock.className = "llm-how-decided-pass";
+    const heading = document.createElement("h5");
+    heading.textContent = "Candidate conflict";
+    conflictBlock.appendChild(heading);
+    const para = document.createElement("p");
+    para.textContent = conflictExplanation;
+    conflictBlock.appendChild(para);
+    details.appendChild(conflictBlock);
+  }
+
+  return details;
+}
+
+/** A plain link to the durable audit JSON - `download` makes a click save
+ * it rather than navigate; the exact same URL also serves a plain
+ * `fetch()` (see loadLatestAuditForEngine/fetchLLMAuditAndRender), so
+ * there is only ever one audit endpoint, not a separate view/download
+ * pair that could drift apart. */
+function buildAuditDownloadLink(runId) {
+  const wrap = document.createElement("div");
+  wrap.className = "action-row llm-audit-actions";
+  const link = document.createElement("a");
+  link.className = "secondary button-like";
+  link.href = `/api/llm-runs/${runId}/audit`;
+  link.setAttribute("download", "");
+  link.textContent = "Download audit report (JSON)";
+  wrap.appendChild(link);
+  return wrap;
+}
+
+function cancelLLMRun(engineId) {
+  const runInfo = llmState.runs[engineId];
+  if (!runInfo) return;
+  const card = findLLMCard(engineId);
+  if (card) {
+    // Disable immediately, before the round trip - a provider request
+    // already in flight cannot be interrupted mid-request (only the
+    // *next* pipeline pass is prevented from starting), so a repeated
+    // click here would not do anything faster; it would only confuse
+    // whether the first click registered.
+    const cancelBtn = card.querySelector(".llm-cancel-btn");
+    cancelBtn.disabled = true;
+    cancelBtn.textContent = "Cancelling...";
+    card.querySelector(".progress-message").textContent =
+      "Cancel requested - stopping after the current provider request finishes";
+  }
+  getJSON(`/api/llm-runs/${runInfo.runId}/cancel`, { method: "POST" }).catch((err) => {
+    showError(err.message);
+  });
+}
+
+function openLLMEngineForm(engine) {
+  llmState.editingEngineId = engine ? engine.engine_id : null;
+  el("llm-engine-display-name").value = engine ? engine.display_name : "";
+  el("llm-engine-provider").value = engine ? engine.provider_name : "openai";
+  populateLLMModelSelect(engine ? engine.model_id : null);
+  el("llm-engine-api-key").value = "";
+  el("llm-engine-env-var").value = "";
+  document.querySelector('input[name="llm-credential-mode"][value="api_key"]').checked = true;
+  updateLLMCredentialFieldVisibility();
+  el("llm-engine-save").textContent = engine ? "Save changes" : "Save engine";
+  el("llm-engine-form").classList.remove("hidden");
+}
+
+function closeLLMEngineForm() {
+  llmState.editingEngineId = null;
+  el("llm-engine-form").classList.add("hidden");
+}
+
+async function onLLMEngineFormSubmit(event) {
+  event.preventDefault();
+  const editingId = llmState.editingEngineId;
+  const checkedRadio = document.querySelector('input[name="llm-credential-mode"]:checked');
+  const rawMode = checkedRadio ? checkedRadio.value : "api_key";
+  const apiKey = el("llm-engine-api-key").value;
+  const envVar = el("llm-engine-env-var").value;
+  // Editing an existing engine without touching either credential field
+  // means "leave the credential as it is" - only a genuinely new value in
+  // one of the two fields counts as changing it.
+  const credentialMode =
+    editingId && !apiKey.trim() && !envVar.trim() ? "unchanged" : rawMode;
+
+  const form = {
+    providerName: el("llm-engine-provider").value,
+    modelId: el("llm-engine-model-id").value,
+    credentialMode,
+    apiKey,
+    envVar,
+  };
+  const errors = validateLLMEngineForm(form);
+  if (errors.length) {
+    showError(errors.join(" "));
+    return;
+  }
+
+  const body = {
+    provider_name: form.providerName,
+    model_id: form.modelId,
+    display_name: el("llm-engine-display-name").value,
+  };
+  if (credentialMode === "api_key") body.api_key = apiKey;
+  if (credentialMode === "env_var") body.env_var = envVar;
+
+  try {
+    if (editingId) {
+      await getJSON(`/api/llm-engines/${editingId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } else {
+      await getJSON("/api/llm-engines", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    }
+    closeLLMEngineForm();
+    await loadLLMEngines();
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+async function deleteLLMEngine(engineId) {
+  try {
+    await getJSON(`/api/llm-engines/${engineId}`, { method: "DELETE" });
+    await loadLLMEngines();
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+async function testLLMEngine(engineId, buttonEl) {
+  buttonEl.disabled = true;
+  try {
+    const result = await getJSON(`/api/llm-engines/${engineId}/test`, { method: "POST" });
+    const card = findLLMCard(engineId);
+    if (card) {
+      const testResult = card.querySelector(".llm-test-result");
+      testResult.textContent = result.message;
+      testResult.classList.remove("hidden");
+      testResult.classList.toggle("warning", !result.ok);
+    }
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    buttonEl.disabled = false;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 
 function init() {
   initUpload();
@@ -1029,6 +2098,7 @@ function init() {
   initFramePicker();
   initAnalysis();
   initZahnReview();
+  initLLMSection();
 }
 
 // Guarded so this file can also be `require()`-d from plain Node (see
@@ -1047,5 +2117,15 @@ if (typeof module !== "undefined" && module.exports) {
     computeReviewCanvasSize,
     timelinePercent,
     shouldShowZahnReview,
+    llmEngineSubtitle,
+    llmResultBadge,
+    llmRunStatusLine,
+    validateLLMEngineForm,
+    llmPassFrameSummary,
+    llmFormatFrameTimestamps,
+    llmEvidenceLabel,
+    llmPassPlainLanguage,
+    llmEndCoarseToValidateExplanation,
+    llmConflictResolutionExplanation,
   };
 }

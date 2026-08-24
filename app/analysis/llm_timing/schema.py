@@ -1,0 +1,299 @@
+"""The strict contract an LLM timing provider must satisfy.
+
+Per the supervisor's spike authorization (PR #4): conversational text is not
+authoritative. A provider's raw output is untrusted until it has been parsed
+into a :class:`TimingVerdict` and passed every invariant below - anything
+that fails parsing or validation becomes an ``ABSTAIN`` verdict, never a
+best-effort guess. This is the same "never confidently wrong" discipline the
+classical tracker (``app/analysis/outlet_tracker.py``) was built under.
+
+A verdict is data, not prose: nothing downstream should ever need to parse
+free text to find out what the model concluded.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from enum import Enum
+
+from ...errors import ConfigurationError
+
+
+class TimingStatus(str, Enum):
+    """How much trust this verdict is entitled to."""
+
+    CONFIRMED = "confirmed"  # evidence met every bar; start_s/end_s are usable
+    ABSTAIN = "abstain"  # provider failed, was malformed, or evidence was weak
+
+
+# Known reason codes. This list documents the vocabulary the pipeline itself
+# emits (schema/provider failures) and the codes the prompt asks the model to
+# use. It is deliberately not a closed set enforced at parse time: an unknown
+# code from the model is logged and kept, not treated as a parse failure, so
+# a new failure mode surfaces as data instead of silently becoming "abstain,
+# reason unknown".
+PIPELINE_REASON_CODES = frozenset(
+    {
+        "provider_error",  # the API call itself failed (timeout, 5xx, network)
+        "malformed_output",  # response did not parse against the schema
+        "low_confidence",  # parsed fine, but confidence fell below the config floor
+        "invalid_invariant",  # e.g. end_s < start_s, negative uncertainty
+        # The four below are the request-grounding checks (Codex review,
+        # finding 1): a verdict can satisfy every invariant above and still
+        # be untethered from the actual video/frames it was asked about - a
+        # model can hallucinate a finite-looking, internally consistent
+        # answer that is simply about the wrong thing.
+        "out_of_bounds",  # start_s/end_s outside the video, or outside the
+        # window whose frames were actually sent for this pass
+        "ungrounded_evidence",  # evidence_frame_timestamps_s empty, or none
+        # of it corresponds to a frame actually submitted in this request
+        "evidence_far_from_claim",  # evidence exists and is grounded, but
+        # none of it sits near the claimed start_s/end_s
+        "uncertainty_exceeds_cap",  # start/end uncertainty too large to
+        # trust as CONFIRMED, even though it parsed and is non-negative
+        "request_too_large",  # even the sparsest frame selection that still
+        # meets the gate's precision floor would exceed the provider's
+        # request-size budget; abstain rather than silently drop evidence
+        # below that floor or send an oversized request the provider would
+        # reject anyway (Codex review, round 2, finding 2)
+        # The below is an end-validate-specific evidence-shape check (a real
+        # audited run found a CONFIRMED end-validate verdict citing
+        # essentially every submitted frame as "evidence" - a generic trend
+        # assertion that satisfies grounding without showing which specific
+        # checkpoints actually prove a sustained trend, see
+        # diagnostics/llm_spike/DESIGN.md):
+        "evidence_not_selective",  # more evidence timestamps cited than the
+        # selective-checkpoint cap allows - citing "all of it" is not
+        # grounding, it is the absence of grounding
+        "insufficient_trend_horizon",  # a second real audited run's finding:
+        # a CONFIRMED end-validate verdict cited "trend checkpoints" that
+        # were really just adjacent native-fps frames (~33ms apart) -
+        # sub-frame-interval jitter, not a multi-second sustained trend.
+        # Onset localization (a dense frame pinpointing where a break
+        # starts) and trend confirmation (specific checkpoints, spaced
+        # roughly a second apart, each showing further shortening) are
+        # different questions; this fires when trend_checkpoint_timestamps_s
+        # has too few entries, isn't grounded, or isn't spaced far enough
+        # from the onset and from each other to be more than jitter. Also
+        # reused (unchanged meaning: "too few/ungrounded checkpoints") by
+        # the candidate-centred contact-sheet cascade's own trend check -
+        # see pipeline._validate_cascade_trend_checkpoints.
+        "cascade_needs_refinement",  # the coarse (9-panel) contact sheet
+        # could not itself confirm a sustained trend but the model flagged
+        # a possible/obvious collapse worth a denser look-back at - see
+        # TimingVerdict.possible_collapse_s and
+        # pipeline._run_end_validation_pass's refine step. Not a terminal
+        # abstain reason on its own; the pipeline either replaces it with
+        # the refine cascade's own verdict, or - if the refine step also
+        # fails to confirm - with "cascade_unconfirmed".
+        "cascade_unconfirmed",  # neither the coarse contact sheet nor the
+        # denser refine look-back (when one ran) could confirm a sustained
+        # trend - the candidate-centred cascade's own final abstain reason,
+        # see pipeline._run_end_validation_pass.
+        "invalid_outlet_anchor",  # the user-marked outlet point
+        # run_llm_timing was given falls outside this video's own frame
+        # bounds (e.g. the video was re-uploaded with different dimensions
+        # after the point was marked) - the cascade's contact sheets need a
+        # real anchor to crop around, never a guessed one; see
+        # pipeline.run_llm_timing's own precondition check. A *missing*
+        # anchor is a caller precondition failure (raises ConfigurationError
+        # instead - see the same check) since the UI requires one before a
+        # run can even be submitted; only an anchor that is present but
+        # invalid converges on this abstain reason.
+    }
+)
+
+MODEL_REASON_CODES = frozenset(
+    {
+        "weak_contrast",  # stream/cup/background too close in intensity to be sure
+        "camera_motion",  # handheld shake made the evidence window ambiguous
+        "no_continuous_stream_found",  # never saw a qualifying continuous stream
+        "no_break_found",  # stream never resolved to a clear break before video end
+        "ambiguous_evidence",  # coarse+fine passes did not converge on one frame
+        "resumed_flow",  # stream broke and reconnected; genuinely ambiguous per spec
+        "missing_outlet",  # cup outlet not visible/identifiable in frame
+        "rigid_background_object",  # apparent recovery/shortening was actually a
+        # rigid structure (e.g. a conveyor hanger) drifting laterally through the
+        # outlet corridor, not real liquid motion - contact-sheet cascade prompts
+        # ask the model to reject this explicitly rather than count it as evidence
+    }
+)
+
+
+@dataclass(frozen=True)
+class TimingVerdict:
+    """A parsed, validated answer from a timing provider for one video.
+
+    Attributes:
+        status: CONFIRMED or ABSTAIN. Every other field is populated either
+            way, so a caller does not need to branch on status just to log.
+        start_s: video-relative timestamp flow was judged to start. ``None``
+            only when ``status`` is ABSTAIN.
+        end_s: video-relative timestamp flow was judged to end. ``None`` only
+            when ``status`` is ABSTAIN.
+        start_uncertainty_s: provider's own +/- bound on ``start_s``, seconds.
+        end_uncertainty_s: provider's own +/- bound on ``end_s``, seconds.
+        confidence: 0..1, the provider's self-reported confidence. Distinct
+            from ``status``: a low-confidence CONFIRMED verdict is possible
+            when explicitly requested; the pipeline is what turns "low
+            confidence" into ABSTAIN via ``min_confidence``.
+        reason_codes: machine-readable codes explaining the verdict. Always
+            non-empty for ABSTAIN. May be empty for a clean CONFIRMED.
+        evidence_frame_timestamps_s: timestamps of the frames the provider
+            says it examined around its decision, for audit/replay.
+        trend_checkpoint_timestamps_s: a distinct, role-labelled subset of
+            evidence - only meaningful for the end-validate pass - the
+            specific submitted timestamps the provider is designating as
+            *trend-confirmation* checkpoints (each showing further
+            shortening than the last), as opposed to the dense frame(s)
+            that merely localize *where* a break's onset sits. Kept
+            separate from ``evidence_frame_timestamps_s`` (general
+            grounding evidence) so onset localization and trend
+            confirmation can be validated against different rules - see
+            ``pipeline._validate_trend_checkpoints``. Empty for every other
+            pass, and for an end-validate verdict that cites no checkpoints
+            (which the pipeline then treats as failing to demonstrate a
+            trend at all, not as "trust the onset anyway").
+        possible_collapse_s: only meaningful for the candidate-centred
+            contact-sheet cascade (see ``pipeline._run_end_validation_pass``
+            and ``prompts.PROMPT_END_CASCADE_COARSE_V1``). The coarse
+            (9-panel) contact sheet may see a possible-but-unconfirmed
+            collapse without being able to confirm a sustained trend from
+            its own panels alone - this is the timestamp (one of the
+            panels actually shown) it points at, so the pipeline can build
+            a denser 7-panel look-back sheet around it, per the
+            supervisor's authorization: "reuse the existing broad pass...
+            do not invent a truth-centred window". ``None`` for every
+            other pass, and for a cascade verdict with nothing specific to
+            point at. Never trusted as a claim by itself - the pipeline
+            re-grounds it against the frames actually submitted for the
+            pass that reported it (see
+            ``pipeline._validate_possible_collapse``) before ever using it
+            to seed the refine window.
+        model_id: identifier of the model/version that produced this verdict.
+        prompt_version: identifier of the prompt template used (see
+            ``prompts.py``). Pinned so a later prompt edit cannot silently
+            change what an old logged verdict means.
+        raw_notes: free-text explanation, kept for the audit trail only.
+            Never read programmatically - see the module docstring.
+    """
+
+    status: TimingStatus
+    start_s: float | None
+    end_s: float | None
+    start_uncertainty_s: float
+    end_uncertainty_s: float
+    confidence: float
+    reason_codes: tuple[str, ...]
+    evidence_frame_timestamps_s: tuple[float, ...]
+    model_id: str
+    prompt_version: str
+    raw_notes: str = ""
+    trend_checkpoint_timestamps_s: tuple[float, ...] = ()
+    possible_collapse_s: float | None = None
+
+    def __post_init__(self) -> None:
+        # Every numeric field is untrusted (it may have come straight from a
+        # model's JSON output, which - unlike normal application input - can
+        # contain NaN/Infinity: Python's json module accepts those as an
+        # extension). A comparison against NaN is always False, so a naive
+        # range check silently lets NaN through; explicit isfinite() checks
+        # close that gap for every numeric field, not just confidence.
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise ConfigurationError(
+                "A timing verdict's confidence must be a finite number between 0 and 1.",
+                detail=f"confidence={self.confidence!r}",
+            )
+        if self.possible_collapse_s is not None and not math.isfinite(self.possible_collapse_s):
+            raise ConfigurationError(
+                "A timing verdict's possible_collapse_s must be a finite number or None.",
+                detail=f"possible_collapse_s={self.possible_collapse_s!r}",
+            )
+        if not math.isfinite(self.start_uncertainty_s) or not math.isfinite(self.end_uncertainty_s):
+            raise ConfigurationError(
+                "A timing verdict's uncertainty bounds must be finite numbers.",
+                detail=(
+                    f"start_uncertainty_s={self.start_uncertainty_s!r} "
+                    f"end_uncertainty_s={self.end_uncertainty_s!r}"
+                ),
+            )
+        if self.start_uncertainty_s < 0.0 or self.end_uncertainty_s < 0.0:
+            raise ConfigurationError(
+                "A timing verdict's uncertainty bounds must not be negative.",
+                detail=(
+                    f"start_uncertainty_s={self.start_uncertainty_s!r} "
+                    f"end_uncertainty_s={self.end_uncertainty_s!r}"
+                ),
+            )
+        if self.status is TimingStatus.CONFIRMED:
+            if self.start_s is None or self.end_s is None:
+                raise ConfigurationError(
+                    "A CONFIRMED timing verdict must have both start_s and end_s."
+                )
+            if not math.isfinite(self.start_s) or not math.isfinite(self.end_s):
+                raise ConfigurationError(
+                    "A CONFIRMED timing verdict's start_s and end_s must be finite numbers.",
+                    detail=f"start_s={self.start_s!r} end_s={self.end_s!r}",
+                )
+            if self.end_s < self.start_s:
+                raise ConfigurationError(
+                    "A timing verdict cannot end before it starts.",
+                    detail=f"start_s={self.start_s!r} end_s={self.end_s!r}",
+                )
+        else:  # ABSTAIN
+            if not self.reason_codes:
+                raise ConfigurationError(
+                    "An ABSTAIN timing verdict must carry at least one reason code."
+                )
+
+    @property
+    def duration_s(self) -> float | None:
+        if self.status is not TimingStatus.CONFIRMED:
+            return None
+        assert self.start_s is not None and self.end_s is not None
+        return self.end_s - self.start_s
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status.value,
+            "start_s": self.start_s,
+            "end_s": self.end_s,
+            "duration_s": self.duration_s,
+            "start_uncertainty_s": self.start_uncertainty_s,
+            "end_uncertainty_s": self.end_uncertainty_s,
+            "confidence": round(self.confidence, 4),
+            "reason_codes": list(self.reason_codes),
+            "evidence_frame_timestamps_s": list(self.evidence_frame_timestamps_s),
+            "trend_checkpoint_timestamps_s": list(self.trend_checkpoint_timestamps_s),
+            "possible_collapse_s": self.possible_collapse_s,
+            "model_id": self.model_id,
+            "prompt_version": self.prompt_version,
+            "raw_notes": self.raw_notes,
+        }
+
+    @staticmethod
+    def abstain(
+        *,
+        reason_codes: tuple[str, ...],
+        model_id: str,
+        prompt_version: str,
+        confidence: float = 0.0,
+        raw_notes: str = "",
+        possible_collapse_s: float | None = None,
+    ) -> TimingVerdict:
+        """Build the abstain verdict every failure path converges on."""
+        return TimingVerdict(
+            status=TimingStatus.ABSTAIN,
+            start_s=None,
+            end_s=None,
+            start_uncertainty_s=0.0,
+            end_uncertainty_s=0.0,
+            confidence=confidence,
+            reason_codes=reason_codes,
+            evidence_frame_timestamps_s=(),
+            model_id=model_id,
+            prompt_version=prompt_version,
+            raw_notes=raw_notes,
+            possible_collapse_s=possible_collapse_s,
+        )

@@ -72,6 +72,16 @@ class TestPageAndHealth:
     def test_health(self, client):
         assert client.get("/api/health").get_json() == {"status": "ok"}
 
+    def test_version_endpoint_reports_a_non_empty_string(self, client):
+        payload = client.get("/api/version").get_json()
+        assert isinstance(payload["app_version"], str)
+        assert payload["app_version"]
+
+    def test_index_page_shows_a_build_version_matching_the_api(self, client):
+        api_version = client.get("/api/version").get_json()["app_version"]
+        body = client.get("/").get_data(as_text=True)
+        assert f"Build {api_version}" in body
+
     def test_modes_endpoint(self, client):
         modes = client.get("/api/modes").get_json()["modes"]
         assert {mode["name"] for mode in modes} == {"zahn_cup", "robot_activity", "motion_scan"}

@@ -32,6 +32,12 @@ body {
 }
 .page-header h1 { margin: 0; font-size: 1.5rem; }
 .subtitle { margin: 0.25rem 0 0; color: var(--muted); font-size: 0.95rem; }
+.app-version {
+  margin: 0.4rem 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
 
 main { max-width: 1000px; margin: 0 auto; padding: 1.5rem 1rem; }
 
@@ -241,3 +247,62 @@ pre { background: #f7f8fa; border: 1px solid var(--line); border-radius: 6px; pa
 
 .hidden { display: none !important; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+
+/* Badges ---------------------------------------------------------------- */
+.badge {
+  display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px;
+  font-size: 0.78rem; font-weight: 600; border: 1px solid transparent; margin-right: 0.4rem;
+}
+.badge.ok { background: #eaf6ee; border-color: #b7ddc4; color: var(--ok); }
+.badge.review { background: #fdf3e0; border-color: #ecd39a; color: var(--review); }
+.badge.bad { background: #fbeceb; border-color: #eab9b5; color: var(--bad); }
+
+/* Experimental: LLM analysis -------------------------------------------- */
+.llm-engine-list { display: flex; flex-direction: column; gap: 0.75rem; margin-top: 0.5rem; }
+.llm-engine-card {
+  border: 1px solid var(--line); border-radius: 8px; padding: 0.85rem 1rem; background: #fbfcfd;
+}
+.llm-engine-card-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.6rem; margin-bottom: 0.6rem; }
+.llm-engine-name { font-weight: 700; }
+.llm-engine-subtitle { color: var(--muted); font-size: 0.9rem; }
+.llm-run-progress { margin-top: 0.6rem; }
+.llm-result { margin-top: 0.75rem; }
+.llm-result .details-grid { margin-top: 0.5rem; }
+.llm-test-result { margin-top: 0.5rem; }
+
+.llm-engine-form {
+  border: 1px solid var(--line); border-radius: 8px; padding: 1rem; margin-top: 0.85rem; background: #fff;
+}
+.llm-credential-fieldset { border: 1px solid var(--line); border-radius: 6px; padding: 0.75rem 1rem; margin: 0.85rem 0; }
+.llm-credential-fieldset legend { font-weight: 600; padding: 0 0.4rem; }
+.llm-credential-option { display: block; font-weight: 400; margin: 0.4rem 0 0.25rem; }
+.llm-credential-fieldset input[type="password"],
+.llm-credential-fieldset input[type="text"] { width: 100%; max-width: 360px; }
+
+.llm-frames-sent { margin-top: 0.85rem; border: 1px solid var(--line); border-radius: 6px; padding: 0.6rem 0.85rem; }
+.llm-frames-sent summary { cursor: pointer; font-weight: 600; }
+.llm-frames-sent .details-grid { margin-top: 0.6rem; }
+.llm-frame-timestamps { margin-top: 0.3rem; }
+.llm-frame-timestamps summary { cursor: pointer; font-weight: 400; color: var(--muted); font-size: 0.8rem; }
+.llm-frame-timestamps p { margin: 0.3rem 0 0; font-size: 0.8rem; color: var(--muted); font-variant-numeric: tabular-nums; word-break: break-word; }
+
+.llm-evidence-section { margin-top: 0.85rem; }
+.llm-evidence-heading { margin: 0 0 0.5rem; font-size: 0.95rem; }
+.llm-evidence-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; }
+.llm-evidence-figure { margin: 0; }
+.llm-evidence-figure figcaption { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.3rem; }
+.llm-evidence-image-wrap { position: relative; }
+.llm-evidence-image { display: block; max-width: 100%; border-radius: 6px; border: 1px solid var(--line); }
+.llm-evidence-timestamp-label {
+  position: absolute; left: 0.4rem; bottom: 0.4rem; background: rgba(0, 0, 0, 0.65); color: #fff;
+  font-size: 0.78rem; padding: 0.1rem 0.4rem; border-radius: 4px; font-variant-numeric: tabular-nums;
+}
+
+.llm-how-decided { margin-top: 0.85rem; border: 1px solid var(--line); border-radius: 6px; padding: 0.6rem 0.85rem; }
+.llm-how-decided summary { cursor: pointer; font-weight: 600; }
+.llm-how-decided-pass { margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--line); }
+.llm-how-decided-pass:first-of-type { margin-top: 0.6rem; padding-top: 0; border-top: none; }
+.llm-how-decided-pass h5 { margin: 0 0 0.3rem; font-size: 0.9rem; }
+.llm-how-decided-pass p { margin: 0.25rem 0 0; font-size: 0.88rem; line-height: 1.4; }
+
+.llm-audit-actions { margin-top: 0.75rem; }
