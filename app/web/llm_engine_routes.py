@@ -128,9 +128,19 @@ def start_llm_run(video_id: str) -> Response:
     if not engine_id:
         raise AnalyzerError("Choose an engine to run.")
 
+    outlet = payload.get("outlet")
+    if not isinstance(outlet, dict) or "x" not in outlet or "y" not in outlet:
+        raise AnalyzerError(
+            "Mark the outlet hole of the cup on the video frame before running an AI engine."
+        )
+    try:
+        outlet_xy = (float(outlet["x"]), float(outlet["y"]))
+    except (TypeError, ValueError) as exc:
+        raise AnalyzerError("The marked outlet point is not valid.") from exc
+
     record = _video_store().get(video_id)
     engine = _engine_store().get(str(engine_id))
-    job = _llm_run_service().submit(record, engine)
+    job = _llm_run_service().submit(record, engine, outlet_xy=outlet_xy)
     return jsonify(job.to_dict())
 
 

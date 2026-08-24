@@ -1407,6 +1407,7 @@ def _run_end_validation_pass(
     locked_start_s: float,
     duration_s: float,
     fine_step_s: float,
+    outlet_xy: tuple[float, float],
     cfg: PipelineConfig,
     provider: TimingProvider,
     on_stage: Callable[[str], None] | None,
@@ -1420,6 +1421,11 @@ def _run_end_validation_pass(
     in the signature for call-site compatibility with the dense-frame
     method this replaced) but is not needed here - panel spacing is fixed
     by the cascade's own contract, not the clip's native frame rate.
+    ``outlet_xy`` is the real, user-marked outlet point (already validated
+    against this video's own bounds by ``run_llm_timing`` before this is
+    ever called - see that function's own precondition check) - every
+    panel's crop is positioned from it via
+    ``contact_sheet.crop_origin_from_outlet``, never guessed.
 
     Unlike the dense-frame method this replaced, a contact sheet is a
     small, fixed-size composite image (9 or 7 tiles at a fixed resolution)
@@ -1429,8 +1435,7 @@ def _run_end_validation_pass(
     """
     del fine_step_s  # unused by the cascade - see docstring
     bound_lo = max(0.0, locked_start_s)
-    sample_frame = reader.frame_at(candidate_ts)
-    crop_origin = contact_sheet.default_crop_origin(sample_frame.shape[1], sample_frame.shape[0])
+    crop_origin = contact_sheet.crop_origin_from_outlet(*outlet_xy)
 
     coarse_timestamps = _cascade_coarse_timestamps(candidate_ts, bound_lo, duration_s)
     coarse_verdict, coarse_response, coarse_submitted = _run_cascade_sheet(
@@ -1504,6 +1509,7 @@ def run_llm_timing(
     *,
     prompt_version: str,
     prompt_text: str,
+    outlet_xy: tuple[float, float] | None = None,
     config: PipelineConfig | None = None,
     video_info: VideoInfo | None = None,
     on_stage: Callable[[str], None] | None = None,
@@ -1517,6 +1523,24 @@ def run_llm_timing(
     (a bad config, an unreadable video) still raise, per the rest of this
     codebase's error conventions.
 
+    ``outlet_xy`` is the real, user-marked cup outlet point (source-video
+    pixel coordinates - the same click-to-mark mechanism
+    ``app/analysis/zahn_detector.py``'s classical detector already uses),
+    required by the candidate-centred contact-sheet cascade (see
+    ``_run_end_validation_pass``) to crop its panels around a real anchor,
+    never a guessed one - a prior heuristic placed the assumed outlet
+    hundreds of pixels from the real one on real footage (see
+    ``diagnostics/llm_spike/DESIGN.md``). Missing entirely is a caller
+    precondition failure (raises ``ConfigurationError`` - the UI requires a
+    click before a run can be submitted at all, so this should be
+    unreachable via the normal flow); present but outside this video's own
+    frame bounds converges on ABSTAIN (``invalid_outlet_anchor``) instead,
+    since that can legitimately happen (e.g. the video was replaced after
+    the point was marked) and is exactly the "fail-safe, never confidently
+    wrong" behaviour every other grounding failure in this module follows -
+    checked before any provider call is made, so an invalid anchor costs
+    nothing.
+
     ``on_stage``, if given, is called with the pass name ("coarse", "fine",
     "end_coarse", "end_validate") immediately before that pass's provider
     call is sent - never after, and never for a pass this run never reaches
@@ -1529,6 +1553,12 @@ def run_llm_timing(
     """
     cfg = config or PipelineConfig()
     cfg.validate()
+    if outlet_xy is None:
+        raise ConfigurationError(
+            "run_llm_timing requires outlet_xy: the candidate-centred contact-sheet "
+            "cascade crops its panels around a real, user-marked outlet point, never "
+            "a guessed one."
+        )
     pass_verdicts: dict[str, TimingVerdict] = {}
     pass_frames: dict[str, tuple[float, ...]] = {}
     derived: dict[str, DerivedValue] = {}
@@ -1539,6 +1569,19 @@ def run_llm_timing(
             raise ConfigurationError(
                 "Cannot run the LLM timing pipeline on a video with unknown duration."
             )
+        outlet_x, outlet_y = outlet_xy
+        if not (0 <= outlet_x < reader.info.width and 0 <= outlet_y < reader.info.height):
+            abstain = TimingVerdict.abstain(
+                reason_codes=("invalid_outlet_anchor",),
+                model_id="",
+                prompt_version=prompt_version,
+                raw_notes=(
+                    f"outlet_xy=({outlet_x}, {outlet_y}) falls outside this video's own "
+                    f"frame bounds ({reader.info.width}x{reader.info.height}); never sent "
+                    f"to the provider"
+                ),
+            )
+            return _abstain_outcome(abstain, _unsent_response(abstain.raw_notes))
 
         coarse_times = _coarse_timestamps(duration_s, cfg.coarse_step_s)
         coarse_frames_dense = _extract_frames(
@@ -1880,6 +1923,7 @@ def run_llm_timing(
             locked_start_s=locked_start_s,
             duration_s=duration_s,
             fine_step_s=fine_step_s,
+            outlet_xy=outlet_xy,
             cfg=cfg,
             provider=provider,
             on_stage=on_stage,
@@ -1916,6 +1960,7 @@ def run_llm_timing(
                 locked_start_s=locked_start_s,
                 duration_s=duration_s,
                 fine_step_s=fine_step_s,
+                outlet_xy=outlet_xy,
                 cfg=cfg,
                 provider=provider,
                 on_stage=on_stage,

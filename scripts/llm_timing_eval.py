@@ -33,8 +33,15 @@ Usage:
 Manifest format (JSON array):
     [
       {"clip_id": "20260820_184144", "video_path": "/path/to/clip.mp4",
-       "true_start_s": 3.8, "true_end_s": 20.6}
+       "true_start_s": 3.8, "true_end_s": 20.6,
+       "outlet_x": 627.0, "outlet_y": 1108.0}
     ]
+
+``outlet_x``/``outlet_y`` are the real, hand-marked outlet point in that
+clip's own source-pixel coordinates (matching the product's required
+outlet-click step - see ``pipeline.run_llm_timing``'s ``outlet_xy``
+parameter). Required for every entry: the contact-sheet cascade crops its
+panels around this real anchor, never a guessed one.
 """
 
 from __future__ import annotations
@@ -94,7 +101,7 @@ def _load_manifest(path: Path) -> list[dict]:
     if not isinstance(entries, list) or not entries:
         raise ValueError(f"{path}: manifest must be a non-empty JSON array")
     for entry in entries:
-        for key in ("clip_id", "video_path", "true_start_s", "true_end_s"):
+        for key in ("clip_id", "video_path", "true_start_s", "true_end_s", "outlet_x", "outlet_y"):
             if key not in entry:
                 raise ValueError(f"manifest entry missing required key {key!r}: {entry}")
     return entries
@@ -214,6 +221,7 @@ def _evaluate_clip(
         provider,
         prompt_version=PROMPT_V1_ID,
         prompt_text=PROMPT_V1,
+        outlet_xy=(float(entry["outlet_x"]), float(entry["outlet_y"])),
         config=config,
     )
     harness_latency_s = time.monotonic() - started

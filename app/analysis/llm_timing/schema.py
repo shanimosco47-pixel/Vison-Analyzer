@@ -91,6 +91,16 @@ PIPELINE_REASON_CODES = frozenset(
         # denser refine look-back (when one ran) could confirm a sustained
         # trend - the candidate-centred cascade's own final abstain reason,
         # see pipeline._run_end_validation_pass.
+        "invalid_outlet_anchor",  # the user-marked outlet point
+        # run_llm_timing was given falls outside this video's own frame
+        # bounds (e.g. the video was re-uploaded with different dimensions
+        # after the point was marked) - the cascade's contact sheets need a
+        # real anchor to crop around, never a guessed one; see
+        # pipeline.run_llm_timing's own precondition check. A *missing*
+        # anchor is a caller precondition failure (raises ConfigurationError
+        # instead - see the same check) since the UI requires one before a
+        # run can even be submitted; only an anchor that is present but
+        # invalid converges on this abstain reason.
     }
 )
 

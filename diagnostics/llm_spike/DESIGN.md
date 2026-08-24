@@ -2873,3 +2873,165 @@ limitation as every prior round). Per the delivery boundary: no
 architecture rewrite beyond this integration, no further prompt research
 or model search, no paid provider call, automated tests use mocks/fixtures
 only. PR #5 stays draft/unmerged.
+
+## 30. Required outlet click: replacing the flawed crop-origin heuristic (supervisor decision)
+
+### Context
+
+A blocking review against real 1080x1920 footage confirmed §29's flagged
+assumption was a real defect, not a hypothetical one:
+`default_crop_origin()`'s heuristic (centred horizontally, 10% down from the
+top) computed an assumed outlet at `(540, 242)`, while the three actual
+validated outlets from the successful gate-1 experiment were `(405, 1107)`,
+`(627, 1108)`, `(278, 1196)` - hundreds of pixels off, near the bottom of
+frame, not the top. The supervisor held the branch at `5d588aa` and then
+decided: "resolve the crop-origin blocker with the simplest reliable product
+flow: after upload, require one user click on the Zahn cup outlet in the
+video frame; use that anchor for tracking/canonical crops and contact
+sheets. Do not attempt a new automatic outlet detector, do not add model
+research, and do not make paid API calls." This round implements exactly
+that - Option 1 of the review's two choices, the automatic-detector option
+having been explicitly discouraged as unvalidated research.
+
+The "existing bounded tracking/canonicalization" the decision refers to is
+not new infrastructure: it is the same click-to-mark-outlet mechanism the
+classical Zahn detector's frame picker already has (`state.outlet` in
+`app.js`, `roi_from_outlet_click`'s bounds validation in
+`zahn_detector.py`). This round gives the Experimental LLM section its own,
+independent instance of that same pattern - `state.llmOutlet` - since
+`#step-llm` is documented as usable without visiting the classical
+mode/frame-picker steps below it.
+
+### What changed
+
+`contact_sheet.default_crop_origin()` is gone. In its place,
+`crop_origin_from_outlet(outlet_x, outlet_y)` positions the crop so the
+real, marked point lands exactly at `OUTLET_IN_CROP_XY` (120, 50) inside the
+240x360 crop - the same place the overlay's own red ring is drawn - so the
+ring in every rendered contact-sheet panel sits on the real outlet, never a
+guess. It never clamps or raises itself (no frame-size context at that
+point); `render_panel`'s existing clamping still applies once the crop is
+actually cut from a frame.
+
+`run_llm_timing()` gained a required `outlet_xy: tuple[float, float] | None
+= None` parameter, threaded through `run_llm_timing_for_engines()`,
+`LLMRunService.submit()`, and the `POST /videos/<id>/llm-runs` route (which
+now requires an `{"x": ..., "y": ...}` `outlet` field in the request body).
+Two distinct failure modes, deliberately different:
+
+- **Missing entirely** (`outlet_xy is None`) is a caller precondition
+  failure - the UI requires a click before submission is even possible, so
+  this can only happen from a direct/CLI caller. It raises
+  `ConfigurationError`, mirroring the existing "video has no known
+  duration" pattern elsewhere in this module.
+- **Present but out of the video's own bounds** (e.g. the video was
+  swapped after the click was made) is a legitimate runtime data-validity
+  condition. It converges on ABSTAIN with a new reason code
+  `invalid_outlet_anchor`, checked immediately after opening the
+  `VideoReader` and before any provider call - zero cost - matching the
+  "never confidently wrong" fail-safe philosophy this pipeline already
+  applies to every other grounding failure.
+
+`LLMRunService.submit()` independently re-validates the same bounds
+synchronously (raising `AnalyzerError` for an immediate, clear 400) before
+ever queuing the background job; `run_llm_timing()` re-checks again for
+direct callers (tests, `scripts/llm_timing_eval.py`) that bypass the HTTP
+layer entirely. Deliberate defense in depth, not redundant scope creep.
+
+### Frontend: the outlet picker
+
+A new `#llm-outlet-picker` block sits inside `#step-llm`, above the engine
+list: a "Use the frame currently shown in the preview" button (reusing the
+same `/videos/<id>/frame?t=...` endpoint and `.frame-toolbar`/`.frame-holder`
+CSS the classical picker already uses), a canvas that takes a single click
+(no drag-to-rectangle - only a point is meaningful here), a "Clear outlet
+mark" action, and a summary line. `state.llmOutlet` is reset on every fresh
+upload (a new video's pixel coordinates almost certainly invalidate a stale
+click from a previous one). Every engine card's Run button is gated on
+`state.llmOutlet` being set, in addition to the existing
+enabled/`state.video` checks; `runLLMEngine()` sends `{"outlet": {"x", "y"}}`
+in the run request body and has its own defense-in-depth guard clause.
+
+`toSourceCoords(event, canvas)` (previously hardcoded to the classical
+picker's `#frame-canvas`) was parameterized so both pickers share the same
+display-to-source-pixel conversion logic without duplicating it.
+
+### App version
+
+Already git-SHA-based and auto-incrementing per commit (§28/§29) - this
+commit's own build id satisfies "visible version identifier that changes
+with each update" with no further code change.
+
+### Files changed
+
+- `app/analysis/llm_timing/contact_sheet.py` - `default_crop_origin()`
+  removed; `crop_origin_from_outlet(outlet_x, outlet_y)` added.
+- `app/analysis/llm_timing/schema.py` - `invalid_outlet_anchor` reason code.
+- `app/analysis/llm_timing/pipeline.py` - `run_llm_timing()` gained
+  `outlet_xy`; `ConfigurationError` when missing, in-bounds check ->
+  `invalid_outlet_anchor` ABSTAIN when present but invalid;
+  `_run_end_validation_pass` now takes `outlet_xy` and calls
+  `crop_origin_from_outlet` instead of sampling a frame for the old
+  heuristic.
+- `app/analysis/llm_timing/engine_config.py` -
+  `run_llm_timing_for_engines()` threads `outlet_xy` through.
+- `app/services/llm_run_service.py` - `submit()` requires `outlet_xy`
+  (keyword-only), validates it against `record.info.width`/`.height`
+  before queuing.
+- `app/web/llm_engine_routes.py` - `start_llm_run` parses and validates the
+  request body's `outlet` field.
+- `app/web/templates/index.html` - `#llm-outlet-picker` block.
+- `app/web/static/app.js` - `state.llmOutlet`; `initLLMOutletPicker()` and
+  its draw/summary/button-gating helpers; parameterized `toSourceCoords`;
+  `runLLMEngine()`/`buildLLMEngineCard()` updated for the new precondition;
+  outlet reset on fresh upload.
+- `scripts/llm_timing_eval.py` - manifest entries now require
+  `outlet_x`/`outlet_y`; threaded into the `run_llm_timing()` call.
+- Every test file that calls `run_llm_timing()`, `run_llm_timing_for_engines()`,
+  or `LLMRunService.submit()` directly (`tests/test_llm_timing_pipeline.py`,
+  `tests/test_llm_run_service.py`, `tests/test_llm_run_audit.py`,
+  `tests/test_llm_timing_frame_budget.py`, `tests/test_llm_timing_pricing.py`,
+  `tests/test_llm_timing_engines.py`, `tests/test_llm_timing_eval_provider_wiring.py`,
+  `tests/test_web_llm_engines.py`) - retargeted to supply a valid
+  `outlet_xy`/`outlet`, drawn from the `zahn_video` fixture's own
+  `truth["outlet_x"]`/`["outlet_y"]`.
+- `tests/test_contact_sheet.py` - `default_crop_origin` tests replaced with
+  `crop_origin_from_outlet` tests, plus an end-to-end test asserting a real
+  marked outlet lands on the rendered ring.
+- `tests_js/playwright/llm_flow.test.js` - new `markLLMOutlet()` helper,
+  called in all three browser scenarios before the first Run click (the
+  button is disabled without it).
+
+### Gates
+
+`pytest tests/` - 629 passed. `ruff check .` / `ruff format --check .` -
+clean. `mypy app` - clean (45 source files, no findings). `node --test
+tests_js/*.test.js` - 107/107. Browser suite
+(`tests_js/playwright/llm_flow.test.js`) - 26/26 (3 top-level scenarios, one
+new "mark the outlet on the video frame" step per scenario).
+
+### Manual test
+
+1. Start the app, upload any video. The Experimental LLM section becomes
+   active; its own outlet picker sits above the engine list, independent of
+   the classical mode/frame-picker steps.
+2. Configure an engine (Settings, or the `+ Add engine` form) - unchanged
+   from prior rounds.
+3. Note the Run button is disabled until an outlet is marked. Play the
+   preview to a frame showing the cup's outlet hole, click "Use the frame
+   currently shown in the preview", then click exactly on the outlet in the
+   image. The summary line reports the marked coordinates; Run becomes
+   enabled.
+4. Run the engine (a configured provider, or the existing Test flow to
+   confirm wiring without a live call). The contact-sheet panels used in
+   "Frames sent to AI" / evidence images now crop around the real marked
+   point, not a guessed one.
+5. Upload a different video: confirm the outlet mark is cleared and Run is
+   disabled again until a new one is marked on the new video.
+
+No real-provider smoke test was possible from this sandbox (same limitation
+as every prior round). Per the delivery boundary: no automatic outlet
+detector, no further prompt/model research, no paid provider call,
+automated tests use mocks/fixtures only. Provider/model selection and the
+audit/evidence reporting architecture are unchanged. PR #5 stays
+draft/unmerged.

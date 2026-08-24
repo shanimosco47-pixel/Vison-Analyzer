@@ -296,6 +296,7 @@ def test_pipeline_confirms_event_matching_ground_truth(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
@@ -328,6 +329,7 @@ def test_pipeline_marks_low_but_passing_confidence_as_review(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
         config=config,
     )
     assert outcome.event is not None
@@ -348,6 +350,7 @@ def test_pipeline_abstains_when_coarse_pass_abstains(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -378,6 +381,7 @@ def test_pipeline_abstains_when_fine_pass_abstains_after_confirmed_coarse(zahn_v
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -395,6 +399,7 @@ def test_pipeline_abstains_on_malformed_provider_output_without_crashing(zahn_vi
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -422,6 +427,7 @@ def test_pipeline_abstains_when_coarse_window_is_implausibly_wide(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
         config=config,
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
@@ -446,6 +452,7 @@ def test_pipeline_abstains_when_uncertainty_exceeds_cap(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
         config=config,
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
@@ -482,6 +489,7 @@ def test_pipeline_abstains_when_fine_start_is_outside_its_window(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -501,6 +509,7 @@ def test_pipeline_abstains_when_evidence_is_empty(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -522,6 +531,7 @@ def test_pipeline_abstains_when_evidence_matches_no_submitted_frame(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -544,6 +554,7 @@ def test_pipeline_abstains_when_evidence_is_grounded_but_far_from_the_claim(zahn
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -588,6 +599,7 @@ def test_pipeline_abstains_when_end_coarse_finds_no_candidate(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -649,6 +661,7 @@ def test_pipeline_start_confirmation_is_independent_of_a_stale_coarse_end_estima
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
@@ -713,6 +726,7 @@ def test_pipeline_end_coarse_never_considers_the_onset_transition_as_a_candidate
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
@@ -762,6 +776,7 @@ def test_pipeline_abstains_when_the_only_candidate_fails_trend_validation(zahn_v
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -811,6 +826,7 @@ def test_pipeline_clamps_the_validation_window_to_locked_start_s_for_an_early_ca
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
@@ -852,6 +868,7 @@ def test_pipeline_clamps_the_validation_window_to_the_clip_end_and_still_confirm
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
@@ -903,6 +920,7 @@ def test_pipeline_abstains_when_the_last_panel_has_no_room_for_a_trend_checkpoin
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -957,6 +975,7 @@ def test_pipeline_reaches_the_true_break_in_one_call_when_end_coarse_avoids_the_
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
@@ -1003,6 +1022,7 @@ def test_pipeline_accepts_a_validation_refined_onset_earlier_than_the_sparse_can
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
@@ -1053,6 +1073,7 @@ def test_pipeline_reaches_a_break_within_the_coarse_sheets_own_reach(zahn_video)
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
@@ -1096,6 +1117,7 @@ def test_pipeline_abstains_when_a_refined_onset_falls_outside_the_validation_win
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -1132,6 +1154,7 @@ def test_pipeline_accepts_a_candidate_with_sustained_shortening_across_later_pan
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert outcome.event is not None
@@ -1162,6 +1185,7 @@ def test_pipeline_calls_on_stage_before_each_pass_it_actually_reaches(zahn_video
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
         on_stage=stages.append,
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
@@ -1190,6 +1214,7 @@ def test_pipeline_on_stage_can_abort_the_run_by_raising(zahn_video):
             provider,
             prompt_version=PROMPT_VERSION,
             prompt_text="irrelevant for a stub",
+            outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
             on_stage=on_stage,
         )
 
@@ -1219,7 +1244,11 @@ def test_pipeline_records_pass_frames_matching_the_actual_submitted_requests(zah
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.CONFIRMED
     assert set(outcome.pass_frames) == {"coarse", "fine", "end_coarse", "end_validate"}
@@ -1257,7 +1286,11 @@ def test_pipeline_pass_frames_omits_passes_that_never_ran(zahn_video):
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert set(outcome.pass_frames) == {"coarse", "fine", "end_coarse"}
@@ -1289,6 +1322,7 @@ def test_pipeline_thinned_pass_frames_match_the_frames_actually_sent(zahn_video)
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
         config=config,
     )
     fine_call = next(c for c in provider.calls if c.pass_name == "fine")
@@ -1318,7 +1352,11 @@ def test_pipeline_confirmed_result_exposes_grounded_evidence_timestamps(zahn_vid
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.event is not None
     start_evidence_s = outcome.event.details["start_evidence_s"]
@@ -1344,7 +1382,11 @@ def test_pipeline_abstain_outcome_has_no_event_and_therefore_no_evidence(zahn_vi
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -1369,7 +1411,11 @@ def test_pipeline_confirmed_result_populates_derived_decisions(zahn_video):
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.event is not None
     assert outcome.derived["locked_start_s"] == pytest.approx(4.0)
@@ -1407,7 +1453,11 @@ def test_pipeline_derived_decisions_survive_a_rejected_end_candidate(zahn_video)
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None
@@ -1478,7 +1528,11 @@ def test_pipeline_never_confirms_the_false_early_candidate_when_both_anchors_con
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
 
     # Never a confidently-wrong CONFIRMED result at the false candidate.
@@ -1537,7 +1591,11 @@ def test_pipeline_reaches_the_true_late_break_via_the_conflict_secondary_validat
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
 
     assert outcome.verdict.status is TimingStatus.CONFIRMED
@@ -1596,7 +1654,11 @@ def test_pipeline_confirms_via_the_coarse_cascade_citing_later_panels_as_checkpo
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
 
     assert outcome.verdict.status is TimingStatus.CONFIRMED
@@ -1633,7 +1695,11 @@ def test_pipeline_refines_via_the_denser_lookback_sheet_when_coarse_abstains(zah
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
 
     assert outcome.verdict.status is TimingStatus.CONFIRMED
@@ -1665,7 +1731,11 @@ def test_pipeline_abstains_when_coarse_cascade_finds_nothing_to_point_at(zahn_vi
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
 
     assert outcome.verdict.status is TimingStatus.ABSTAIN
@@ -1702,7 +1772,11 @@ def test_pipeline_abstains_when_the_refine_sheet_also_fails_to_confirm(zahn_vide
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
 
     assert outcome.verdict.status is TimingStatus.ABSTAIN
@@ -1742,7 +1816,11 @@ def test_pipeline_rejects_an_ungrounded_possible_collapse_s(zahn_video):
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
 
     assert outcome.verdict.status is TimingStatus.ABSTAIN
@@ -1780,7 +1858,11 @@ def test_pipeline_rejects_cascade_trend_checkpoints_not_strictly_after_onset(zah
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_VERSION, prompt_text="irrelevant"
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_VERSION,
+        prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
 
     assert outcome.verdict.status is TimingStatus.ABSTAIN

@@ -162,9 +162,18 @@ class LLMRunService:
 
     # -- submission ----------------------------------------------------- #
 
-    def submit(self, record: VideoRecord, engine: EngineConfig) -> LLMRunJob:
+    def submit(
+        self, record: VideoRecord, engine: EngineConfig, *, outlet_xy: tuple[float, float]
+    ) -> LLMRunJob:
         if not engine.enabled:
             raise AnalyzerError("This engine is disabled. Enable it before running.")
+
+        outlet_x, outlet_y = outlet_xy
+        if not (0 <= outlet_x < record.info.width and 0 <= outlet_y < record.info.height):
+            raise AnalyzerError(
+                "Mark the outlet hole of the cup on the video frame before running an "
+                "AI engine - the marked point must fall within the video's own frame."
+            )
 
         job = LLMRunJob(
             run_id=uuid.uuid4().hex,
@@ -179,7 +188,7 @@ class LLMRunService:
         logger.info(
             "Queued LLM run %s: engine=%s video=%s", job.run_id, engine.engine_id, record.video_id
         )
-        self._executor.submit(self._run_job, job, record, engine)
+        self._executor.submit(self._run_job, job, record, engine, outlet_xy)
         return job
 
     # -- inspection ------------------------------------------------------- #
@@ -273,7 +282,13 @@ class LLMRunService:
 
     # -- worker ------------------------------------------------------------- #
 
-    def _run_job(self, job: LLMRunJob, record: VideoRecord, engine: EngineConfig) -> None:
+    def _run_job(
+        self,
+        job: LLMRunJob,
+        record: VideoRecord,
+        engine: EngineConfig,
+        outlet_xy: tuple[float, float],
+    ) -> None:
         if job.cancelled:
             # cancel() already finalized this job (status/finished_at) while
             # it was still queued - persist that safe partial audit here,
@@ -315,6 +330,7 @@ class LLMRunService:
                 provider,
                 prompt_version=PROMPT_V1_ID,
                 prompt_text=PROMPT_V1,
+                outlet_xy=outlet_xy,
                 config=PipelineConfig(),
                 video_info=record.info,
                 on_stage=on_stage,

@@ -21,6 +21,10 @@ const state = {
   mode: null,         // selected analysis mode
   outlet: null,       // {x, y} in source pixels (Zahn)
   roi: null,          // {x, y, width, height} in source pixels
+  llmOutlet: null,    // {x, y} in source pixels, marked for the Experimental LLM section -
+                       // independent of `outlet` above (its own picker, its own state), since
+                       // the LLM section works without ever going through the classical
+                       // mode/frame-picker steps.
   frameTime: 0,       // timestamp of the frame shown in the picker
   jobId: null,
   pollTimer: null,
@@ -282,6 +286,15 @@ function onVideoUploaded(info) {
   preview.src = `/api/videos/${info.video_id}/media`;
   preview.load();
 
+  // A fresh video invalidates any previously-marked outlet: its pixel
+  // coordinates almost certainly no longer point at this video's outlet.
+  state.llmOutlet = null;
+  drawLLMOutlet();
+  updateLLMOutletSummary();
+  el("llm-outlet-image").src = "";
+  el("llm-frame-time-label").textContent = "";
+  el("llm-clear-outlet").classList.add("hidden");
+
   el("video-details").classList.remove("hidden");
   enableStep("step-mode", true);
   enableStep("step-configure", true);
@@ -380,9 +393,10 @@ function loadFrameFromPreview() {
   el("clear-region").classList.remove("hidden");
 }
 
-/** Convert a pointer event into source-video pixel coordinates. */
-function toSourceCoords(event) {
-  const canvas = el("frame-canvas");
+/** Convert a pointer event into source-video pixel coordinates for a given
+ * canvas (the canvas's own width/height already hold the source frame's
+ * true pixel dimensions - set on image "load", see below). */
+function toSourceCoords(event, canvas) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = canvas.width / rect.width;
   const scaleY = canvas.height / rect.height;
@@ -394,18 +408,18 @@ function toSourceCoords(event) {
 
 function onPointerDown(event) {
   if (!el("frame-image").src) return;
-  state.dragStart = toSourceCoords(event);
+  state.dragStart = toSourceCoords(event, el("frame-canvas"));
 }
 
 function onPointerMove(event) {
   if (!state.dragStart) return;
-  const current = toSourceCoords(event);
+  const current = toSourceCoords(event, el("frame-canvas"));
   drawRegion(rectFrom(state.dragStart, current));
 }
 
 function onPointerUp(event) {
   if (!state.dragStart) return;
-  const current = toSourceCoords(event);
+  const current = toSourceCoords(event, el("frame-canvas"));
   const rect = rectFrom(state.dragStart, current);
   const isClick = rect.width < 8 || rect.height < 8;
 
@@ -480,6 +494,88 @@ function updateRegionSummary() {
       ? "No outlet marked yet - this is required for Zahn cup analysis."
       : "No region selected - the whole frame will be analysed.";
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Experimental LLM section - outlet picker                            */
+/*                                                                      */
+/* Independent of the classical picker above (state.outlet/state.roi): */
+/* the Experimental section is documented as usable without visiting   */
+/* the classical mode/frame-picker steps, so it keeps its own anchor   */
+/* in state.llmOutlet and its own frame/canvas pair.                   */
+/* ------------------------------------------------------------------ */
+
+function initLLMOutletPicker() {
+  el("llm-grab-frame").addEventListener("click", loadLLMFrameFromPreview);
+  el("llm-clear-outlet").addEventListener("click", () => {
+    state.llmOutlet = null;
+    drawLLMOutlet();
+    updateLLMOutletSummary();
+    updateLLMRunButtons();
+  });
+
+  const canvas = el("llm-outlet-canvas");
+  canvas.addEventListener("pointerup", onLLMOutletPointerUp);
+
+  el("llm-outlet-image").addEventListener("load", () => {
+    const image = el("llm-outlet-image");
+    const canvasEl = el("llm-outlet-canvas");
+    canvasEl.width = image.naturalWidth;
+    canvasEl.height = image.naturalHeight;
+    drawLLMOutlet();
+  });
+}
+
+function loadLLMFrameFromPreview() {
+  if (!state.video) return;
+  const time = el("preview").currentTime || 0;
+  el("llm-outlet-image").src =
+    `/api/videos/${state.video.video_id}/frame?t=${encodeURIComponent(time.toFixed(3))}`;
+  el("llm-frame-time-label").textContent = `Frame at ${time.toFixed(2)} s`;
+  el("llm-clear-outlet").classList.remove("hidden");
+}
+
+function onLLMOutletPointerUp(event) {
+  if (!el("llm-outlet-image").src) return;
+  state.llmOutlet = toSourceCoords(event, el("llm-outlet-canvas"));
+  drawLLMOutlet();
+  updateLLMOutletSummary();
+  updateLLMRunButtons();
+}
+
+function drawLLMOutlet() {
+  const canvas = el("llm-outlet-canvas");
+  const context = canvas.getContext("2d");
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  if (!state.llmOutlet) return;
+
+  const lineWidth = Math.max(2, Math.round(canvas.width / 400));
+  const radius = Math.max(6, Math.round(canvas.width / 90));
+  context.strokeStyle = "#ffaa00";
+  context.lineWidth = lineWidth;
+  context.beginPath();
+  context.arc(state.llmOutlet.x, state.llmOutlet.y, radius, 0, Math.PI * 2);
+  context.stroke();
+}
+
+function updateLLMOutletSummary() {
+  const summary = el("llm-outlet-summary");
+  summary.textContent = state.llmOutlet
+    ? `Outlet marked at x=${state.llmOutlet.x}, y=${state.llmOutlet.y}. `
+      + "AI engines will crop and analyse frames anchored on this point."
+    : "No outlet marked yet - this is required before running an AI engine.";
+}
+
+/** Re-applies the outlet-marked precondition to every rendered engine
+ * card's Run button - called whenever state.llmOutlet changes and after
+ * renderLLMEngineList() rebuilds the cards from scratch. */
+function updateLLMRunButtons() {
+  llmState.engines.forEach((engine) => {
+    const card = findLLMCard(engine.engine_id);
+    if (!card) return;
+    const runBtn = card.querySelector(".llm-run-btn");
+    if (runBtn) runBtn.disabled = !engine.enabled || !state.video || !state.llmOutlet;
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1155,6 +1251,7 @@ function initLLMSection() {
   document.querySelectorAll('input[name="llm-credential-mode"]').forEach((radio) => {
     radio.addEventListener("change", updateLLMCredentialFieldVisibility);
   });
+  initLLMOutletPicker();
   loadLLMModelOptions();
   loadLLMEngines();
 }
@@ -1289,7 +1386,7 @@ function buildLLMEngineCard(engine) {
   runBtn.type = "button";
   runBtn.className = "primary llm-run-btn";
   runBtn.textContent = "Run";
-  runBtn.disabled = !engine.enabled || !state.video;
+  runBtn.disabled = !engine.enabled || !state.video || !state.llmOutlet;
   runBtn.addEventListener("click", () => runLLMEngine(engine));
   actions.appendChild(runBtn);
 
@@ -1348,6 +1445,10 @@ function buildLLMEngineCard(engine) {
 
 async function runLLMEngine(engine) {
   if (!state.video) return;
+  if (!state.llmOutlet) {
+    showError("Mark the outlet hole of the cup on the video frame before running an AI engine.");
+    return;
+  }
   const card = findLLMCard(engine.engine_id);
   if (!card) return;
   const runBtn = card.querySelector(".llm-run-btn");
@@ -1368,7 +1469,7 @@ async function runLLMEngine(engine) {
     const job = await getJSON(`/api/videos/${state.video.video_id}/llm-runs`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ engine_id: engine.engine_id }),
+      body: JSON.stringify({ engine_id: engine.engine_id, outlet: state.llmOutlet }),
     });
     llmState.runs[engine.engine_id] = { runId: job.run_id };
     pollLLMRun(engine.engine_id);

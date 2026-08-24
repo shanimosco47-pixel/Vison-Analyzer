@@ -76,6 +76,11 @@ def record(zahn_video) -> VideoRecord:
     )
 
 
+@pytest.fixture
+def outlet_xy(zahn_video) -> tuple[float, float]:
+    return (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"])
+
+
 def _confirmed_stub_provider() -> StubTimingProvider:
     candidate_s = 12.0
 
@@ -100,7 +105,11 @@ def _confirmed_stub_provider() -> StubTimingProvider:
 def test_build_audit_record_for_a_confirmed_outcome_has_every_pass(zahn_video):
     provider = _confirmed_stub_provider()
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_V1_ID, prompt_text=PROMPT_V1
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_V1_ID,
+        prompt_text=PROMPT_V1,
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     audit = build_audit_record(
         run_id="deadbeefdeadbeefdeadbeefdeadbeef",
@@ -185,6 +194,7 @@ def test_build_audit_record_exact_post_thinning_timestamps_match_pass_frames(zah
         provider,
         prompt_version=PROMPT_V1_ID,
         prompt_text=PROMPT_V1,
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
         config=config,
     )
     audit = build_audit_record(
@@ -232,7 +242,11 @@ def test_build_audit_record_for_a_rejected_candidate_still_shows_the_chain(zahn_
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_V1_ID, prompt_text=PROMPT_V1
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_V1_ID,
+        prompt_text=PROMPT_V1,
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     audit = build_audit_record(
         run_id="b" * 32,
@@ -300,7 +314,11 @@ def test_build_audit_record_redacts_secret_shaped_text_in_raw_notes_and_error(za
 
     provider = StubTimingProvider(respond)
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_V1_ID, prompt_text=PROMPT_V1
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_V1_ID,
+        prompt_text=PROMPT_V1,
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     audit = build_audit_record(
         run_id="d" * 32,
@@ -332,7 +350,11 @@ def test_build_audit_record_never_carries_image_bytes_credentials_or_paths(zahn_
     objects and no path-shaped strings from this sandbox leaking in."""
     provider = _confirmed_stub_provider()
     outcome = run_llm_timing(
-        zahn_video.path, provider, prompt_version=PROMPT_V1_ID, prompt_text=PROMPT_V1
+        zahn_video.path,
+        provider,
+        prompt_version=PROMPT_V1_ID,
+        prompt_text=PROMPT_V1,
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     audit = build_audit_record(
         run_id="e" * 32,
@@ -443,7 +465,11 @@ def _wait_for(service: LLMRunService, run_id: str, timeout_s: float = 30.0) -> d
 
 
 def test_a_completed_run_is_automatically_persisted_and_retrievable(
-    engine_store: LLMEngineStore, app_config: AppConfig, record: VideoRecord, monkeypatch
+    engine_store: LLMEngineStore,
+    app_config: AppConfig,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
+    monkeypatch,
 ):
     service = LLMRunService(engine_store, app_config, sweep_interval_s=0.05)
     try:
@@ -452,7 +478,7 @@ def test_a_completed_run_is_automatically_persisted_and_retrievable(
         )
         monkeypatch.setattr(engine_store, "build_provider", lambda e: _confirmed_stub_provider())
 
-        job = service.submit(record, engine)
+        job = service.submit(record, engine, outlet_xy=outlet_xy)
         _wait_for(service, job.run_id)
 
         audit = service.get_audit(job.run_id)
@@ -472,7 +498,11 @@ def test_a_completed_run_is_automatically_persisted_and_retrievable(
 
 
 def test_audit_is_readable_from_a_brand_new_service_instance(
-    engine_store: LLMEngineStore, app_config: AppConfig, record: VideoRecord, monkeypatch
+    engine_store: LLMEngineStore,
+    app_config: AppConfig,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
+    monkeypatch,
 ):
     """Simulates a server restart at the LLMRunService layer: a run
     completed under one service instance must still be readable through a
@@ -485,7 +515,7 @@ def test_audit_is_readable_from_a_brand_new_service_instance(
             provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
         )
         monkeypatch.setattr(engine_store, "build_provider", lambda e: _confirmed_stub_provider())
-        job = first.submit(record, engine)
+        job = first.submit(record, engine, outlet_xy=outlet_xy)
         _wait_for(first, job.run_id)
     finally:
         first.shutdown()
@@ -503,14 +533,17 @@ def test_audit_is_readable_from_a_brand_new_service_instance(
 
 
 def test_a_missing_credential_failure_still_persists_a_safe_partial_audit(
-    engine_store: LLMEngineStore, app_config: AppConfig, record: VideoRecord
+    engine_store: LLMEngineStore,
+    app_config: AppConfig,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
 ):
     service = LLMRunService(engine_store, app_config, sweep_interval_s=0.05)
     try:
         engine = engine_store.create(
             provider_name="openai", model_id="gpt-4.1-mini", env_var="THIS_VAR_IS_NEVER_SET"
         )
-        job = service.submit(record, engine)
+        job = service.submit(record, engine, outlet_xy=outlet_xy)
         _wait_for(service, job.run_id)
 
         audit = service.get_audit(job.run_id)
@@ -527,7 +560,11 @@ def test_a_missing_credential_failure_still_persists_a_safe_partial_audit(
 
 
 def test_a_run_cancelled_before_it_starts_still_persists_a_safe_partial_audit(
-    engine_store: LLMEngineStore, app_config: AppConfig, record: VideoRecord, monkeypatch
+    engine_store: LLMEngineStore,
+    app_config: AppConfig,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
+    monkeypatch,
 ):
     engine = engine_store.create(
         provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
@@ -542,7 +579,7 @@ def test_a_run_cancelled_before_it_starts_still_persists_a_safe_partial_audit(
         service._executor.submit(gate.wait)  # fill every worker
 
         monkeypatch.setattr(engine_store, "build_provider", lambda e: _confirmed_stub_provider())
-        job = service.submit(record, engine)
+        job = service.submit(record, engine, outlet_xy=outlet_xy)
         cancelled = service.cancel(job.run_id)
         assert cancelled.status == "cancelled"
         gate.set()
@@ -565,7 +602,11 @@ def test_a_run_cancelled_before_it_starts_still_persists_a_safe_partial_audit(
 
 
 def test_purge_expired_also_removes_the_durable_audit(
-    engine_store: LLMEngineStore, app_config: AppConfig, record: VideoRecord, monkeypatch
+    engine_store: LLMEngineStore,
+    app_config: AppConfig,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
+    monkeypatch,
 ):
     service = LLMRunService(engine_store, app_config, sweep_interval_s=0.05)
     try:
@@ -573,7 +614,7 @@ def test_purge_expired_also_removes_the_durable_audit(
             provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
         )
         monkeypatch.setattr(engine_store, "build_provider", lambda e: _confirmed_stub_provider())
-        job = service.submit(record, engine)
+        job = service.submit(record, engine, outlet_xy=outlet_xy)
         _wait_for(service, job.run_id)
         assert service.get_audit(job.run_id) is not None
 

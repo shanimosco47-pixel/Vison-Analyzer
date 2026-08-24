@@ -138,6 +138,7 @@ def test_disabled_engine_is_skipped_and_never_calls_the_factory(zahn_video):
         factory,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert len(results) == 1
     assert results[0].status is EngineRunStatus.SKIPPED
@@ -159,6 +160,7 @@ def test_one_engine_erroring_does_not_block_the_others(zahn_video):
         factory,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
 
     # Order preserved, one entry per engine, nothing merged.
@@ -187,6 +189,7 @@ def test_engine_error_message_is_redacted_when_it_contains_a_secret_shape(zahn_v
         factory,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert results[0].status is EngineRunStatus.ENGINE_ERROR
     assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in results[0].error_message
@@ -209,6 +212,7 @@ def test_results_are_never_aggregated_even_when_engines_disagree(zahn_video):
         factory,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     early, late = results
     assert early.outcome.verdict.end_s == pytest.approx(10.0)

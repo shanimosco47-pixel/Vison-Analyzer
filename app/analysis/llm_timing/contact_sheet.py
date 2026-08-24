@@ -44,29 +44,34 @@ _SCALE_TICK_LENGTH_PX = 15
 _SCALE_COLOR_BGR = (255, 0, 0)  # blue
 
 
-def default_crop_origin(frame_width_px: int, frame_height_px: int) -> tuple[int, int]:
-    """The crop's top-left corner within a raw source frame, when the
-    caller has not supplied a calibrated one of its own.
+def crop_origin_from_outlet(outlet_x: float, outlet_y: float) -> tuple[int, int]:
+    """The crop's top-left corner within a raw source frame, derived from a
+    real, user-marked outlet point - never a guessed or heuristic position.
 
-    The supervisor's overlay contract fixes the crop's *size* (240x360) and
-    the outlet's position *within* it (120, 50) - both were tuned against
-    the experiment's own dev footage - but not where that crop sits within
-    an arbitrary uploaded video's frame, which was never specified and
-    cannot be inferred without exactly the kind of per-frame outlet
-    tracking five classical mechanisms already failed at (see PR #4). This
-    heuristic - horizontally centred, biased toward the upper part of the
-    frame - follows the same "outlet near top-centre, stream flows down"
-    framing convention this app's own classical-ROI defaults already
-    assume (``AppConfig.roi_height_fraction``/``outlet_band_fraction`` in
-    ``app/config.py``), clamped so the fixed-size crop always fits inside
-    the frame. It is a documented assumption, not a calibrated value -
-    flagged as such in this round's PR write-up for confirmation/tuning
-    against real footage."""
-    x = (frame_width_px - SOURCE_CROP_WIDTH_PX) // 2
-    y = round(frame_height_px * 0.10)
-    x = max(0, min(x, max(0, frame_width_px - SOURCE_CROP_WIDTH_PX)))
-    y = max(0, min(y, max(0, frame_height_px - SOURCE_CROP_HEIGHT_PX)))
-    return x, y
+    A prior round shipped a centred/near-top heuristic in this function's
+    place; a real-footage review caught it placing the assumed outlet
+    hundreds of pixels from the actual one on real 1080x1920 clips (the
+    outlet sits low in frame, not 10% from the top) - the crop would have
+    missed the stream entirely. The supervisor's follow-up decision:
+    require one user click on the outlet (the same click-to-mark mechanism
+    ``app/analysis/zahn_detector.py``'s ``roi_from_outlet_click`` already
+    uses for the classical detector), and derive the crop directly from it,
+    positioned so the marked point lands at ``OUTLET_IN_CROP_XY`` within
+    the crop - the same place the overlay's own red ring is drawn, so the
+    ring in every rendered panel actually sits on the real, marked outlet.
+
+    Callers are responsible for validating ``(outlet_x, outlet_y)`` against
+    the video's own bounds before calling this (see
+    ``pipeline.run_llm_timing``'s own precondition check) - this function
+    itself never raises or clamps against a frame size, since it has none;
+    :func:`render_panel`'s own clamping still applies once the resulting
+    origin is used to crop an actual frame, so a still-negative or
+    still-out-of-bounds origin degrades to a bounded, zero-padded crop
+    rather than raising."""
+    return (
+        round(outlet_x) - OUTLET_IN_CROP_XY[0],
+        round(outlet_y) - OUTLET_IN_CROP_XY[1],
+    )
 
 
 def render_panel(

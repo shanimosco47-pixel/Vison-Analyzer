@@ -12,19 +12,29 @@ def _frame(width: int = 640, height: int = 480, fill: int = 200) -> np.ndarray:
     return np.full((height, width, 3), fill, dtype=np.uint8)
 
 
-def test_default_crop_origin_is_centered_horizontally_and_near_the_top() -> None:
-    x, y = cs.default_crop_origin(640, 480)
-    assert x == (640 - cs.SOURCE_CROP_WIDTH_PX) // 2
-    assert y == round(480 * 0.10)
-    # Always fits inside the frame.
-    assert 0 <= x <= 640 - cs.SOURCE_CROP_WIDTH_PX
-    assert 0 <= y <= 480 - cs.SOURCE_CROP_HEIGHT_PX
+def test_crop_origin_from_outlet_positions_the_outlet_at_its_marker() -> None:
+    outlet_x, outlet_y = 627.0, 1108.0
+    x, y = cs.crop_origin_from_outlet(outlet_x, outlet_y)
+    assert x == outlet_x - cs.OUTLET_IN_CROP_XY[0]
+    assert y == outlet_y - cs.OUTLET_IN_CROP_XY[1]
+    # The marked outlet, re-expressed inside the crop, lands exactly where
+    # the overlay's own red ring is drawn.
+    assert (outlet_x - x, outlet_y - y) == cs.OUTLET_IN_CROP_XY
 
 
-def test_default_crop_origin_clamps_for_a_frame_smaller_than_the_crop() -> None:
-    x, y = cs.default_crop_origin(100, 80)
-    assert x == 0
-    assert y == 0
+def test_crop_origin_from_outlet_rounds_a_fractional_click() -> None:
+    x, y = cs.crop_origin_from_outlet(100.6, 200.4)
+    assert x == round(100.6) - cs.OUTLET_IN_CROP_XY[0]
+    assert y == round(200.4) - cs.OUTLET_IN_CROP_XY[1]
+
+
+def test_crop_origin_from_outlet_can_go_negative_near_a_frame_edge() -> None:
+    # An outlet marked close to the frame's own top-left corner yields a
+    # negative origin - render_panel's own clamping handles this, not this
+    # function (see its docstring).
+    x, y = cs.crop_origin_from_outlet(10.0, 5.0)
+    assert x < 0
+    assert y < 0
 
 
 def test_render_panel_has_the_exact_tile_dimensions() -> None:
@@ -54,6 +64,19 @@ def test_render_panel_draws_a_red_outlet_ring() -> None:
     ring_x = x + cs.OUTLET_MARKER_RADIUS_PX
     pixel = tile[y, ring_x]
     # BGR - red is (0, 0, 255).
+    assert pixel[2] > pixel[0] and pixel[2] > pixel[1]
+
+
+def test_a_real_marked_outlet_lands_on_the_rendered_ring() -> None:
+    """End to end: a real (x, y) click, run through crop_origin_from_outlet
+    and then render_panel, must land the marked point exactly on the
+    overlay's own red ring - not merely somewhere inside the crop."""
+    frame = _frame(width=1920, height=1080, fill=255)
+    outlet_x, outlet_y = 627.0, 1108.0
+    crop_origin = cs.crop_origin_from_outlet(outlet_x, outlet_y)
+    tile = cs.render_panel(frame, timestamp_s=0.0, crop_origin=crop_origin)
+    ring_x, ring_y = cs.OUTLET_MARKER_XY
+    pixel = tile[ring_y, ring_x + cs.OUTLET_MARKER_RADIUS_PX]
     assert pixel[2] > pixel[0] and pixel[2] > pixel[1]
 
 

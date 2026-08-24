@@ -72,6 +72,11 @@ def record(zahn_video) -> VideoRecord:
     )
 
 
+@pytest.fixture
+def outlet_xy(zahn_video) -> tuple[float, float]:
+    return (zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"])
+
+
 def _confirmed_stub_provider() -> StubTimingProvider:
     candidate_s = 12.0
 
@@ -99,14 +104,18 @@ def _wait_for(run_service: LLMRunService, run_id: str, timeout_s: float = 30.0) 
 
 
 def test_a_run_completes_and_reports_a_confirmed_outcome(
-    engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
+    engine_store: LLMEngineStore,
+    run_service: LLMRunService,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
+    monkeypatch,
 ):
     engine = engine_store.create(
         provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
     )
     monkeypatch.setattr(engine_store, "build_provider", lambda e: _confirmed_stub_provider())
 
-    job = run_service.submit(record, engine)
+    job = run_service.submit(record, engine, outlet_xy=outlet_xy)
     payload = _wait_for(run_service, job.run_id)
 
     assert payload["status"] == "complete"
@@ -116,7 +125,11 @@ def test_a_run_completes_and_reports_a_confirmed_outcome(
 
 
 def test_a_run_reports_abstain_without_crashing(
-    engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
+    engine_store: LLMEngineStore,
+    run_service: LLMRunService,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
+    monkeypatch,
 ):
     engine = engine_store.create(
         provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
@@ -131,7 +144,7 @@ def test_a_run_reports_abstain_without_crashing(
 
     monkeypatch.setattr(engine_store, "build_provider", lambda e: StubTimingProvider(respond))
 
-    job = run_service.submit(record, engine)
+    job = run_service.submit(record, engine, outlet_xy=outlet_xy)
     payload = _wait_for(run_service, job.run_id)
 
     assert payload["status"] == "complete"
@@ -140,7 +153,10 @@ def test_a_run_reports_abstain_without_crashing(
 
 
 def test_a_missing_credential_fails_the_run_with_a_safe_message(
-    engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord
+    engine_store: LLMEngineStore,
+    run_service: LLMRunService,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
 ):
     # env_var references a variable that was never actually set - build_provider
     # (the real one, not mocked) will fail resolving it.
@@ -148,7 +164,7 @@ def test_a_missing_credential_fails_the_run_with_a_safe_message(
         provider_name="openai", model_id="gpt-4.1-mini", env_var="THIS_VAR_IS_NEVER_SET"
     )
 
-    job = run_service.submit(record, engine)
+    job = run_service.submit(record, engine, outlet_xy=outlet_xy)
     payload = _wait_for(run_service, job.run_id)
 
     assert payload["status"] == "failed"
@@ -157,17 +173,24 @@ def test_a_missing_credential_fails_the_run_with_a_safe_message(
 
 
 def test_disabled_engine_is_rejected_before_any_run_is_queued(
-    engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord
+    engine_store: LLMEngineStore,
+    run_service: LLMRunService,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
 ):
     engine = engine_store.create(
         provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY", enabled=False
     )
     with pytest.raises(AnalyzerError):
-        run_service.submit(record, engine)
+        run_service.submit(record, engine, outlet_xy=outlet_xy)
 
 
 def test_cancel_before_the_run_starts_marks_it_cancelled_immediately(
-    engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
+    engine_store: LLMEngineStore,
+    run_service: LLMRunService,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
+    monkeypatch,
 ):
     engine = engine_store.create(
         provider_name="openai", model_id="gpt-4.1-mini", env_var="OPENAI_API_KEY"
@@ -183,7 +206,7 @@ def test_cancel_before_the_run_starts_marks_it_cancelled_immediately(
     run_service._executor.submit(gate.wait)  # fill all MAX_CONCURRENT_RUNS workers
 
     monkeypatch.setattr(engine_store, "build_provider", lambda e: _confirmed_stub_provider())
-    job = run_service.submit(record, engine)
+    job = run_service.submit(record, engine, outlet_xy=outlet_xy)
     cancelled = run_service.cancel(job.run_id)
     gate.set()  # release the blocked workers so the executor can shut down cleanly
 
@@ -192,7 +215,11 @@ def test_cancel_before_the_run_starts_marks_it_cancelled_immediately(
 
 
 def test_cancel_mid_run_stops_before_the_next_pass_completes(
-    engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
+    engine_store: LLMEngineStore,
+    run_service: LLMRunService,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
+    monkeypatch,
 ):
     """A cancellation requested while the coarse pass is in flight is
     honoured before the fine pass ever starts - proven by asserting the
@@ -215,7 +242,7 @@ def test_cancel_mid_run_stops_before_the_next_pass_completes(
     monkeypatch.setattr(engine_store, "build_provider", lambda e: StubTimingProvider(respond))
 
     job_holder: dict[str, str] = {}
-    job = run_service.submit(record, engine)
+    job = run_service.submit(record, engine, outlet_xy=outlet_xy)
     job_holder["run_id"] = job.run_id
 
     payload = _wait_for(run_service, job.run_id)
@@ -225,7 +252,11 @@ def test_cancel_mid_run_stops_before_the_next_pass_completes(
 
 
 def test_cancel_of_a_running_job_reports_an_honest_stopping_message(
-    engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
+    engine_store: LLMEngineStore,
+    run_service: LLMRunService,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
+    monkeypatch,
 ):
     """Cancelling a job whose coarse request is already in flight must not
     claim the vendor call itself was stopped - only that the *next* pass
@@ -247,7 +278,7 @@ def test_cancel_of_a_running_job_reports_an_honest_stopping_message(
     monkeypatch.setattr(engine_store, "build_provider", lambda e: StubTimingProvider(respond))
 
     job_holder: dict[str, str] = {}
-    job = run_service.submit(record, engine)
+    job = run_service.submit(record, engine, outlet_xy=outlet_xy)
     job_holder["run_id"] = job.run_id
     _wait_for(run_service, job.run_id)
 
@@ -256,7 +287,11 @@ def test_cancel_of_a_running_job_reports_an_honest_stopping_message(
 
 
 def test_a_frames_only_provider_request_never_carries_the_video_file(
-    engine_store: LLMEngineStore, run_service: LLMRunService, record: VideoRecord, monkeypatch
+    engine_store: LLMEngineStore,
+    run_service: LLMRunService,
+    record: VideoRecord,
+    outlet_xy: tuple[float, float],
+    monkeypatch,
 ):
     """The provider only ever receives extracted JPEG frames - never the
     original uploaded video file or its path."""
@@ -273,7 +308,7 @@ def test_a_frames_only_provider_request_never_carries_the_video_file(
     )
     monkeypatch.setattr(engine_store, "build_provider", lambda e: StubTimingProvider(respond))
 
-    job = run_service.submit(record, engine)
+    job = run_service.submit(record, engine, outlet_xy=outlet_xy)
     _wait_for(run_service, job.run_id)
 
     assert seen_requests

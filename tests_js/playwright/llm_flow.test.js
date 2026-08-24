@@ -50,6 +50,27 @@ function requirePlaywright() {
 
 const { chromium } = requirePlaywright();
 
+/** Marks the required outlet anchor in the Experimental LLM section's own
+ * picker (independent of the classical picker below it - see
+ * app.js's initLLMOutletPicker). Every scenario below must do this before
+ * clicking Run: the button stays disabled without it. */
+async function markLLMOutlet(page) {
+  await page.click("#llm-grab-frame");
+  await page.waitForSelector("#llm-clear-outlet:not(.hidden)");
+  await page.waitForFunction(() => {
+    const canvas = document.querySelector("#llm-outlet-canvas");
+    return canvas.width > 0 && canvas.height > 0;
+  });
+  const box = await page.$eval("#llm-outlet-canvas", (el) => {
+    const rect = el.getBoundingClientRect();
+    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+  });
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForFunction(() =>
+    /Outlet marked at/.test(document.querySelector("#llm-outlet-summary").textContent)
+  );
+}
+
 /** Clicks the first button matching `selector` whose text is exactly
  * `text` - a plain, dependency-free stand-in for Playwright's `:text()`
  * pseudo-class, which some builds resolve differently. */
@@ -159,6 +180,10 @@ test("Experimental LLM analysis - full browser flow against a stub provider", as
     await page.setInputFiles("#file-input", videoPath);
     await page.waitForSelector("#video-details:not(.hidden)", { timeout: 15000 });
     await page.waitForSelector("#step-llm:not(.disabled)");
+  });
+
+  await t.test("mark the outlet on the video frame", async () => {
+    await markLLMOutlet(page);
   });
 
   await t.test("the page shows a build version matching the backend's own API", async () => {
@@ -395,6 +420,7 @@ test("Experimental LLM analysis - the wrong-candidate audit trail explains itsel
     await page.goto(baseUrl, { waitUntil: "load" });
     await page.setInputFiles("#file-input", videoPath);
     await page.waitForSelector("#video-details:not(.hidden)", { timeout: 15000 });
+    await markLLMOutlet(page);
 
     await page.click("#llm-add-engine");
     await page.waitForSelector("#llm-engine-form:not(.hidden)");
@@ -516,6 +542,7 @@ test("Experimental LLM analysis - a candidate conflict explains itself and resol
     await page.goto(baseUrl, { waitUntil: "load" });
     await page.setInputFiles("#file-input", videoPath);
     await page.waitForSelector("#video-details:not(.hidden)", { timeout: 15000 });
+    await markLLMOutlet(page);
 
     await page.click("#llm-add-engine");
     await page.waitForSelector("#llm-engine-form:not(.hidden)");

@@ -237,6 +237,8 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_gemini(zahn_
     entry = {
         "clip_id": "offline-routing-check",
         "video_path": str(zahn_video.path),
+        "outlet_x": zahn_video.truth["outlet_x"],
+        "outlet_y": zahn_video.truth["outlet_y"],
         "true_start_s": zahn_video.truth["flow_start_s"],
         "true_end_s": zahn_video.truth["flow_end_s"],
     }
@@ -320,6 +322,8 @@ def test_evaluate_clip_routes_through_the_full_harness_offline_with_openai(zahn_
     entry = {
         "clip_id": "offline-routing-check-openai",
         "video_path": str(zahn_video.path),
+        "outlet_x": zahn_video.truth["outlet_x"],
+        "outlet_y": zahn_video.truth["outlet_y"],
         "true_start_s": zahn_video.truth["flow_start_s"],
         "true_end_s": zahn_video.truth["flow_end_s"],
     }
@@ -369,6 +373,8 @@ def test_evaluate_clip_surfaces_raw_notes_on_a_provider_error(zahn_video):
     entry = {
         "clip_id": "provider-error-check",
         "video_path": str(zahn_video.path),
+        "outlet_x": zahn_video.truth["outlet_x"],
+        "outlet_y": zahn_video.truth["outlet_y"],
         "true_start_s": zahn_video.truth["flow_start_s"],
         "true_end_s": zahn_video.truth["flow_end_s"],
     }
@@ -392,6 +398,8 @@ def test_evaluate_clip_raw_notes_redacts_secret_shaped_text_from_a_provider_erro
     entry = {
         "clip_id": "secret-leak-check",
         "video_path": str(zahn_video.path),
+        "outlet_x": zahn_video.truth["outlet_x"],
+        "outlet_y": zahn_video.truth["outlet_y"],
         "true_start_s": zahn_video.truth["flow_start_s"],
         "true_end_s": zahn_video.truth["flow_end_s"],
     }
@@ -421,6 +429,8 @@ def test_evaluate_clip_raw_notes_redacts_a_masked_credential_from_a_provider_err
     entry = {
         "clip_id": "masked-credential-leak-check",
         "video_path": str(zahn_video.path),
+        "outlet_x": zahn_video.truth["outlet_x"],
+        "outlet_y": zahn_video.truth["outlet_y"],
         "true_start_s": zahn_video.truth["flow_start_s"],
         "true_end_s": zahn_video.truth["flow_end_s"],
     }

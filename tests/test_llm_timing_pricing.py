@@ -101,6 +101,7 @@ def test_pipeline_outcome_reports_none_cost_when_model_unpriced(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.event is not None
     assert len(provider.calls) == 4  # coarse, fine, one end-coarse call, one validation call
@@ -134,6 +135,7 @@ def test_pipeline_outcome_estimates_cost_with_an_injected_table(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     table = {"priced-stub": ModelPricing(input_usd_per_1k_tokens=0.5, output_usd_per_1k_tokens=1.5)}
     # Each pass: 1000 in @ $0.5/1k + 1000 out @ $1.5/1k = $2.00; four passes

@@ -62,6 +62,31 @@
       before relying on it.
     </p>
 
+    <div id="llm-outlet-picker">
+      <p class="instruction">
+        Play the preview until the cup and the outlet hole are clearly visible, press
+        &ldquo;Use the frame currently shown&rdquo;, then click exactly on the outlet
+        hole. This anchors every AI engine&#39;s frames around the real outlet, and is
+        required before running one.
+      </p>
+      <div class="frame-toolbar">
+        <button type="button" class="secondary" id="llm-grab-frame">
+          Use the frame currently shown in the preview
+        </button>
+        <span class="hint" id="llm-frame-time-label"></span>
+        <button type="button" class="secondary hidden" id="llm-clear-outlet">
+          Clear outlet mark
+        </button>
+      </div>
+      <div class="frame-holder">
+        <img id="llm-outlet-image" alt="Video frame for marking the cup outlet">
+        <canvas id="llm-outlet-canvas"></canvas>
+      </div>
+      <p class="hint" id="llm-outlet-summary">
+        No outlet marked yet - this is required before running an AI engine.
+      </p>
+    </div>
+
     <div id="llm-engine-list" class="llm-engine-list"></div>
 
     <div class="action-row">

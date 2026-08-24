@@ -203,6 +203,7 @@ def test_pipeline_thins_fine_frames_under_a_tight_byte_budget(zahn_video):
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
         config=config,
     )
     fine_call = provider.calls[1]
@@ -226,6 +227,7 @@ def test_pipeline_abstains_with_request_too_large_when_fine_floor_cannot_fit(zah
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
         config=config,
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
@@ -243,6 +245,7 @@ def test_pipeline_abstains_with_request_too_large_when_even_coarse_floor_cannot_
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
         config=config,
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
@@ -437,6 +440,7 @@ def test_pipeline_abstains_when_fine_evidence_is_nowhere_near_the_start_window(z
         provider,
         prompt_version=PROMPT_VERSION,
         prompt_text="irrelevant for a stub",
+        outlet_xy=(zahn_video.truth["outlet_x"], zahn_video.truth["outlet_y"]),
     )
     assert outcome.verdict.status is TimingStatus.ABSTAIN
     assert outcome.event is None

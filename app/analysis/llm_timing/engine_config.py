@@ -165,6 +165,7 @@ def run_llm_timing_for_engines(
     *,
     prompt_version: str,
     prompt_text: str,
+    outlet_xy: tuple[float, float] | None = None,
     config: PipelineConfig | None = None,
 ) -> list[EngineOutcome]:
     """Run every enabled engine independently and return every result.
@@ -196,6 +197,7 @@ def run_llm_timing_for_engines(
                 provider,
                 prompt_version=prompt_version,
                 prompt_text=prompt_text,
+                outlet_xy=outlet_xy,
                 config=config,
             )
             results.append(

@@ -271,7 +271,11 @@ class TestLLMRuns:
         )
 
         started = client.post(
-            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+            f"/api/videos/{video['video_id']}/llm-runs",
+            json={
+                "engine_id": engine["engine_id"],
+                "outlet": {"x": zahn_video.truth["outlet_x"], "y": zahn_video.truth["outlet_y"]},
+            },
         )
         assert started.status_code == 200
         run = started.get_json()
@@ -295,7 +299,11 @@ class TestLLMRuns:
         ).get_json()
 
         started = client.post(
-            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+            f"/api/videos/{video['video_id']}/llm-runs",
+            json={
+                "engine_id": engine["engine_id"],
+                "outlet": {"x": zahn_video.truth["outlet_x"], "y": zahn_video.truth["outlet_y"]},
+            },
         ).get_json()
         payload = _wait_for_run(client, started["run_id"])
         assert payload["status"] == "failed"
@@ -311,14 +319,19 @@ class TestLLMRuns:
             },
         ).get_json()
         response = client.post(
-            "/api/videos/does-not-exist/llm-runs", json={"engine_id": engine["engine_id"]}
+            "/api/videos/does-not-exist/llm-runs",
+            json={"engine_id": engine["engine_id"], "outlet": {"x": 100.0, "y": 100.0}},
         )
         assert response.status_code == 404
 
     def test_run_with_an_unknown_engine_is_404(self, client, zahn_video):
         video = upload(client, zahn_video.path).get_json()
         response = client.post(
-            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": "does-not-exist"}
+            f"/api/videos/{video['video_id']}/llm-runs",
+            json={
+                "engine_id": "does-not-exist",
+                "outlet": {"x": zahn_video.truth["outlet_x"], "y": zahn_video.truth["outlet_y"]},
+            },
         )
         assert response.status_code == 404
 
@@ -347,7 +360,11 @@ class TestLLMRuns:
             lambda e: _confirmed_stub_provider(),
         )
         started = client.post(
-            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+            f"/api/videos/{video['video_id']}/llm-runs",
+            json={
+                "engine_id": engine["engine_id"],
+                "outlet": {"x": zahn_video.truth["outlet_x"], "y": zahn_video.truth["outlet_y"]},
+            },
         ).get_json()
         cancelled = client.post(f"/api/llm-runs/{started['run_id']}/cancel")
         gate.set()
@@ -376,7 +393,11 @@ class TestLLMRuns:
             lambda e: _confirmed_stub_provider(),
         )
         started = client.post(
-            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+            f"/api/videos/{video['video_id']}/llm-runs",
+            json={
+                "engine_id": engine["engine_id"],
+                "outlet": {"x": zahn_video.truth["outlet_x"], "y": zahn_video.truth["outlet_y"]},
+            },
         ).get_json()
         payload = _wait_for_run(client, started["run_id"])
 
@@ -409,7 +430,11 @@ class TestLLMRuns:
             lambda e: _confirmed_stub_provider(),
         )
         started = client.post(
-            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+            f"/api/videos/{video['video_id']}/llm-runs",
+            json={
+                "engine_id": engine["engine_id"],
+                "outlet": {"x": zahn_video.truth["outlet_x"], "y": zahn_video.truth["outlet_y"]},
+            },
         ).get_json()
         _wait_for_run(client, started["run_id"])
 
@@ -440,7 +465,11 @@ class TestLLMRuns:
             lambda e: _confirmed_stub_provider(),
         )
         started = client.post(
-            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+            f"/api/videos/{video['video_id']}/llm-runs",
+            json={
+                "engine_id": engine["engine_id"],
+                "outlet": {"x": zahn_video.truth["outlet_x"], "y": zahn_video.truth["outlet_y"]},
+            },
         ).get_json()
         payload = _wait_for_run(client, started["run_id"])
         assert payload["start_evidence_s"] is not None
@@ -482,7 +511,11 @@ class TestLLMRuns:
             },
         ).get_json()
         started = client.post(
-            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+            f"/api/videos/{video['video_id']}/llm-runs",
+            json={
+                "engine_id": engine["engine_id"],
+                "outlet": {"x": zahn_video.truth["outlet_x"], "y": zahn_video.truth["outlet_y"]},
+            },
         ).get_json()
         response = client.get(f"/api/llm-runs/{started['run_id']}/evidence/middle")
         assert response.status_code == 400
@@ -513,7 +546,11 @@ class TestLLMRuns:
             lambda e: StubTimingProvider(respond),
         )
         started = client.post(
-            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+            f"/api/videos/{video['video_id']}/llm-runs",
+            json={
+                "engine_id": engine["engine_id"],
+                "outlet": {"x": zahn_video.truth["outlet_x"], "y": zahn_video.truth["outlet_y"]},
+            },
         ).get_json()
         payload = _wait_for_run(client, started["run_id"])
         assert payload["status"] == "complete"
@@ -562,7 +599,11 @@ class TestLLMRunAudit:
             lambda e: _confirmed_stub_provider(),
         )
         started = client.post(
-            f"/api/videos/{video['video_id']}/llm-runs", json={"engine_id": engine["engine_id"]}
+            f"/api/videos/{video['video_id']}/llm-runs",
+            json={
+                "engine_id": engine["engine_id"],
+                "outlet": {"x": zahn_video.truth["outlet_x"], "y": zahn_video.truth["outlet_y"]},
+            },
         ).get_json()
         _wait_for_run(client, started["run_id"])
         return engine, started["run_id"]
